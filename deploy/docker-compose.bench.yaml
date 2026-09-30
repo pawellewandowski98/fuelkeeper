@@ -4,6 +4,10 @@
 # ports 8081-8083 only; the bench Postgres exposes no host port.
 name: fuelkeeper-bench
 
+# The config mount uses the lowercase `z` SELinux option on purpose: all three
+# fuelkeeper containers read the same host file, and `z` gives it a shared label.
+# Uppercase `Z` relabels it privately for the last container to start and denies
+# the other two under rootless Podman.
 services:
   postgres:
     image: postgres:16-alpine

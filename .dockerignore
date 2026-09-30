@@ -10,7 +10,7 @@ deploy/*.yaml
 *.db
 bin/
 dist/
-fuelkeeper
+/fuelkeeper
 coverage.out
 *.log
 .idea/
