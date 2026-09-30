@@ -98,7 +98,9 @@ type TxStatus struct {
 	Status int `json:"status"`
 	// BlockHash is the hash of the block the transaction was mined in.
 	BlockHash string `json:"blockHash"`
-	// BlockHeight is the height of that block.
+	// BlockHeight is the height of that block. The spec types this field
+	// int64; uint32 is a deliberate narrowing (Bitcoin block heights won't
+	// reach 2^32 for tens of thousands of years at the current block rate).
 	BlockHeight uint32 `json:"blockHeight"`
 	// MerklePath is the hex-encoded BUMP merkle path, present once mined.
 	MerklePath string `json:"merklePath"`
@@ -195,8 +197,12 @@ type policyResponse struct {
 // Option configures a Client constructed by New.
 type Option func(*Client)
 
-// WithCallbackToken sets the X-CallbackToken header on every request this
-// client makes to arcade (submissions and status lookups).
+// WithCallbackToken sets the X-CallbackToken header on submissions (PostTx
+// and PostTxs) only. The arcade contract defines this header solely for
+// POST /tx and POST /txs; GET /tx/{txid} exposes the equivalent capability
+// as a "callbackToken" query parameter instead (not implemented by this
+// client), and GET /policy has no callback concept at all, so neither GetTx
+// nor Policy send this header.
 func WithCallbackToken(tok string) Option {
 	return func(c *Client) { c.callbackToken = tok }
 }
@@ -220,7 +226,12 @@ type Client struct {
 }
 
 // New constructs a Client for the given base URL. The base URL must be
-// absolute (scheme and host required); a trailing slash is stripped.
+// absolute, use the http or https scheme, and carry no query string or
+// fragment (those would silently become part of every request's query once
+// a "/tx", "/txs" or "/policy" suffix is appended to the path, e.g.
+// "https://arcade.example/v1?token=abc" + "/tx/<txid>" would request
+// "/v1?token=abc" with "/tx/<txid>" folded into the query string rather than
+// the path arcade expects). A trailing slash on the path is stripped.
 func New(base string, opts ...Option) (*Client, error) {
 	if base == "" {
 		return nil, errors.New("arcadeclient: base url must not be empty")
@@ -229,8 +240,14 @@ func New(base string, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("arcadeclient: invalid base url %q: %w", base, err)
 	}
-	if u.Scheme == "" || u.Host == "" {
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("arcadeclient: base url %q must use the http or https scheme", base)
+	}
+	if u.Host == "" {
 		return nil, fmt.Errorf("arcadeclient: base url %q must be absolute (scheme and host required)", base)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("arcadeclient: base url %q must not contain a query string or fragment", base)
 	}
 	c := &Client{
 		base: strings.TrimRight(base, "/"),
@@ -244,8 +261,10 @@ func New(base string, opts ...Option) (*Client, error) {
 
 // do issues one request against the base URL, wrapping both request
 // construction and transport errors so errors.Is/As (e.g. against
-// context.Canceled) sees through to the underlying cause.
-func (c *Client) do(ctx context.Context, method, path, contentType string, body []byte) (*http.Response, error) {
+// context.Canceled) sees through to the underlying cause. withCallbackToken
+// scopes the X-CallbackToken header to the submission endpoints; see
+// WithCallbackToken.
+func (c *Client) do(ctx context.Context, method, path, contentType string, body []byte, withCallbackToken bool) (*http.Response, error) {
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
@@ -257,7 +276,7 @@ func (c *Client) do(ctx context.Context, method, path, contentType string, body 
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	if c.callbackToken != "" {
+	if withCallbackToken && c.callbackToken != "" {
 		req.Header.Set("X-CallbackToken", c.callbackToken)
 	}
 	resp, err := c.http.Do(req)
@@ -295,8 +314,30 @@ func decodeJSON(body io.Reader, limit int64, v any) error {
 	return nil
 }
 
+// UnexpectedStatusError reports an HTTP status code outside the set this
+// client understands for a given request (e.g. a 502 from an intermediary),
+// so callers can log or branch on the exact code instead of parsing a
+// free-form error string.
+type UnexpectedStatusError struct {
+	// Method is the HTTP method of the request (e.g. "GET", "POST").
+	Method string
+	// Path is the request path relative to the client's base URL (e.g.
+	// "/tx/<txid>", "/tx", "/txs", "/policy").
+	Path string
+	// Code is the HTTP status code arcade (or an intermediary) returned.
+	Code int
+}
+
+// Error implements the error interface.
+func (e *UnexpectedStatusError) Error() string {
+	return fmt.Sprintf("arcadeclient: %s %s: unexpected status %d", e.Method, e.Path, e.Code)
+}
+
 // parseRetryAfter reads the Retry-After header as a positive integer number
-// of seconds, defaulting to defaultRetryAfter when absent or invalid.
+// of seconds, defaulting to defaultRetryAfter when absent or invalid. Arcade
+// types Retry-After as a plain integer (arcade.openapi.yaml, the 503
+// response headers on both POST /tx and POST /txs), never an HTTP-date, so
+// parsing an RFC 1123 date here is intentionally not supported.
 func parseRetryAfter(h http.Header) int {
 	ra, err := strconv.Atoi(h.Get("Retry-After"))
 	if err != nil || ra <= 0 {
@@ -325,7 +366,7 @@ func (c *Client) GetTx(ctx context.Context, txid string) (*TxStatus, error) {
 		return nil, fmt.Errorf("arcadeclient: invalid txid %q: must be 64 lowercase hex characters", txid)
 	}
 
-	resp, err := c.do(ctx, http.MethodGet, "/tx/"+txid, "", nil)
+	resp, err := c.do(ctx, http.MethodGet, "/tx/"+txid, "", nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +376,7 @@ func (c *Client) GetTx(ctx context.Context, txid string) (*TxStatus, error) {
 		return nil, ErrNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("arcadeclient: GET /tx/%s: unexpected status %s", txid, resp.Status)
+		return nil, &UnexpectedStatusError{Method: http.MethodGet, Path: "/tx/" + txid, Code: resp.StatusCode}
 	}
 
 	var st TxStatus
@@ -348,7 +389,7 @@ func (c *Client) GetTx(ctx context.Context, txid string) (*TxStatus, error) {
 // PostTx submits one transaction (raw or extended format bytes) for
 // validation, propagation, and lifecycle tracking.
 func (c *Client) PostTx(ctx context.Context, tx []byte) (*SubmitResponse, error) {
-	resp, err := c.do(ctx, http.MethodPost, "/tx", "application/octet-stream", tx)
+	resp, err := c.do(ctx, http.MethodPost, "/tx", "application/octet-stream", tx, true)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +407,7 @@ func (c *Client) PostTx(ctx context.Context, tx []byte) (*SubmitResponse, error)
 	case resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError:
 		return nil, parseRejectError(resp)
 	default:
-		return nil, fmt.Errorf("arcadeclient: POST /tx: unexpected status %s", resp.Status)
+		return nil, &UnexpectedStatusError{Method: http.MethodPost, Path: "/tx", Code: resp.StatusCode}
 	}
 }
 
@@ -377,7 +418,7 @@ func (c *Client) PostTxs(ctx context.Context, rawTxs [][]byte) (*BatchSubmitResp
 		return nil, errEmptyBatch
 	}
 
-	resp, err := c.do(ctx, http.MethodPost, "/txs", "application/octet-stream", bytes.Join(rawTxs, nil))
+	resp, err := c.do(ctx, http.MethodPost, "/txs", "application/octet-stream", bytes.Join(rawTxs, nil), true)
 	if err != nil {
 		return nil, err
 	}
@@ -395,20 +436,20 @@ func (c *Client) PostTxs(ctx context.Context, rawTxs [][]byte) (*BatchSubmitResp
 	case resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError:
 		return nil, parseRejectError(resp)
 	default:
-		return nil, fmt.Errorf("arcadeclient: POST /txs: unexpected status %s", resp.Status)
+		return nil, &UnexpectedStatusError{Method: http.MethodPost, Path: "/txs", Code: resp.StatusCode}
 	}
 }
 
 // Policy fetches arcade's current fee and size policy.
 func (c *Client) Policy(ctx context.Context) (*Policy, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/policy", "", nil)
+	resp, err := c.do(ctx, http.MethodGet, "/policy", "", nil, false)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("arcadeclient: GET /policy: unexpected status %s", resp.Status)
+		return nil, &UnexpectedStatusError{Method: http.MethodGet, Path: "/policy", Code: resp.StatusCode}
 	}
 
 	var pr policyResponse

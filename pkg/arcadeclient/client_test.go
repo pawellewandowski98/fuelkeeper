@@ -37,6 +37,7 @@ func fakeArcade(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/tx/{txid}", func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(t, r.Header.Get("X-CallbackToken"), "GetTx must not send X-CallbackToken; arcade scopes it to submissions")
 		switch r.PathValue("txid") {
 		case txidMined:
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -76,7 +77,8 @@ func fakeArcade(t *testing.T) *httptest.Server {
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]any{"submitted": 2, "duplicates": 0, "total": 2})
 	})
-	mux.HandleFunc("GET /v1/policy", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v1/policy", func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(t, r.Header.Get("X-CallbackToken"), "Policy must not send X-CallbackToken; the endpoint has no callback concept")
 		// The real contract's PolicyResponse wraps the policy under a
 		// "policy" key alongside a "timestamp" (see arcade.openapi.yaml,
 		// schemas PolicyResponse/Policy) -- it is not a flat object.
@@ -146,6 +148,9 @@ func TestNew(t *testing.T) {
 		{"empty", ""},
 		{"no scheme", "arcade.example.com/v1"},
 		{"no host", "https:///v1"},
+		{"bad scheme", "ftp://arcade.example.com/v1"},
+		{"query string", "https://arcade.example.com/v1?token=abc"},
+		{"fragment", "https://arcade.example.com/v1#frag"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -486,4 +491,52 @@ func TestWithHTTPClientNilIsNoop(t *testing.T) {
 
 	_, err = c.Policy(context.Background())
 	require.NoError(t, err)
+}
+
+// TestUnexpectedStatusError checks that all four methods surface a status
+// code outside the set they understand (e.g. a 502 from a misbehaving
+// intermediary) as a typed *UnexpectedStatusError carrying the method, path
+// and code, rather than an opaque string.
+func TestUnexpectedStatusError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c, err := arcadeclient.New(srv.URL + "/v1")
+	require.NoError(t, err)
+
+	t.Run("GetTx", func(t *testing.T) {
+		_, err := c.GetTx(context.Background(), txidMined)
+		var use *arcadeclient.UnexpectedStatusError
+		require.ErrorAs(t, err, &use)
+		assert.Equal(t, http.MethodGet, use.Method)
+		assert.Equal(t, "/tx/"+txidMined, use.Path)
+		assert.Equal(t, http.StatusBadGateway, use.Code)
+	})
+	t.Run("PostTx", func(t *testing.T) {
+		_, err := c.PostTx(context.Background(), []byte("tx"))
+		var use *arcadeclient.UnexpectedStatusError
+		require.ErrorAs(t, err, &use)
+		assert.Equal(t, http.MethodPost, use.Method)
+		assert.Equal(t, "/tx", use.Path)
+		assert.Equal(t, http.StatusBadGateway, use.Code)
+	})
+	t.Run("PostTxs", func(t *testing.T) {
+		_, err := c.PostTxs(context.Background(), [][]byte{[]byte("tx")})
+		var use *arcadeclient.UnexpectedStatusError
+		require.ErrorAs(t, err, &use)
+		assert.Equal(t, http.MethodPost, use.Method)
+		assert.Equal(t, "/txs", use.Path)
+		assert.Equal(t, http.StatusBadGateway, use.Code)
+	})
+	t.Run("Policy", func(t *testing.T) {
+		_, err := c.Policy(context.Background())
+		var use *arcadeclient.UnexpectedStatusError
+		require.ErrorAs(t, err, &use)
+		assert.Equal(t, http.MethodGet, use.Method)
+		assert.Equal(t, "/policy", use.Path)
+		assert.Equal(t, http.StatusBadGateway, use.Code)
+	})
 }
