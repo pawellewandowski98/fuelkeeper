@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
@@ -66,6 +68,9 @@ func testArgumentValidation(t *testing.T, s store.Store, clk *Clock) {
 	require.ErrorIs(t, err, store.ErrInvalidArgument, "zero token")
 	_, err = s.Spend(ctx, "main", zeroTok, Ops(rows), txid, false)
 	require.ErrorIs(t, err, store.ErrInvalidArgument, "zero token")
+
+	_, err = s.Spend(ctx, "main", tok, Ops(rows), chainhash.Hash{}, true)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "terminal spend requires a non-zero txid")
 
 	dup := append(Ops(rows), Ops(rows)[0])
 	_, err = s.Release(ctx, "main", tok, dup)
@@ -166,4 +171,33 @@ func testPoolIsolation(t *testing.T, s store.Store, clk *Clock) {
 	mainShard, err := s.GetShard(ctx, "main", shard.TxID)
 	require.NoError(t, err)
 	require.Equal(t, store.ShardMined, mainShard.Status, "none of the above may have touched main's shard")
+
+	// Shard write methods must also be scoped to their pool. A shard's txid is
+	// globally unique across pools, so a mutation that drops the pool predicate
+	// would still find and mutate main's shard when called against "other" with
+	// main's txid: this must instead find nothing (ErrNotFound per store.go).
+	leaseShard, leaseRows := MintShard(t, s, "main", 2, store.ShardMined)
+	_, err = s.AcquireShard(ctx, "main", "h", clk.Now(), clk.Now().Add(time.Minute), []store.ShardStatus{store.ShardMined}, nil)
+	require.NoError(t, err)
+	beforeLease, err := s.GetShard(ctx, "main", leaseShard.TxID)
+	require.NoError(t, err)
+
+	require.ErrorIs(t, s.UpdateShard(ctx, "other", leaseShard.TxID, store.ShardUnmined, nil), store.ErrNotFound,
+		"UpdateShard must not cross pools even via a globally-unique txid")
+	_, err = s.RetireShard(ctx, "other", leaseShard.TxID)
+	require.ErrorIs(t, err, store.ErrNotFound, "RetireShard must not cross pools")
+	_, err = s.RenewShard(ctx, "other", leaseShard.TxID, "h", clk.Now().Add(time.Hour))
+	require.ErrorIs(t, err, store.ErrNotFound, "RenewShard must not cross pools")
+	require.ErrorIs(t, s.ReleaseShard(ctx, "other", leaseShard.TxID, "h"), store.ErrNotFound, "ReleaseShard must not cross pools")
+
+	afterLease, err := s.GetShard(ctx, "main", leaseShard.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, beforeLease.Status, afterLease.Status, "cross-pool shard-write calls must not change main's shard status")
+	assert.Equal(t, beforeLease.Owner, afterLease.Owner, "cross-pool shard-write calls must not change main's shard owner")
+	assert.Equal(t, beforeLease.LeaseUntil, afterLease.LeaseUntil, "cross-pool shard-write calls must not change main's shard lease")
+	assert.Equal(t, beforeLease.Version, afterLease.Version, "cross-pool shard-write calls must not bump main's shard version")
+
+	leaseAvail, err := s.ListAvailable(ctx, "main", leaseShard.TxID, 0, 10)
+	require.NoError(t, err)
+	assert.Len(t, leaseAvail, len(leaseRows), "cross-pool shard-write calls must not touch main's rows")
 }

@@ -12,7 +12,10 @@ import (
 )
 
 // ListAvailable implements store.Store.
-func (s *Store) ListAvailable(_ context.Context, pool string, txid chainhash.Hash, fromVout uint32, limit int) ([]store.Row, error) {
+func (s *Store) ListAvailable(ctx context.Context, pool string, txid chainhash.Hash, fromVout uint32, limit int) ([]store.Row, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}
@@ -37,7 +40,10 @@ func (s *Store) ListAvailable(_ context.Context, pool string, txid chainhash.Has
 }
 
 // GetRows implements store.Store.
-func (s *Store) GetRows(_ context.Context, pool string, ops []store.Outpoint) ([]store.Row, error) {
+func (s *Store) GetRows(ctx context.Context, pool string, ops []store.Outpoint) ([]store.Row, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}
@@ -56,7 +62,10 @@ func (s *Store) GetRows(_ context.Context, pool string, ops []store.Outpoint) ([
 }
 
 // Reserve implements store.Store.
-func (s *Store) Reserve(_ context.Context, pool string, ops []store.ReserveOp) ([]store.ReserveOp, error) {
+func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp) ([]store.ReserveOp, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}
@@ -120,7 +129,10 @@ func clearReservation(r *store.Row) {
 }
 
 // Release implements store.Store.
-func (s *Store) Release(_ context.Context, pool string, token store.Token, ops []store.Outpoint) (int, error) {
+func (s *Store) Release(ctx context.Context, pool string, token store.Token, ops []store.Outpoint) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return 0, err
 	}
@@ -131,20 +143,29 @@ func (s *Store) Release(_ context.Context, pool string, token store.Token, ops [
 }
 
 // Spend implements store.Store.
-func (s *Store) Spend(_ context.Context, pool string, token store.Token, ops []store.Outpoint, txid chainhash.Hash, terminal bool) (int, error) {
+func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops []store.Outpoint, txid chainhash.Hash, terminal bool) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return 0, err
 	}
+	if err := store.ValidateSpend(txid, terminal); err != nil {
+		return 0, err
+	}
 	return s.mutateReserved(pool, token, ops, func(r *store.Row, now time.Time) {
-		h := txid
 		if terminal {
+			h := txid
 			r.State = store.StateSpent
 			r.SpentBy = &h
 			return
 		}
 		r.State = store.StateQuarantined
 		r.QuarantinedAt = now
-		r.SpentHint = &h
+		if txid != (chainhash.Hash{}) {
+			h := txid
+			r.SpentHint = &h
+		}
 	})
 }
 
@@ -158,13 +179,21 @@ func (s *Store) Spend(_ context.Context, pool string, token store.Token, ops []s
 // SELECT ... FOR UPDATE / locking CTE that re-validates the predicate before
 // committing); otherwise a concurrent Release or Reserve replay on the same row
 // could be silently clobbered.
-func (s *Store) Quarantine(_ context.Context, pool string, before time.Time, limit int) (int, error) {
+func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, limit int) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return 0, err
 	}
 	if err := store.ValidateLimit(limit); err != nil {
 		return 0, err
 	}
+	// Truncate to microsecond precision (store.go, "Clocks"): every stored
+	// expires_at is already truncated on write, so comparing against a raw,
+	// sub-microsecond-precise `before` could treat a value only a few hundred
+	// nanoseconds past expiry as if it were a full microsecond past it.
+	before = before.Truncate(time.Microsecond)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var due []*store.Row
@@ -207,13 +236,18 @@ func quarantineCursorLess(a, b store.RowCursor) bool {
 }
 
 // ListQuarantined implements store.Store.
-func (s *Store) ListQuarantined(_ context.Context, pool string, before time.Time, after *store.RowCursor, limit int) ([]store.Row, error) {
+func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Time, after *store.RowCursor, limit int) ([]store.Row, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}
 	if err := store.ValidateLimit(limit); err != nil {
 		return nil, err
 	}
+	// Truncate to microsecond precision: see the matching comment in Quarantine.
+	before = before.Truncate(time.Microsecond)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []store.Row
@@ -236,7 +270,10 @@ func (s *Store) ListQuarantined(_ context.Context, pool string, before time.Time
 }
 
 // Resolve implements store.Store.
-func (s *Store) Resolve(_ context.Context, pool string, ops []store.Outpoint, to store.State, spentBy *chainhash.Hash) (int, error) {
+func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, to store.State, spentBy *chainhash.Hash) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return 0, err
 	}
@@ -270,7 +307,10 @@ func (s *Store) Resolve(_ context.Context, pool string, ops []store.Outpoint, to
 }
 
 // Stats implements store.Store.
-func (s *Store) Stats(_ context.Context, pool string) (store.Stats, error) {
+func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
+	if err := ctx.Err(); err != nil {
+		return store.Stats{}, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return store.Stats{}, err
 	}

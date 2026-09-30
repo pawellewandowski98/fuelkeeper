@@ -271,11 +271,21 @@ func (s *Store) Release(ctx context.Context, pool string, token store.Token, ops
 
 // Spend implements store.Store.
 func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops []store.Outpoint, txid chainhash.Hash, terminal bool) (int, error) {
+	if err := store.ValidateSpend(txid, terminal); err != nil {
+		return 0, err
+	}
 	now := s.now().UnixMicro()
 	if terminal {
 		return s.updateReserved(ctx, pool, token, ops, spendTerminalRowSQL, txid[:], now)
 	}
-	return s.updateReserved(ctx, pool, token, ops, spendHintRowSQL, now, txid[:], now)
+	// A zero txid is only a client-supplied hint, not an oracle-proven fact (see
+	// ValidateSpend): bind NULL rather than 32 zero bytes so SpentHint scans back
+	// as nil, not a non-nil zero hash.
+	var hint []byte
+	if txid != (chainhash.Hash{}) {
+		hint = txid[:]
+	}
+	return s.updateReserved(ctx, pool, token, ops, spendHintRowSQL, now, hint, now)
 }
 
 // Quarantine implements store.Store.

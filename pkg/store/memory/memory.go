@@ -61,7 +61,7 @@ func New(opts ...Option) *Store {
 var _ store.Store = (*Store)(nil)
 
 // Ping implements store.Store.
-func (s *Store) Ping(context.Context) error { return nil }
+func (s *Store) Ping(ctx context.Context) error { return ctx.Err() }
 
 // Capabilities implements store.Store.
 func (s *Store) Capabilities() store.Caps {

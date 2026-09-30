@@ -32,7 +32,7 @@ func rows(txid chainhash.Hash, pool string, n int) []store.Row { //nolint:unpara
 
 func TestValidatePutShard(t *testing.T) {
 	txid := hashN(1)
-	ok := store.Shard{Pool: "main", TxID: txid, Size: 3, Denomination: 50, Status: store.ShardUnmined}
+	ok := store.Shard{Pool: "main", TxID: txid, Size: 3, Denomination: 50, Status: store.ShardUnmined, BEEF: []byte("beef")}
 	require.NoError(t, store.ValidatePutShard(ok, rows(txid, "main", 3)))
 
 	bad := ok
@@ -50,6 +50,14 @@ func TestValidatePutShard(t *testing.T) {
 	bad = ok
 	bad.Denomination = 0
 	require.ErrorIs(t, store.ValidatePutShard(bad, rows(txid, "main", 3)), store.ErrInvalidArgument)
+
+	bad = ok
+	bad.BEEF = nil
+	require.ErrorIs(t, store.ValidatePutShard(bad, rows(txid, "main", 3)), store.ErrInvalidArgument, "BEEF must not be empty")
+
+	bad = ok
+	bad.BEEF = []byte{}
+	require.ErrorIs(t, store.ValidatePutShard(bad, rows(txid, "main", 3)), store.ErrInvalidArgument, "an empty (non-nil) BEEF is also rejected")
 
 	r := rows(txid, "main", 3)
 	r[1].TxID = hashN(2)

@@ -45,6 +45,8 @@ func subtests() []subtest {
 		{"ListAvailablePagination", testListAvailablePagination},
 		{"StatsCounts", testStatsCounts},
 		{"TimePrecisionMicros", testTimePrecisionMicros},
+		{"SubMicrosecondArguments", testSubMicrosecondArguments},
+		{"CancelledContextRejected", testCancelledContextRejected},
 		{"ReserveExclusivityConcurrent", testReserveExclusivityConcurrent},
 		{"ReserveReleaseCycleConcurrent", testReserveReleaseCycleConcurrent},
 		{"AcquireShardExclusiveConcurrent", testAcquireShardExclusiveConcurrent},

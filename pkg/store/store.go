@@ -55,6 +55,14 @@ import (
 //
 // All stored times have microsecond precision; backends truncate to the
 // microsecond on write and callers compare with time.Time.Truncate(time.Microsecond).
+//
+// # Errors
+//
+// A returned count, applied set or row/shard result is meaningful only when
+// err == nil; treat it as undefined otherwise. ErrUnavailable may wrap
+// context.Canceled or context.DeadlineExceeded when the caller's own context
+// ended the call early: check ctx.Err() before deciding whether to retry,
+// since retrying a cancelled or expired caller context is never useful.
 type Store interface {
 	// Ping reports connectivity. It must not allocate or mutate.
 	Ping(ctx context.Context) error
@@ -68,15 +76,16 @@ type Store interface {
 	// original BEEF/status even if the replay carries different ones; a replay with a
 	// different size, denomination or lock mode also returns ErrShardExists. Backends
 	// without multi-record atomicity write rows first and the shard record last, so a
-	// visible shard implies its rows exist. pool must be non-empty (ErrInvalidArgument).
+	// visible shard implies its rows exist. pool must be non-empty and BEEF must not
+	// be empty (ErrInvalidArgument).
 	PutShard(ctx context.Context, shard Shard, rows []Row) error
 	// GetShard returns the full record including BEEF, or ErrNotFound. pool must be
 	// non-empty (ErrInvalidArgument).
 	GetShard(ctx context.Context, pool string, txid chainhash.Hash) (*Shard, error)
 	// UpdateShard sets status (unmined, mined or retired) and, when beef != nil,
 	// replaces BEEF; it bumps Version. It never touches the shard's lease (Owner,
-	// LeaseUntil). Retired/invalid shards return ErrTerminalShard. pool must be
-	// non-empty (ErrInvalidArgument).
+	// LeaseUntil). Retired/invalid shards return ErrTerminalShard. Missing shard:
+	// ErrNotFound. pool must be non-empty (ErrInvalidArgument).
 	UpdateShard(ctx context.Context, pool string, txid chainhash.Hash, status ShardStatus, beef []byte) error
 	// RetireShard marks the shard invalid, clears its lease, bumps Version, and moves
 	// every non-terminal row (available, reserved, quarantined) to invalid, keeping
@@ -127,8 +136,12 @@ type Store interface {
 	Release(ctx context.Context, pool string, token Token, ops []Outpoint) (int, error)
 	// Spend moves rows from reserved(token) to quarantined with QuarantinedAt = now
 	// and SpentHint = txid, or, when terminal is true (spend_policy=trust), directly
-	// to spent with SpentBy = txid. ReservedBy, ReservedAt and ExpiresAt are kept for
-	// provenance either way (see "Provenance"). Returns the number of rows changed.
+	// to spent with SpentBy = txid. terminal=true requires a non-zero txid
+	// (ErrInvalidArgument otherwise), since SpentBy is meant to be an oracle-proven
+	// fact; terminal=false accepts a zero txid and still moves the row to
+	// quarantined, but records no hint (SpentHint stays nil). ReservedBy, ReservedAt
+	// and ExpiresAt are kept for provenance either way (see "Provenance"). Returns
+	// the number of rows changed.
 	Spend(ctx context.Context, pool string, token Token, ops []Outpoint, txid chainhash.Hash, terminal bool) (int, error)
 	// Quarantine moves up to limit reserved rows whose expires_at < before to
 	// quarantined, picked in (expires_at, txid internal bytes, vout) ascending

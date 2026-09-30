@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -282,7 +283,7 @@ func testReleaseGuard(t *testing.T, s store.Store, clk *Clock) {
 
 func testSpendGuard(t *testing.T, s store.Store, clk *Clock) {
 	ctx := context.Background()
-	_, rows := MintShard(t, s, "main", 3, store.ShardMined)
+	_, rows := MintShard(t, s, "main", 5, store.ShardMined)
 	tokA, tokB := store.NewToken(), store.NewToken()
 	tx1, tx2 := NewTxID(), NewTxID()
 	reservedAt := clk.Now()
@@ -328,6 +329,26 @@ func testSpendGuard(t *testing.T, s store.Store, clk *Clock) {
 	assert.Equal(t, exp, g.ExpiresAt.UTC(), "ExpiresAt kept (terminal spend)")
 	assert.Equal(t, t1, g.UpdatedAt.UTC(), "UpdatedAt is stamped by Spend(true)")
 
+	// terminal=true requires a non-zero txid: SpentBy is meant to be an
+	// oracle-proven fact, so a zero txid there is always invalid, not a hint.
+	n, err = s.Spend(ctx, "main", tokA, Ops(rows[2:3]), chainhash.Hash{}, true)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "terminal spend with a zero txid is invalid")
+	assert.Equal(t, 0, n)
+	g = RowsByOutpoint(t, s, "main", Ops(rows[2:3]))[rows[2].Outpoint]
+	assert.Equal(t, store.StateReserved, g.State, "a rejected terminal spend must not change the row")
+
+	// terminal=false accepts a zero txid: it is only a client-supplied hint, so a
+	// zero txid there still quarantines the row but records no hint.
+	n, err = s.Spend(ctx, "main", tokA, Ops(rows[3:4]), chainhash.Hash{}, false)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	g = RowsByOutpoint(t, s, "main", Ops(rows[3:4]))[rows[3].Outpoint]
+	assert.Equal(t, store.StateQuarantined, g.State)
+	assert.Nil(t, g.SpentHint, "a zero txid records no hint")
+	assert.Equal(t, tokA, g.ReservedBy, "provenance kept")
+	assert.Equal(t, reservedAt, g.ReservedAt.UTC(), "ReservedAt kept for provenance")
+	assert.Equal(t, exp, g.ExpiresAt.UTC(), "ExpiresAt kept for provenance")
+
 	applied, err := s.Reserve(ctx, "main", ReserveOps(rows[1:2], tokB, clk.Now().Add(time.Minute)))
 	require.NoError(t, err)
 	assert.Empty(t, applied, "spent is terminal")
@@ -364,8 +385,10 @@ func testQuarantineByExpiry(t *testing.T, s store.Store, clk *Clock) {
 		assert.Equal(t, store.StateQuarantined, g.State)
 		assert.Equal(t, clk.Now(), g.QuarantinedAt.UTC())
 		assert.Equal(t, clk.Now(), g.UpdatedAt.UTC(), "quarantine stamps updated_at")
-		assert.Nil(t, g.SpentHint)
-		assert.Equal(t, tokA, g.ReservedBy)
+		assert.Nil(t, g.SpentHint, "Quarantine (the reaper's expiry sweep, not a Spend) never sets a hint")
+		assert.Equal(t, tokA, g.ReservedBy, "ReservedBy kept for provenance")
+		assert.Equal(t, t0, g.ReservedAt.UTC(), "ReservedAt kept for provenance")
+		assert.Equal(t, t0.Add(10*time.Second), g.ExpiresAt.UTC(), "ExpiresAt kept for provenance")
 	}
 	for _, r := range rows[2:5] {
 		assert.Equal(t, store.StateReserved, got[r.Outpoint].State)
@@ -460,6 +483,39 @@ func testQuarantineByExpiry(t *testing.T, s store.Store, clk *Clock) {
 	pageEnd, err := s.ListQuarantined(ctx, "distinct", clk.Now().Add(time.Hour), &cursorLast, 10)
 	require.NoError(t, err)
 	assert.Empty(t, pageEnd, "a cursor past the last row returns empty")
+
+	// Deterministic tie-break: two rows from two different shards (so two
+	// different txids) whose reservations expire at the same instant land in the
+	// same Quarantine call and so share quarantined_at exactly; both Quarantine's
+	// own candidate selection and ListQuarantined must then break the tie by the
+	// txid's internal bytes, not its display (reversed) hex string -- a random
+	// txid pair only catches a display-hex ordering bug part of the time.
+	tbA, tbB := TxIDPairDisplayReversed()
+	tbShardA, tbRowsA := MintShardWithTxID(t, s, "tiebreak", tbA, 1, store.ShardMined)
+	tbShardB, tbRowsB := MintShardWithTxID(t, s, "tiebreak", tbB, 1, store.ShardMined)
+	tbTok := store.NewToken()
+	tbExp := clk.Now().Add(time.Second)
+	MustReserve(t, s, "tiebreak", tbRowsA, tbTok, tbExp)
+	MustReserve(t, s, "tiebreak", tbRowsB, tbTok, tbExp)
+	clk.Advance(2 * time.Second)
+
+	tbN1, err := s.Quarantine(ctx, "tiebreak", clk.Now(), 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, tbN1)
+	tbAfterFirst := RowsByOutpoint(t, s, "tiebreak", append(Ops(tbRowsA), Ops(tbRowsB)...))
+	assert.Equal(t, store.StateQuarantined, tbAfterFirst[tbRowsA[0].Outpoint].State,
+		"Quarantine's own candidate order breaks a quarantined_at tie by txid internal bytes, not display hex")
+	assert.Equal(t, store.StateReserved, tbAfterFirst[tbRowsB[0].Outpoint].State)
+
+	tbN2, err := s.Quarantine(ctx, "tiebreak", clk.Now(), 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, tbN2)
+
+	tbList, err := s.ListQuarantined(ctx, "tiebreak", clk.Now().Add(time.Second), nil, 10)
+	require.NoError(t, err)
+	require.Len(t, tbList, 2)
+	assert.Equal(t, tbShardA.TxID, tbList[0].TxID, "ListQuarantined breaks a quarantined_at tie by txid internal bytes, not display hex")
+	assert.Equal(t, tbShardB.TxID, tbList[1].TxID)
 }
 
 func testResolveGuard(t *testing.T, s store.Store, clk *Clock) {
@@ -504,6 +560,9 @@ func testResolveGuard(t *testing.T, s store.Store, clk *Clock) {
 	assert.Equal(t, store.StateSpent, g.State)
 	require.NotNil(t, g.SpentBy)
 	assert.Equal(t, tx1, *g.SpentBy)
+	assert.Equal(t, beforeResolve.ReservedBy, g.ReservedBy, "ReservedBy kept for provenance after Resolve to spent")
+	assert.Equal(t, beforeResolve.ReservedAt, g.ReservedAt, "ReservedAt kept for provenance after Resolve to spent")
+	assert.Equal(t, beforeResolve.ExpiresAt, g.ExpiresAt, "ExpiresAt kept for provenance after Resolve to spent")
 	require.NotNil(t, g.SpentHint, "SpentHint kept for provenance after Resolve to spent")
 	assert.Equal(t, *beforeResolve.SpentHint, *g.SpentHint)
 	assert.Equal(t, beforeResolve.QuarantinedAt, g.QuarantinedAt, "QuarantinedAt kept for provenance after Resolve to spent")
@@ -638,4 +697,62 @@ func testTimePrecisionMicros(t *testing.T, s store.Store, clk *Clock) {
 	leaseExp, err := s.TryAcquireOrRenew(ctx, "jobs/precision", "h", ttl)
 	require.NoError(t, err)
 	assert.Equal(t, wantLeaseExp, leaseExp.UTC(), "TryAcquireOrRenew truncates the lease expiry to microsecond precision")
+}
+
+// testSubMicrosecondArguments pins that every backend treats a caller-supplied
+// time argument at microsecond precision, not raw nanosecond precision (store.go,
+// "Clocks"): a value only a few hundred nanoseconds past a boundary must compare
+// as if it were exactly at that boundary. It sets the manual clock to an instant
+// carrying a nanosecond remainder so "now" itself is not already microsecond-
+// aligned, then checks AcquireShard's until-after-now validation and Quarantine/
+// ListQuarantined's exclusive "before" comparisons all truncate before comparing.
+func testSubMicrosecondArguments(t *testing.T, s store.Store, clk *Clock) {
+	ctx := context.Background()
+	// now's within-microsecond remainder (100ns) plus the 500ns added below stays
+	// under 1us, so both truncate into the same microsecond bucket.
+	now := clk.Set(Start.Add(100 * time.Nanosecond))
+	mined := []store.ShardStatus{store.ShardMined}
+
+	MintShard(t, s, "main", 1, store.ShardMined)
+	_, err := s.AcquireShard(ctx, "main", "h", now, now.Add(500*time.Nanosecond), mined, nil)
+	require.ErrorIs(t, err, store.ErrInvalidArgument,
+		"until only 500ns after now truncates to the same microsecond as now and must be rejected")
+
+	got, err := s.AcquireShard(ctx, "main", "h", now, now.Add(time.Microsecond+500*time.Nanosecond), mined, nil)
+	require.NoError(t, err)
+	require.NotNil(t, got, "until a full microsecond after now must be accepted")
+
+	// Quarantine's `before` compared against the row's stored (already-truncated)
+	// expires_at.
+	_, rows := MintShard(t, s, "main", 1, store.ShardMined)
+	tok := store.NewToken()
+	MustReserve(t, s, "main", rows, tok, clk.Now().Add(time.Minute))
+	stored := RowsByOutpoint(t, s, "main", Ops(rows))[rows[0].Outpoint]
+	require.False(t, stored.ExpiresAt.IsZero())
+
+	n, err := s.Quarantine(ctx, "main", stored.ExpiresAt.Add(500*time.Nanosecond), 10)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n, "before 500ns past expires_at truncates to expires_at itself; strict < must not match")
+
+	q, err := s.ListQuarantined(ctx, "main", stored.ExpiresAt.Add(500*time.Nanosecond), nil, 10)
+	require.NoError(t, err)
+	assert.Empty(t, q, "ListQuarantined's before must apply the same truncation")
+
+	n, err = s.Quarantine(ctx, "main", stored.ExpiresAt.Add(time.Microsecond), 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "a full microsecond past expires_at must quarantine the row")
+
+	quarantined := RowsByOutpoint(t, s, "main", Ops(rows))[rows[0].Outpoint]
+	require.Equal(t, store.StateQuarantined, quarantined.State)
+	require.False(t, quarantined.QuarantinedAt.IsZero())
+
+	// ListQuarantined's `before` compared against the row's stored (already-
+	// truncated) quarantined_at.
+	q, err = s.ListQuarantined(ctx, "main", quarantined.QuarantinedAt.Add(500*time.Nanosecond), nil, 10)
+	require.NoError(t, err)
+	assert.Empty(t, q, "before 500ns past quarantined_at truncates to quarantined_at itself; strict < must not match")
+
+	q, err = s.ListQuarantined(ctx, "main", quarantined.QuarantinedAt.Add(time.Microsecond), nil, 10)
+	require.NoError(t, err)
+	require.Len(t, q, 1, "a full microsecond past quarantined_at must include the row")
 }

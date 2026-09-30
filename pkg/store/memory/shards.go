@@ -12,7 +12,10 @@ import (
 )
 
 // PutShard implements store.Store.
-func (s *Store) PutShard(_ context.Context, shard store.Shard, rows []store.Row) error {
+func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Row) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := store.ValidatePutShard(shard, rows); err != nil {
 		return err
 	}
@@ -50,7 +53,10 @@ func (s *Store) PutShard(_ context.Context, shard store.Shard, rows []store.Row)
 }
 
 // GetShard implements store.Store.
-func (s *Store) GetShard(_ context.Context, pool string, txid chainhash.Hash) (*store.Shard, error) {
+func (s *Store) GetShard(ctx context.Context, pool string, txid chainhash.Hash) (*store.Shard, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}
@@ -65,7 +71,10 @@ func (s *Store) GetShard(_ context.Context, pool string, txid chainhash.Hash) (*
 }
 
 // UpdateShard implements store.Store.
-func (s *Store) UpdateShard(_ context.Context, pool string, txid chainhash.Hash, status store.ShardStatus, beef []byte) error {
+func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Hash, status store.ShardStatus, beef []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return err
 	}
@@ -91,7 +100,10 @@ func (s *Store) UpdateShard(_ context.Context, pool string, txid chainhash.Hash,
 }
 
 // RetireShard implements store.Store.
-func (s *Store) RetireShard(_ context.Context, pool string, txid chainhash.Hash) (int, error) {
+func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Hash) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return 0, err
 	}
@@ -123,7 +135,10 @@ func (s *Store) RetireShard(_ context.Context, pool string, txid chainhash.Hash)
 }
 
 // AcquireShard implements store.Store.
-func (s *Store) AcquireShard(_ context.Context, pool, holder string, now, until time.Time, statuses []store.ShardStatus, exclude []chainhash.Hash) (*store.Shard, error) {
+func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, until time.Time, statuses []store.ShardStatus, exclude []chainhash.Hash) (*store.Shard, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}
@@ -136,6 +151,11 @@ func (s *Store) AcquireShard(_ context.Context, pool, holder string, now, until 
 	if err := store.ValidateAcquireUntil(until, now); err != nil {
 		return nil, err
 	}
+	// Truncate to microsecond precision once at entry (store.go, "Clocks"): every
+	// comparison and stored value below must agree with what ValidateAcquireUntil
+	// just validated at truncated precision.
+	now = now.Truncate(time.Microsecond)
+	until = until.Truncate(time.Microsecond)
 	want := map[store.ShardStatus]bool{}
 	for _, st := range statuses {
 		want[st] = true
@@ -162,14 +182,17 @@ func (s *Store) AcquireShard(_ context.Context, pool, holder string, now, until 
 		return nil, nil //nolint:nilnil // contract: (nil, nil) means nothing adoptable
 	}
 	best.Owner = holder
-	best.LeaseUntil = until.Truncate(time.Microsecond)
+	best.LeaseUntil = until
 	best.UpdatedAt = s.clockNow()
 	c := cloneShard(best, true)
 	return &c, nil
 }
 
 // RenewShard implements store.Store.
-func (s *Store) RenewShard(_ context.Context, pool string, txid chainhash.Hash, holder string, until time.Time) (store.ShardHead, error) {
+func (s *Store) RenewShard(ctx context.Context, pool string, txid chainhash.Hash, holder string, until time.Time) (store.ShardHead, error) {
+	if err := ctx.Err(); err != nil {
+		return store.ShardHead{}, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return store.ShardHead{}, err
 	}
@@ -193,7 +216,10 @@ func (s *Store) RenewShard(_ context.Context, pool string, txid chainhash.Hash, 
 }
 
 // ReleaseShard implements store.Store.
-func (s *Store) ReleaseShard(_ context.Context, pool string, txid chainhash.Hash, holder string) error {
+func (s *Store) ReleaseShard(ctx context.Context, pool string, txid chainhash.Hash, holder string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return err
 	}
@@ -214,7 +240,10 @@ func (s *Store) ReleaseShard(_ context.Context, pool string, txid chainhash.Hash
 }
 
 // ListShards implements store.Store.
-func (s *Store) ListShards(_ context.Context, pool string, f store.ShardFilter) ([]store.Shard, error) {
+func (s *Store) ListShards(ctx context.Context, pool string, f store.ShardFilter) ([]store.Shard, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}

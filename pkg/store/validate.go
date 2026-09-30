@@ -60,9 +60,13 @@ func ValidateLease(name, holder string, ttl time.Duration) error {
 }
 
 // ValidateAcquireUntil checks the lease expiry passed to AcquireShard: it must be
-// strictly after now, so a freshly granted lease is immediately held.
+// strictly after now, so a freshly granted lease is immediately held. The
+// comparison truncates both sides to microsecond precision first (store.go,
+// "Clocks"): every backend stores/compares at microsecond resolution, so an
+// until only a few hundred nanoseconds after now would truncate to the same
+// stored instant and be immediately free, not "immediately held".
 func ValidateAcquireUntil(until, now time.Time) error {
-	if !until.After(now) {
+	if !until.Truncate(time.Microsecond).After(now.Truncate(time.Microsecond)) {
 		return invalidf("acquire until must be after now")
 	}
 	return nil
@@ -123,6 +127,9 @@ func ValidatePutShard(shard Shard, rows []Row) error {
 	}
 	if shard.Denomination == 0 {
 		return invalidf("shard denomination must be > 0")
+	}
+	if len(shard.BEEF) == 0 {
+		return invalidf("shard BEEF must not be empty")
 	}
 	if shard.Status != ShardUnmined && shard.Status != ShardMined {
 		return invalidf("new shard status must be unmined or mined, got %s", shard.Status)
@@ -186,6 +193,18 @@ func ValidateOutpoints(ops []Outpoint, maxBatch int) error {
 			return invalidf("duplicate outpoint %s in batch", op)
 		}
 		seen[op] = struct{}{}
+	}
+	return nil
+}
+
+// ValidateSpend checks the txid/terminal combination passed to Spend: a
+// terminal spend (spend_policy=trust) always names the spending txid, since
+// SpentBy is meant to be an oracle-proven fact, not an absent one. A
+// non-terminal spend's txid is only a client-supplied hint, so a zero txid is
+// accepted there and simply records no hint (see Spend's doc comment).
+func ValidateSpend(txid chainhash.Hash, terminal bool) error {
+	if terminal && txid == (chainhash.Hash{}) {
+		return invalidf("terminal spend requires a non-zero txid")
 	}
 	return nil
 }

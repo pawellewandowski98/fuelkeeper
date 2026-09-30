@@ -19,6 +19,12 @@ var (
 	// ErrInvalidArgument is returned for malformed input; it is never retryable.
 	ErrInvalidArgument = errors.New("store: invalid argument")
 	// ErrUnavailable wraps transient backend failures (lock timeouts, connection loss).
-	// Callers may retry an ErrUnavailable operation; Reserve is idempotent per (outpoint, token).
+	// It may also wrap context.Canceled or context.DeadlineExceeded when the caller's
+	// own context ended the operation early: callers must check ctx.Err() before
+	// deciding whether to retry, since retrying a cancelled or expired caller context
+	// is never useful. Callers may otherwise retry an ErrUnavailable operation;
+	// Reserve is idempotent per (outpoint, token). Whenever an operation returns a
+	// non-nil error, its count/applied/row result is meaningful only when err == nil;
+	// treat it as undefined on any error, including ErrUnavailable.
 	ErrUnavailable = errors.New("store: temporarily unavailable")
 )

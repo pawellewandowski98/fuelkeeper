@@ -30,3 +30,13 @@ func (c *Clock) Advance(d time.Duration) time.Time {
 	c.t = c.t.Add(d)
 	return c.t
 }
+
+// Set moves the clock to t directly (e.g. to a time carrying a sub-microsecond
+// nanosecond component, for tests that pin microsecond-truncation behaviour)
+// and returns it.
+func (c *Clock) Set(t time.Time) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = t
+	return c.t
+}

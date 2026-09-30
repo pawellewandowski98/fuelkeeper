@@ -8,7 +8,10 @@ import (
 )
 
 // TryAcquireOrRenew implements store.Leaser.
-func (s *Store) TryAcquireOrRenew(_ context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
+func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
 	if err := store.ValidateLease(name, holder, ttl); err != nil {
 		return time.Time{}, err
 	}
@@ -28,7 +31,10 @@ func (s *Store) TryAcquireOrRenew(_ context.Context, name, holder string, ttl ti
 }
 
 // ReleaseLease implements store.Leaser.
-func (s *Store) ReleaseLease(_ context.Context, name, holder string) error {
+func (s *Store) ReleaseLease(ctx context.Context, name, holder string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := store.ValidateLeaseName(name); err != nil {
 		return err
 	}

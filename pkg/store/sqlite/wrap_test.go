@@ -188,13 +188,16 @@ func TestWrapCtx_LiveContextTxDoneNotAttributed(t *testing.T) {
 	assert.ErrorIs(t, err, sql.ErrTxDone)
 }
 
-// TestWrapCtx_LiveContextAlreadyWrapsCanceled proves wrapCtx does not
+// TestWrapCtx_CancelledContextAlreadyWrapsCanceled proves wrapCtx does not
 // double-wrap an error that already carries context.Canceled in its chain
 // (e.g. an error returned by a lower layer that already did its own
-// attribution): the resulting message must mention "context canceled" only
+// attribution) even when ctx itself is also done, which is the only case
+// where wrapCtx's own "attribute to ctx.Err()" branch could otherwise wrap it
+// a second time: the resulting message must mention "context canceled" only
 // once.
-func TestWrapCtx_LiveContextAlreadyWrapsCanceled(t *testing.T) {
-	ctx := context.Background()
+func TestWrapCtx_CancelledContextAlreadyWrapsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 	original := fmt.Errorf("op failed: %w", context.Canceled)
 	err := wrapCtx(ctx, original)
 	require.Error(t, err)

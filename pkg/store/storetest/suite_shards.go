@@ -3,7 +3,6 @@ package storetest
 import (
 	"bytes"
 	"context"
-	"sort"
 	"testing"
 	"time"
 
@@ -90,6 +89,16 @@ func testPutShardAtomicAndIdempotent(t *testing.T, s store.Store, clk *Clock) {
 	_, err = s.GetShard(ctx, "main", bad.TxID)
 	require.ErrorIs(t, err, store.ErrNotFound, "rejected PutShard must not create a partial shard record")
 
+	// Both SQL schemas declare beef NOT NULL, so a nil/empty BEEF must be rejected
+	// uniformly as ErrInvalidArgument before it ever reaches the backend, not left
+	// to surface as a raw constraint violation on some backends and silently
+	// succeed on others.
+	noBEEF, noBEEFRows := BuildShard("main", 2, store.ShardUnmined)
+	noBEEF.BEEF = nil
+	require.ErrorIs(t, s.PutShard(ctx, noBEEF, noBEEFRows), store.ErrInvalidArgument, "PutShard requires non-empty BEEF")
+	_, err = s.GetShard(ctx, "main", noBEEF.TxID)
+	require.ErrorIs(t, err, store.ErrNotFound, "a rejected nil-BEEF PutShard must not store anything")
+
 	_, err = s.GetShard(ctx, "main", NewTxID())
 	require.ErrorIs(t, err, store.ErrNotFound)
 	_, err = s.GetShard(ctx, "other", shard.TxID)
@@ -157,36 +166,46 @@ func testListShards(t *testing.T, s store.Store, clk *Clock) {
 	free, err := s.ListShards(ctx, "main", store.ShardFilter{Owner: &none})
 	require.NoError(t, err)
 	require.Len(t, free, 2)
+
+	// f.Owner matches the stored owner string regardless of lease expiry (store.go):
+	// an expired lease still has a non-empty Owner, and ListShards must still find it.
+	clk.Advance(2 * time.Minute)
+	ownedAfterExpiry, err := s.ListShards(ctx, "main", store.ShardFilter{Owner: &owner})
+	require.NoError(t, err)
+	require.Len(t, ownedAfterExpiry, 1, "ListShards with an Owner filter must still find a shard whose lease has since expired")
+	assert.Equal(t, b.TxID, ownedAfterExpiry[0].TxID)
 }
 
 // testListShardsTieBreak pins the (created_at, txid) ordering's tie-break: when
-// created_at is identical, ties are broken by the txid's 32 internal bytes, not its
-// display (reversed) hex string.
+// created_at is identical, ties are broken by the txid's 32 internal bytes, not
+// its display (reversed) hex string. It uses TxIDPairDisplayReversed rather than
+// random txids so a display-hex ordering bug is caught deterministically instead
+// of only part of the time (whenever a random pair happens to disagree that way).
 func testListShardsTieBreak(t *testing.T, s store.Store, clk *Clock) {
 	ctx := context.Background()
-	shards := make([]store.Shard, 3)
-	for i := range shards {
-		sh, _ := MintShard(t, s, "main", 1, store.ShardMined)
-		shards[i] = sh
-	}
-	sort.Slice(shards, func(i, j int) bool {
-		return bytes.Compare(shards[i].TxID[:], shards[j].TxID[:]) < 0
-	})
+	a, b := TxIDPairDisplayReversed()
+	require.Negative(t, bytes.Compare(a[:], b[:]), "test setup: a must sort before b by internal bytes")
+	require.Less(t, b.String(), a.String(), "test setup: b must sort before a by display (reversed) hex string")
+
+	shardA, _ := MintShardWithTxID(t, s, "main", a, 1, store.ShardMined)
+	shardB, _ := MintShardWithTxID(t, s, "main", b, 1, store.ShardMined)
 
 	all, err := s.ListShards(ctx, "main", store.ShardFilter{})
 	require.NoError(t, err)
-	require.Len(t, all, 3)
-	for i, sh := range shards {
-		assert.Equal(t, sh.TxID, all[i].TxID, "ListShards ties broken by txid bytes, not display hex")
-	}
+	require.Len(t, all, 2)
+	assert.Equal(t, shardA.TxID, all[0].TxID, "ListShards ties broken by txid internal bytes, not display hex")
+	assert.Equal(t, shardB.TxID, all[1].TxID)
 
 	mined := []store.ShardStatus{store.ShardMined}
-	for i, sh := range shards {
-		got, err := s.AcquireShard(ctx, "main", "h", clk.Now(), clk.Now().Add(time.Minute), mined, nil)
-		require.NoError(t, err)
-		require.NotNil(t, got)
-		assert.Equal(t, sh.TxID, got.TxID, "AcquireShard call %d follows the same tie-break order", i)
-	}
+	got, err := s.AcquireShard(ctx, "main", "h", clk.Now(), clk.Now().Add(time.Minute), mined, nil)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, shardA.TxID, got.TxID, "AcquireShard follows the same tie-break order")
+
+	got, err = s.AcquireShard(ctx, "main", "h", clk.Now(), clk.Now().Add(time.Minute), mined, nil)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, shardB.TxID, got.TxID)
 }
 
 func testAcquireRenewRelease(t *testing.T, s store.Store, clk *Clock) {
@@ -359,10 +378,13 @@ func testRetireShardCascade(t *testing.T, s store.Store, clk *Clock) {
 	shard, rows := MintShard(t, s, "main", 6, store.ShardMined)
 	tok := store.NewToken()
 	spendTx := NewTxID()
-	MustReserve(t, s, "main", rows[:2], tok, clk.Now().Add(time.Minute))
+	reservedAt := clk.Now()
+	exp := clk.Now().Add(time.Minute)
+	MustReserve(t, s, "main", rows[:2], tok, exp)
 	n, err := s.Spend(ctx, "main", tok, Ops(rows[:1]), spendTx, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
+	quarantinedAt := clk.Now()
 	n, err = s.Spend(ctx, "main", tok, Ops(rows[1:2]), spendTx, true)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
@@ -370,12 +392,17 @@ func testRetireShardCascade(t *testing.T, s store.Store, clk *Clock) {
 	// rows[2] stays reserved (under a second token) into the retire, proving the
 	// cascade also invalidates reserved rows, not just available/quarantined ones.
 	secondTok := store.NewToken()
+	secondReservedAt := clk.Now()
 	secondExp := clk.Now().Add(time.Minute)
 	MustReserve(t, s, "main", rows[2:3], secondTok, secondExp)
 
 	got, err := s.AcquireShard(ctx, "main", "a", clk.Now(), clk.Now().Add(time.Minute), []store.ShardStatus{store.ShardMined}, nil)
 	require.NoError(t, err)
 	require.NotNil(t, got)
+
+	before := RowsByOutpoint(t, s, "main", Ops(rows))
+	clk.Advance(time.Second) // so the cascade's UpdatedAt stamp is distinguishable from before's
+	retireAt := clk.Now()
 
 	changed, err := s.RetireShard(ctx, "main", shard.TxID)
 	require.NoError(t, err)
@@ -390,15 +417,47 @@ func testRetireShardCascade(t *testing.T, s store.Store, clk *Clock) {
 	require.ErrorIs(t, err, store.ErrNotOwner)
 
 	states := RowsByOutpoint(t, s, "main", Ops(rows))
-	assert.Equal(t, store.StateInvalid, states[rows[0].Outpoint].State)
-	assert.Equal(t, tok, states[rows[0].Outpoint].ReservedBy, "retire keeps provenance fields")
-	assert.Equal(t, &spendTx, states[rows[0].Outpoint].SpentHint, "quarantined row keeps its spent hint")
-	assert.Equal(t, store.StateSpent, states[rows[1].Outpoint].State)
-	assert.Equal(t, store.StateInvalid, states[rows[2].Outpoint].State)
-	assert.Equal(t, secondTok, states[rows[2].Outpoint].ReservedBy, "retire keeps provenance fields for reserved rows too")
-	assert.Equal(t, secondExp, states[rows[2].Outpoint].ExpiresAt.UTC(), "retire keeps ExpiresAt for provenance too")
+
+	// rows[0]: was quarantined via Spend(false) before the retire; the cascade
+	// invalidates it but every provenance field (including the spend hint) and the
+	// re-stamped UpdatedAt must survive.
+	r0 := states[rows[0].Outpoint]
+	assert.Equal(t, store.StateInvalid, r0.State)
+	assert.Equal(t, tok, r0.ReservedBy, "retire keeps ReservedBy for provenance")
+	assert.Equal(t, reservedAt, r0.ReservedAt.UTC(), "retire keeps ReservedAt for provenance")
+	assert.Equal(t, exp, r0.ExpiresAt.UTC(), "retire keeps ExpiresAt for provenance")
+	assert.Equal(t, quarantinedAt, r0.QuarantinedAt.UTC(), "retire keeps QuarantinedAt for provenance")
+	assert.Equal(t, &spendTx, r0.SpentHint, "quarantined row keeps its spent hint")
+	assert.Equal(t, retireAt, r0.UpdatedAt.UTC(), "retire cascade stamps UpdatedAt")
+
+	// rows[1]: already terminal (spent) before the retire, so the cascade must
+	// leave it untouched entirely, including UpdatedAt.
+	r1 := states[rows[1].Outpoint]
+	assert.Equal(t, store.StateSpent, r1.State)
+	assert.Equal(t, tok, r1.ReservedBy, "retire keeps ReservedBy for provenance (already-terminal row)")
+	assert.Equal(t, reservedAt, r1.ReservedAt.UTC(), "retire keeps ReservedAt for provenance (already-terminal row)")
+	assert.Equal(t, exp, r1.ExpiresAt.UTC(), "retire keeps ExpiresAt for provenance (already-terminal row)")
+	assert.True(t, r1.QuarantinedAt.IsZero(), "a terminal (true) spend never set QuarantinedAt")
+	assert.Nil(t, r1.SpentHint, "a terminal (true) spend never set SpentHint")
+	require.NotNil(t, r1.SpentBy)
+	assert.Equal(t, spendTx, *r1.SpentBy)
+	assert.Equal(t, before[rows[1].Outpoint].UpdatedAt, r1.UpdatedAt, "retire must not touch an already-terminal row's UpdatedAt")
+
+	// rows[2]: still reserved (under the second token) going into the retire; the
+	// cascade invalidates it and keeps its provenance too.
+	r2 := states[rows[2].Outpoint]
+	assert.Equal(t, store.StateInvalid, r2.State)
+	assert.Equal(t, secondTok, r2.ReservedBy, "retire keeps ReservedBy for provenance (reserved row)")
+	assert.Equal(t, secondReservedAt, r2.ReservedAt.UTC(), "retire keeps ReservedAt for provenance (reserved row)")
+	assert.Equal(t, secondExp, r2.ExpiresAt.UTC(), "retire keeps ExpiresAt for provenance too")
+	assert.True(t, r2.QuarantinedAt.IsZero(), "a never-quarantined row keeps QuarantinedAt zero")
+	assert.Nil(t, r2.SpentHint)
+	assert.Equal(t, retireAt, r2.UpdatedAt.UTC(), "retire cascade stamps UpdatedAt")
+
 	for _, r := range rows[3:] {
-		assert.Equal(t, store.StateInvalid, states[r.Outpoint].State)
+		gotRow := states[r.Outpoint]
+		assert.Equal(t, store.StateInvalid, gotRow.State)
+		assert.Equal(t, retireAt, gotRow.UpdatedAt.UTC(), "retire cascade stamps UpdatedAt for available rows too")
 	}
 	avail, err := s.ListAvailable(ctx, "main", shard.TxID, 0, 10)
 	require.NoError(t, err)

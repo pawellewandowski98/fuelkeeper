@@ -27,10 +27,17 @@ func NewTxID() chainhash.Hash {
 	return *h
 }
 
-// MintShard builds a shard of n puzzle rows (denomination 50) and inserts it.
-func MintShard(t *testing.T, s store.Store, pool string, n int, status store.ShardStatus) (store.Shard, []store.Row) {
-	t.Helper()
-	txid := NewTxID()
+// BuildShard constructs (without inserting) a shard of n puzzle rows
+// (denomination 50) with a fresh, random txid.
+func BuildShard(pool string, n int, status store.ShardStatus) (store.Shard, []store.Row) {
+	return BuildShardWithTxID(pool, NewTxID(), n, status)
+}
+
+// BuildShardWithTxID is BuildShard with an explicit txid, for tests that need
+// control over a shard's exact txid (e.g. deterministic tie-break ordering
+// via TxIDPairDisplayReversed) or that need an unminted shard/rows to insert
+// (or deliberately not insert) themselves.
+func BuildShardWithTxID(pool string, txid chainhash.Hash, n int, status store.ShardStatus) (store.Shard, []store.Row) {
 	shard := store.Shard{
 		Pool:         pool,
 		TxID:         txid,
@@ -50,8 +57,39 @@ func MintShard(t *testing.T, s store.Store, pool string, n int, status store.Sha
 			UnlockingScript: []byte{0x20, byte(i)},
 		}
 	}
+	return shard, rows
+}
+
+// MintShard builds a shard of n puzzle rows (denomination 50) and inserts it.
+func MintShard(t *testing.T, s store.Store, pool string, n int, status store.ShardStatus) (store.Shard, []store.Row) {
+	t.Helper()
+	shard, rows := BuildShard(pool, n, status)
 	require.NoError(t, s.PutShard(context.Background(), shard, rows))
 	return shard, rows
+}
+
+// MintShardWithTxID is MintShard with an explicit txid; see BuildShardWithTxID.
+func MintShardWithTxID(t *testing.T, s store.Store, pool string, txid chainhash.Hash, n int, status store.ShardStatus) (store.Shard, []store.Row) {
+	t.Helper()
+	shard, rows := BuildShardWithTxID(pool, txid, n, status)
+	require.NoError(t, s.PutShard(context.Background(), shard, rows))
+	return shard, rows
+}
+
+// TxIDPairDisplayReversed returns two txids whose internal-byte order and
+// display (reversed-hex, chainhash.Hash.String) order disagree: a sorts
+// before b by the 32 internal bytes, but after b by display string. A test
+// built from random txids only catches a display-hex ordering bug part of
+// the time (whenever the random pair happens to disagree that way); this
+// pair catches it every time.
+func TxIDPairDisplayReversed() (a, b chainhash.Hash) {
+	a[0] = 0x01
+	for i := 1; i < len(a); i++ {
+		a[i] = 0xff
+	}
+	b[0] = 0x02
+	// b's remaining bytes are already zero.
+	return a, b
 }
 
 // Ops extracts outpoints.
