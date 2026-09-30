@@ -84,6 +84,7 @@ func testReserveBasic(t *testing.T, s store.Store, clk *Clock) {
 	tokMixed, tokOther := store.NewToken(), store.NewToken()
 	mixedExp := clk.Now().Add(time.Minute)
 	MustReserve(t, s, "main", mixed[1:2], tokMixed, mixedExp) // replayed below
+	clk.Advance(time.Second)                                  // so a re-stamped UpdatedAt on replay would be detectable
 	MustReserve(t, s, "main", mixed[2:3], tokMixed, mixedExp) // spent below
 	MustReserve(t, s, "main", mixed[3:4], tokOther, mixedExp) // reserved by another token
 
@@ -362,6 +363,7 @@ func testQuarantineByExpiry(t *testing.T, s store.Store, clk *Clock) {
 		g := got[r.Outpoint]
 		assert.Equal(t, store.StateQuarantined, g.State)
 		assert.Equal(t, clk.Now(), g.QuarantinedAt.UTC())
+		assert.Equal(t, clk.Now(), g.UpdatedAt.UTC(), "quarantine stamps updated_at")
 		assert.Nil(t, g.SpentHint)
 		assert.Equal(t, tokA, g.ReservedBy)
 	}

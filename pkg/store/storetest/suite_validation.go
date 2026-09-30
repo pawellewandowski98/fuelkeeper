@@ -104,6 +104,17 @@ func testPoolIsolation(t *testing.T, s store.Store, clk *Clock) {
 	shard, rows := MintShard(t, s, "main", 3, store.ShardMined)
 	tok := store.NewToken()
 	MustReserve(t, s, "main", rows[:1], tok, clk.Now().Add(time.Minute))
+
+	// Actually quarantine one main row so the cross-pool Resolve and ListQuarantined
+	// checks below are non-vacuous: with nothing quarantined anywhere, "other" would
+	// trivially find nothing regardless of whether pool scoping works at all.
+	qTok := store.NewToken()
+	MustReserve(t, s, "main", rows[1:2], qTok, clk.Now().Add(time.Second))
+	clk.Advance(2 * time.Second)
+	qn, err := s.Quarantine(ctx, "main", clk.Now(), 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, qn, "the quarantine setup for this test must actually quarantine the row")
+
 	before := RowsByOutpoint(t, s, "main", Ops(rows))
 
 	n, err := s.Quarantine(ctx, "other", clk.Now().Add(time.Hour), 10)
@@ -114,9 +125,16 @@ func testPoolIsolation(t *testing.T, s store.Store, clk *Clock) {
 	require.NoError(t, err)
 	require.Empty(t, q, "ListQuarantined must not see main's rows from another pool")
 
-	rn, err := s.Resolve(ctx, "other", Ops(rows[:1]), store.StateAvailable, nil)
+	mainQ, err := s.ListQuarantined(ctx, "main", clk.Now().Add(time.Hour), nil, 10)
+	require.NoError(t, err)
+	require.Len(t, mainQ, 1, "ListQuarantined for main must return the quarantined row")
+	require.Equal(t, rows[1].Outpoint, mainQ[0].Outpoint)
+
+	rn, err := s.Resolve(ctx, "other", Ops(rows[1:2]), store.StateAvailable, nil)
 	require.NoError(t, err)
 	require.Equal(t, 0, rn, "Resolve must not cross pools")
+	stillQuarantined := RowsByOutpoint(t, s, "main", Ops(rows[1:2]))[rows[1].Outpoint]
+	require.Equal(t, store.StateQuarantined, stillQuarantined.State, "cross-pool Resolve must not change main's row")
 
 	relN, err := s.Release(ctx, "other", tok, Ops(rows[:1]))
 	require.NoError(t, err)
