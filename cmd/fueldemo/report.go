@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -77,10 +78,16 @@ func (r *report) reserved() {
 }
 
 // percentile returns the nearest-rank percentile p (0..1) of sorted, a
-// latency sample already sorted ascending, converted from microseconds to
-// milliseconds. sorted must be non-empty.
+// latency sample of length n already sorted ascending, converted from
+// microseconds to milliseconds. The nearest rank is ceil(n*p), a 1-indexed
+// rank into sorted; idx converts that to sorted's 0-indexed position,
+// clamped to [0, n-1] to guard the p=0 case (ceil(0)-1 == -1) and any
+// floating-point rounding at p=1. sorted must be non-empty.
 func percentile(sorted []int64, p float64) float64 {
-	idx := int(float64(len(sorted)-1) * p)
+	n := len(sorted)
+	idx := int(math.Ceil(float64(n)*p)) - 1
+	idx = max(idx, 0)
+	idx = min(idx, n-1)
 	return float64(sorted[idx]) / 1000
 }
 

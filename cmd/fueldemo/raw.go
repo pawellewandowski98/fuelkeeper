@@ -57,6 +57,19 @@ type rawRunner struct {
 	memo     []byte // OP_RETURN payload
 	satPerKB uint64 // fee rate for buildFuelTx's change decision
 	changeTo []byte // locking script for an optional change output; nil = none
+
+	// afterCycle, when set, is called once at the end of every
+	// reserve/process/release cycle (after any leftover outputs have been
+	// released, before the loop checks ctx again). It is nil in production.
+	// Tests use it to stop a worker deterministically between cycles rather
+	// than racing ctx's cancellation against an in-flight Reserve call: a
+	// Reserve the server commits just as the client's ctx expires mid-flight
+	// is reported to the caller as a context error (see worker's
+	// ctx.Err()-after-Reserve-error guard) with no token to release those
+	// rows by, leaving them reserved until the pool's own TTL reclaims them
+	// -- the intended self-healing behaviour of a lease-based pool, but not
+	// something a wall-clock-timeout test can assert around reliably.
+	afterCycle func()
 }
 
 // buildFuelTx spends one fuel output o into an OP_RETURN carrying memo. When
@@ -115,6 +128,10 @@ func buildFuelTx(o wire.Output, constraints *wire.Constraints, memo, changeTo []
 		change := &transaction.TransactionOutput{LockingScript: script.NewFromBytes(changeTo)}
 		tx.AddOutput(change)
 		fee := fuel.FeeSats(tx.Size(), satPerKB)
+		// Require at least 1 satoshi of change: o.Satoshis > fee already
+		// guarantees that for these uint64 values, but the explicit >= 1
+		// keeps the dust/no-zero-value-output threshold visible here rather
+		// than relying on unsigned-subtraction semantics to imply it.
 		if o.Satoshis > fee && o.Satoshis-fee >= 1 {
 			change.Satoshis = o.Satoshis - fee
 		} else {
@@ -254,6 +271,10 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 			relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
 			_, _ = r.fk.Release(relCtx, r.pool, res.Token, unused)
 			cancel()
+		}
+
+		if r.afterCycle != nil {
+			r.afterCycle()
 		}
 	}
 }

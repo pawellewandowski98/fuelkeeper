@@ -3,15 +3,16 @@
 // through a real settlement path instead of fuelbench's synthetic
 // fake-txid spend calls.
 //
-// In raw mode (the only mode implemented so far; see Plan 6 Task 4) each
-// fuel output is spent into its own OP_RETURN transaction, submitted to an
-// arcade instance in extended format (arcade needs no BEEF for this), and
-// reported to FuelKeeper with spend. This measures FuelKeeper's own
-// ceiling: the cheapest possible transaction that still exercises the real
-// reserve/spend round trip and a real broadcast.
+// In raw mode (Plan 6 Task 4) each fuel output is spent into its own
+// OP_RETURN transaction, submitted to an arcade instance in extended format
+// (arcade needs no BEEF for this), and reported to FuelKeeper with spend.
+// This measures FuelKeeper's own ceiling: the cheapest possible transaction
+// that still exercises the real reserve/spend round trip and a real
+// broadcast.
 //
-// toolbox mode (Plan 6 Task 5) will instead drive a go-sdk wallet through
-// createAction the way a real integrator would.
+// In toolbox mode (Plan 6 Task 5) a go-sdk wallet drives createAction over
+// reserved fuel inputs the way a real integrator would, funding itself and
+// broadcasting through arcade and verifying inputs against chaintracks.
 package main
 
 import (
@@ -91,7 +92,11 @@ type options struct {
 	feeKB       uint64
 	changeTo    string // hex locking script, "" = none
 
-	// toolbox-mode flags: parsed but unused until Plan 6 Task 5.
+	// toolbox-mode flags. --arcade and --chaintracks are both required in
+	// toolbox mode (checked in toolbox.go, not options.validate: the wallet
+	// funds itself and broadcasts through arcade, and verifies every input
+	// BEEF against chaintracks). --change-to is raw-mode only and ignored in
+	// toolbox mode: the wallet's own createAction call sizes its own change.
 	network     string
 	walletKey   string
 	chaintracks string
@@ -180,16 +185,23 @@ func run(ctx context.Context, o options) (*report, error) {
 		return nil, fmt.Errorf("fueldemo: fuelkeeper client: %w", err)
 	}
 
-	rep := newReport(o.mode, o.network, o.workers)
-
+	// Toolbox mode's report does carry o.network (its only consumer); raw
+	// mode leaves report.Network empty, since --network is a toolbox-only
+	// flag (see options.network's doc comment).
 	if o.mode == "toolbox" {
+		rep := newReport(o.mode, o.network, o.workers)
 		return rep, newToolboxRunner(ctx, o, fk, rep)
 	}
 
 	arc, err := arcadeclient.New(o.arcadeURL, arcadeclient.WithCallbackToken(o.arcadeToken))
 	if err != nil {
-		return rep, fmt.Errorf("fueldemo: arcade client: %w", err)
+		// Both clients must be up before a report is even constructed: a
+		// caller must never mistake a report for a completed (even empty)
+		// run when construction itself failed before anything ran.
+		return nil, fmt.Errorf("fueldemo: arcade client: %w", err)
 	}
+
+	rep := newReport(o.mode, "", o.workers)
 
 	var changeTo []byte
 	if o.changeTo != "" {

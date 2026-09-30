@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -235,6 +236,21 @@ func TestWorkerRejectStillReportsSpend(t *testing.T) {
 // TestWorkerBackpressureReleasesOutputs checks that arcade backpressure is
 // tallied and that the affected outputs are released back to the pool
 // rather than left reserved or reported spent.
+//
+// It stops the worker deterministically after exactly one full
+// reserve/process/release cycle via afterCycle, rather than racing a
+// wall-clock ctx timeout against the worker's loop: cancelling ctx while a
+// Reserve call is in flight is indistinguishable, from the worker's side,
+// from a normal shutdown (worker's ctx.Err()-after-Reserve-error guard
+// treats it as such and returns), but if the server had already committed
+// that Reserve, its rows have no token to release them by and are left
+// reserved until the pool's own TTL reclaims them -- correct self-healing
+// behaviour, but not something this test should assert around under a race
+// that a wall-clock cutoff makes more likely the harder the scheduler is
+// loaded (observed as a flake under `go test -race -count=2`). afterCycle
+// only ever fires between cycles, once the previous one's release has
+// already completed, so cancelling from it can never race an in-flight
+// Reserve.
 func TestWorkerBackpressureReleasesOutputs(t *testing.T) {
 	srv, st, rows := newRawTestEnv(t, 1, 5)
 	fk, err := client.New(srv.URL)
@@ -243,9 +259,22 @@ func TestWorkerBackpressureReleasesOutputs(t *testing.T) {
 	rep := newReport("raw", "test", 1)
 	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r.worker(ctx, 0)
+	var cycles atomic.Int32
+	r.afterCycle = func() {
+		if cycles.Add(1) == 1 {
+			cancel()
+		}
+	}
+
+	done := make(chan struct{})
+	go func() { defer close(done); r.worker(ctx, 0) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not stop within 5s of its first cycle completing")
+	}
 
 	assert.Zero(t, rep.Sent)
 	assert.Positive(t, rep.Failed["arcade:backpressure"])
@@ -271,7 +300,10 @@ func p2pkhLockingScript() []byte {
 // TestBuildFuelTxP2PKHConstraints checks that buildFuelTx pins the
 // transaction's version/lockTime and the input's sequence number to a
 // non-nil constraints value, as a presigned P2PKH output's signature
-// requires.
+// requires. The constraint values are deliberately chosen to differ from
+// buildFuelTx's own puzzle-mode defaults (version 1, lockTime 0, sequence
+// 0xffffffff): using the default values here would leave this test green
+// even if the whole constraints branch were deleted.
 func TestBuildFuelTxP2PKHConstraints(t *testing.T) {
 	txid := storetest.NewTxID()
 	o := wire.Output{
@@ -282,15 +314,15 @@ func TestBuildFuelTxP2PKHConstraints(t *testing.T) {
 		LockingScript: hex.EncodeToString(p2pkhLockingScript()),
 		Unlock:        wire.Unlock{Mode: "p2pkh", Script: hex.EncodeToString(bytes.Repeat([]byte{0x01}, 107)), Length: 107},
 	}
-	constraints := &wire.Constraints{TxVersion: 1, LockTime: 0, Sequence: 0xffffffff}
+	constraints := &wire.Constraints{TxVersion: 2, LockTime: 600000, Sequence: 0xfffffffe}
 
 	tx, err := buildFuelTx(o, constraints, []byte("memo"), nil, 100)
 	require.NoError(t, err)
 
-	assert.Equal(t, constraints.TxVersion, tx.Version)
-	assert.Equal(t, constraints.LockTime, tx.LockTime)
+	assert.Equal(t, uint32(2), tx.Version)
+	assert.Equal(t, uint32(600000), tx.LockTime)
 	require.Len(t, tx.Inputs, 1)
-	assert.Equal(t, constraints.Sequence, tx.Inputs[0].SequenceNumber)
+	assert.Equal(t, uint32(0xfffffffe), tx.Inputs[0].SequenceNumber)
 	assert.Equal(t, o.Vout, tx.Inputs[0].SourceTxOutIndex)
 	assert.Equal(t, txid, *tx.Inputs[0].SourceTXID)
 }
@@ -382,7 +414,12 @@ func TestApiCode(t *testing.T) {
 }
 
 // TestReportFinishPercentiles checks report.finish's percentiles against a
-// known, hand-computed sample.
+// known, hand-computed sample: 5 latencies (10,20,30,40,50 ms), nearest-rank
+// index = ceil(n*p)-1 for n=5:
+//
+//	p50: ceil(5*0.50)-1 = ceil(2.50)-1 = 3-1 = 2 -> sorted[2] = 30ms
+//	p95: ceil(5*0.95)-1 = ceil(4.75)-1 = 5-1 = 4 -> sorted[4] = 50ms
+//	p99: ceil(5*0.99)-1 = ceil(4.95)-1 = 5-1 = 4 -> sorted[4] = 50ms
 func TestReportFinishPercentiles(t *testing.T) {
 	r := newReport("raw", "test", 1)
 	for _, ms := range []int64{10, 20, 30, 40, 50} {
@@ -390,15 +427,10 @@ func TestReportFinishPercentiles(t *testing.T) {
 	}
 	r.finish()
 
-	sorted := []int64{10000, 20000, 30000, 40000, 50000} // µs, ascending
-	want := func(p float64) float64 {
-		return float64(sorted[int(float64(len(sorted)-1)*p)]) / 1000
-	}
-
 	assert.Equal(t, int64(5), r.Sent)
-	assert.InDelta(t, want(0.50), r.P50Ms, 0.0001)
-	assert.InDelta(t, want(0.95), r.P95Ms, 0.0001)
-	assert.InDelta(t, want(0.99), r.P99Ms, 0.0001)
+	assert.InDelta(t, 30.0, r.P50Ms, 0.0001)
+	assert.InDelta(t, 50.0, r.P95Ms, 0.0001)
+	assert.InDelta(t, 50.0, r.P99Ms, 0.0001)
 	assert.Positive(t, r.Seconds)
 	assert.InDelta(t, float64(r.Sent)/r.Seconds, r.TPS, 1e-6)
 	assert.Nil(t, r.Failed, "no failures recorded: Failed must be omitted, not an empty map")
@@ -486,4 +518,23 @@ func TestRunRequiresArcadeInRawMode(t *testing.T) {
 	assert.Nil(t, rep)
 	var uerr *usageError
 	require.ErrorAs(t, err, &uerr)
+}
+
+// TestRunReturnsNilReportOnArcadeClientFailure is the regression test for a
+// bug where run returned its pre-built (all-zero) report alongside the
+// error when arcadeclient.New failed: main would then write that report
+// (sent=0 tps=0, etc.) to stdout/--out as if a run had actually happened,
+// before going on to report the error. The FuelKeeper client construction
+// succeeds here (a syntactically valid URL, never dialed); it is arcade's
+// client construction that must fail (a query string, which
+// arcadeclient.New rejects) and must yield a nil report, not a zero one.
+func TestRunReturnsNilReportOnArcadeClientFailure(t *testing.T) {
+	o := options{
+		mode: "raw", url: "http://127.0.0.1:1", pool: "main",
+		arcadeURL: "https://x/v1?tok=abc", // rejected: arcadeclient.New disallows a query string
+		workers:   1, batch: 1, duration: time.Second,
+	}
+	rep, err := run(context.Background(), o)
+	require.Error(t, err)
+	assert.Nil(t, rep, "a client construction failure must never hand back a report")
 }
