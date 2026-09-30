@@ -5,7 +5,6 @@ package memory
 import (
 	"bytes"
 	"context"
-	"errors"
 	"sort"
 	"sync"
 	"time"
@@ -14,8 +13,6 @@ import (
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 )
-
-var errNotImplemented = errors.New("memory: not implemented")
 
 type shardKey struct {
 	pool string
@@ -34,7 +31,10 @@ type Store struct {
 	shards map[shardKey]*store.Shard
 	byTxID map[chainhash.Hash]string // txid -> owning pool; enforces global txid uniqueness
 	rows   map[store.Outpoint]*store.Row
-	leases map[string]lease
+	// rowsByShard indexes a shard's row outpoints so ListAvailable and RetireShard
+	// don't have to scan every row in the store.
+	rowsByShard map[chainhash.Hash][]store.Outpoint
+	leases      map[string]lease
 }
 
 // Option configures New.
@@ -46,11 +46,12 @@ func WithClock(now func() time.Time) Option { return func(s *Store) { s.now = no
 // New returns an empty store.
 func New(opts ...Option) *Store {
 	s := &Store{
-		now:    time.Now,
-		shards: map[shardKey]*store.Shard{},
-		byTxID: map[chainhash.Hash]string{},
-		rows:   map[store.Outpoint]*store.Row{},
-		leases: map[string]lease{},
+		now:         time.Now,
+		shards:      map[shardKey]*store.Shard{},
+		byTxID:      map[chainhash.Hash]string{},
+		rows:        map[store.Outpoint]*store.Row{},
+		rowsByShard: map[chainhash.Hash][]store.Outpoint{},
+		leases:      map[string]lease{},
 	}
 	for _, o := range opts {
 		o(s)
@@ -132,6 +133,7 @@ func (s *Store) PutShard(_ context.Context, shard store.Shard, rows []store.Row)
 		r.UpdatedAt = now
 		if _, exists := s.rows[r.Outpoint]; !exists {
 			s.rows[r.Outpoint] = &r
+			s.rowsByShard[shard.TxID] = append(s.rowsByShard[shard.TxID], r.Outpoint)
 		}
 	}
 	sh := cloneShard(&shard, true)
@@ -203,12 +205,14 @@ func (s *Store) RetireShard(_ context.Context, pool string, txid chainhash.Hash)
 	sh.Version++
 	sh.UpdatedAt = now
 	n := 0
-	for _, r := range s.rows {
-		if r.Pool == pool && r.TxID == txid && !r.State.Terminal() {
-			r.State = store.StateInvalid
-			r.UpdatedAt = now
-			n++
+	for _, op := range s.rowsByShard[txid] {
+		r, ok := s.rows[op]
+		if !ok || r.Pool != pool || r.State.Terminal() {
+			continue
 		}
+		r.State = store.StateInvalid
+		r.UpdatedAt = now
+		n++
 	}
 	return n, nil
 }
@@ -342,78 +346,287 @@ func (s *Store) ListShards(_ context.Context, pool string, f store.ShardFilter) 
 	return res, nil
 }
 
-// ---- rows (implemented in Task 5) ----
+// ---- rows ----
 
-// ListAvailable is implemented in Task 5.
-func (s *Store) ListAvailable(_ context.Context, pool string, _ chainhash.Hash, _ uint32, _ int) ([]store.Row, error) {
+// ListAvailable implements store.Store.
+func (s *Store) ListAvailable(_ context.Context, pool string, txid chainhash.Hash, fromVout uint32, limit int) ([]store.Row, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}
-	return nil, errNotImplemented
+	if err := store.ValidateLimit(limit); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []store.Row
+	for _, op := range s.rowsByShard[txid] {
+		r, ok := s.rows[op]
+		if !ok || r.Pool != pool || r.State != store.StateAvailable || r.Vout < fromVout {
+			continue
+		}
+		out = append(out, cloneRow(r))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Vout < out[j].Vout })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
-// GetRows is implemented in Task 5.
-func (s *Store) GetRows(_ context.Context, pool string, _ []store.Outpoint) ([]store.Row, error) {
+// GetRows implements store.Store.
+func (s *Store) GetRows(_ context.Context, pool string, ops []store.Outpoint) ([]store.Row, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}
-	return nil, errNotImplemented
+	if err := store.ValidateOutpoints(ops, s.Capabilities().MaxBatch); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]store.Row, 0, len(ops))
+	for _, op := range ops {
+		if r, ok := s.rows[op]; ok && r.Pool == pool {
+			out = append(out, cloneRow(r))
+		}
+	}
+	return out, nil
 }
 
-// Reserve is implemented in Task 5.
-func (s *Store) Reserve(_ context.Context, pool string, _ []store.ReserveOp) ([]store.ReserveOp, error) {
+// Reserve implements store.Store.
+func (s *Store) Reserve(_ context.Context, pool string, ops []store.ReserveOp) ([]store.ReserveOp, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}
-	return nil, errNotImplemented
+	if err := store.ValidateReserveOps(ops, s.Capabilities().MaxBatch); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	applied := make([]store.ReserveOp, 0, len(ops))
+	for _, op := range ops {
+		r, ok := s.rows[op.Outpoint]
+		if !ok || r.Pool != pool {
+			continue
+		}
+		switch {
+		case r.State == store.StateAvailable:
+			r.State = store.StateReserved
+			r.ReservedBy = op.Token
+			r.ReservedAt = now
+			r.ExpiresAt = op.ExpiresAt
+			r.UpdatedAt = now
+			applied = append(applied, op)
+		case r.State == store.StateReserved && r.ReservedBy == op.Token:
+			op.ExpiresAt = r.ExpiresAt // report the stored expiry on replay
+			applied = append(applied, op)
+		}
+	}
+	return applied, nil
 }
 
-// Release is implemented in Task 5.
-func (s *Store) Release(_ context.Context, pool string, _ store.Token, _ []store.Outpoint) (int, error) {
+// mutateReserved applies fn to every op row in state reserved under token.
+func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpoint, fn func(r *store.Row, now time.Time)) (int, error) {
+	if err := store.ValidateOutpoints(ops, s.Capabilities().MaxBatch); err != nil {
+		return 0, err
+	}
+	if token.IsZero() {
+		return 0, store.ErrInvalidArgument
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	n := 0
+	for _, op := range ops {
+		r, ok := s.rows[op]
+		if !ok || r.Pool != pool || r.State != store.StateReserved || r.ReservedBy != token {
+			continue
+		}
+		fn(r, now)
+		r.UpdatedAt = now
+		n++
+	}
+	return n, nil
+}
+
+func clearReservation(r *store.Row) {
+	r.ReservedBy = store.Token{}
+	r.ReservedAt, r.ExpiresAt, r.QuarantinedAt = time.Time{}, time.Time{}, time.Time{}
+	r.SpentHint = nil
+}
+
+// Release implements store.Store.
+func (s *Store) Release(_ context.Context, pool string, token store.Token, ops []store.Outpoint) (int, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return 0, err
 	}
-	return 0, errNotImplemented
+	return s.mutateReserved(pool, token, ops, func(r *store.Row, _ time.Time) {
+		r.State = store.StateAvailable
+		clearReservation(r)
+	})
 }
 
-// Spend is implemented in Task 5.
-func (s *Store) Spend(_ context.Context, pool string, _ store.Token, _ []store.Outpoint, _ chainhash.Hash, _ bool) (int, error) {
+// Spend implements store.Store.
+func (s *Store) Spend(_ context.Context, pool string, token store.Token, ops []store.Outpoint, txid chainhash.Hash, terminal bool) (int, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return 0, err
 	}
-	return 0, errNotImplemented
+	return s.mutateReserved(pool, token, ops, func(r *store.Row, now time.Time) {
+		h := txid
+		if terminal {
+			r.State = store.StateSpent
+			r.SpentBy = &h
+			return
+		}
+		r.State = store.StateQuarantined
+		r.QuarantinedAt = now
+		r.SpentHint = &h
+	})
 }
 
-// Quarantine is implemented in Task 5.
-func (s *Store) Quarantine(_ context.Context, pool string, _ time.Time, _ int) (int, error) {
+// Quarantine implements store.Store.
+func (s *Store) Quarantine(_ context.Context, pool string, before time.Time, limit int) (int, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return 0, err
 	}
-	return 0, errNotImplemented
+	if err := store.ValidateLimit(limit); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var due []*store.Row
+	for _, r := range s.rows {
+		if r.Pool == pool && r.State == store.StateReserved && r.ExpiresAt.Before(before) {
+			due = append(due, r)
+		}
+	}
+	sort.Slice(due, func(i, j int) bool {
+		if !due[i].ExpiresAt.Equal(due[j].ExpiresAt) {
+			return due[i].ExpiresAt.Before(due[j].ExpiresAt)
+		}
+		if c := bytes.Compare(due[i].TxID[:], due[j].TxID[:]); c != 0 {
+			return c < 0
+		}
+		return due[i].Vout < due[j].Vout
+	})
+	if len(due) > limit {
+		due = due[:limit]
+	}
+	now := s.now()
+	for _, r := range due {
+		r.State = store.StateQuarantined
+		r.QuarantinedAt = now
+		r.UpdatedAt = now
+	}
+	return len(due), nil
 }
 
-// ListQuarantined is implemented in Task 5.
-func (s *Store) ListQuarantined(_ context.Context, pool string, _ time.Time, _ int) ([]store.Row, error) {
+// ListQuarantined implements store.Store.
+func (s *Store) ListQuarantined(_ context.Context, pool string, before time.Time, limit int) ([]store.Row, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}
-	return nil, errNotImplemented
+	if err := store.ValidateLimit(limit); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []store.Row
+	for _, r := range s.rows {
+		if r.Pool == pool && r.State == store.StateQuarantined && r.QuarantinedAt.Before(before) {
+			out = append(out, cloneRow(r))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].QuarantinedAt.Equal(out[j].QuarantinedAt) {
+			return out[i].QuarantinedAt.Before(out[j].QuarantinedAt)
+		}
+		if c := bytes.Compare(out[i].TxID[:], out[j].TxID[:]); c != 0 {
+			return c < 0
+		}
+		return out[i].Vout < out[j].Vout
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
-// Resolve is implemented in Task 5.
-func (s *Store) Resolve(_ context.Context, pool string, _ []store.Outpoint, _ store.State, _ *chainhash.Hash) (int, error) {
+// Resolve implements store.Store.
+func (s *Store) Resolve(_ context.Context, pool string, ops []store.Outpoint, to store.State, spentBy *chainhash.Hash) (int, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return 0, err
 	}
-	return 0, errNotImplemented
+	if err := store.ValidateOutpoints(ops, s.Capabilities().MaxBatch); err != nil {
+		return 0, err
+	}
+	if err := store.ValidateResolve(to, spentBy); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	n := 0
+	for _, op := range ops {
+		r, ok := s.rows[op]
+		if !ok || r.Pool != pool || r.State != store.StateQuarantined {
+			continue
+		}
+		if to == store.StateAvailable {
+			r.State = store.StateAvailable
+			clearReservation(r)
+		} else {
+			h := *spentBy
+			r.State = store.StateSpent
+			r.SpentBy = &h
+		}
+		r.UpdatedAt = now
+		n++
+	}
+	return n, nil
 }
 
-// Stats is implemented in Task 5.
+// Stats implements store.Store.
 func (s *Store) Stats(_ context.Context, pool string) (store.Stats, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return store.Stats{}, err
 	}
-	return store.Stats{}, errNotImplemented
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var st store.Stats
+	for _, r := range s.rows {
+		if r.Pool != pool {
+			continue
+		}
+		switch r.State {
+		case store.StateAvailable:
+			st.Available++
+		case store.StateReserved:
+			st.Reserved++
+		case store.StateQuarantined:
+			st.Quarantined++
+		case store.StateSpent:
+			st.Spent++
+		case store.StateInvalid:
+			st.Invalid++
+		}
+	}
+	for k, sh := range s.shards {
+		if k.pool != pool {
+			continue
+		}
+		switch sh.Status {
+		case store.ShardUnmined:
+			st.ShardsUnmined++
+		case store.ShardMined:
+			st.ShardsMined++
+		case store.ShardRetired:
+			st.ShardsRetired++
+		case store.ShardInvalid:
+			st.ShardsInvalid++
+		}
+	}
+	return st, nil
 }
 
 // ---- leases ----

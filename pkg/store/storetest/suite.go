@@ -34,7 +34,15 @@ func subtests() []subtest {
 		{"RetireShardCascade", testRetireShardCascade},
 		{"ShardLeaseBoundary", testShardLeaseBoundary},
 		{"ArgumentValidation", testArgumentValidation},
-		// Task 5 appends row subtests here; Task 6 appends concurrency subtests.
+		{"ReserveBasic", testReserveBasic},
+		{"ReserveMixedTokensMixedShards", testReserveMixedTokensMixedShards},
+		{"ReleaseGuard", testReleaseGuard},
+		{"SpendGuard", testSpendGuard},
+		{"QuarantineByExpiry", testQuarantineByExpiry},
+		{"ResolveGuard", testResolveGuard},
+		{"ListAvailablePagination", testListAvailablePagination},
+		{"StatsCounts", testStatsCounts},
+		// Task 6 appends concurrency subtests.
 	}
 }
 
