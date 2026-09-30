@@ -305,7 +305,13 @@ func runServeConfig(ctx context.Context, cfg *config.Config, hooks serveHooks) e
 	clock := pool.RealClock{}
 	newStore := hooks.newStore
 	if newStore == nil {
-		newStore = factory.New
+		// Wrapped, not assigned directly, so serveHooks.newStore's signature
+		// (matched by every test's own newStore hook) never has to change
+		// just to thread the configured logger through to backends that log
+		// their own runtime events (pebble, aerospike; see factory.WithLogger).
+		newStore = func(ctx context.Context, storeCfg factory.Config, now func() time.Time) (store.Store, error) {
+			return factory.New(ctx, storeCfg, now, factory.WithLogger(log))
+		}
 	}
 	st, err := newStore(ctx, cfg.Store, clock.Now)
 	if err != nil {

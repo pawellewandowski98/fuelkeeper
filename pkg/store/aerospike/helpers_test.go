@@ -36,6 +36,34 @@ func TestValidateKeyPrefix(t *testing.T) {
 	}
 }
 
+// TestValidatePoolRejectsPipe reproduces the review's collision finding: '|'
+// is this package's own field separator for every "[KeyPrefix|]pool|..."
+// key and index value (shardID, pstFor, psFor), so a pool name containing
+// '|' could make a store with no KeyPrefix using pool "tX|main" derive the
+// exact same on-disk values as a store with KeyPrefix "tX" using pool
+// "main". validatePool must reject '|' with store.ErrInvalidArgument on top
+// of store.ValidatePool's own checks, as defence in depth alongside the
+// config-level check.
+func TestValidatePoolRejectsPipe(t *testing.T) {
+	require.NoError(t, validatePool("main"))
+	require.NoError(t, validatePool("tX"))
+
+	err := validatePool("tX|main")
+	require.ErrorIs(t, err, store.ErrInvalidArgument)
+
+	// Sanity: this is exactly the collision the check guards against --
+	// without it, these two would derive identical on-disk identifiers.
+	plain := &Store{ns: "test", rowsSet: "rows", shardsSet: "shards"}
+	tn := &Store{ns: "test", rowsSet: "rows", shardsSet: "shards", keyPrefix: "tX", tenant: "tX|"}
+	txid := storetest.NewTxID()
+	assert.Equal(t, plain.akFor("tX|main", txid), tn.akFor("main", txid),
+		"sanity: confirms the collision validatePool must prevent")
+
+	// A plain store.ValidatePool call alone would accept this name: the
+	// generic contract check knows nothing about '|'.
+	require.NoError(t, store.ValidatePool("tX|main"))
+}
+
 func TestMatchExistingIndex(t *testing.T) {
 	list := "ns=test:indexname=fk_rows_rx:set=fk_rows:bin=rx:type=numeric:indextype=default:context=null:exp=null:state=RW;" +
 		"ns=test:indexname=fk_rows_ak:set=fk_rows:bin=ak:type=string:indextype=default:context=null:exp=null:state=WO;" +

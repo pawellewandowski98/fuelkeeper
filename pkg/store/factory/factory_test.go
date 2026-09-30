@@ -1,7 +1,9 @@
 package factory_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"path/filepath"
 	"testing"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/postgres"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/sqlite"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/store/storetest"
 )
 
 // TestConfigValidate table-drives every branch of Config.Validate: an
@@ -91,6 +94,54 @@ func TestNewPebble(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, s.Capabilities().MultiProcess)
 	require.NoError(t, s.Ping(ctx))
+	require.NoError(t, s.Close())
+}
+
+// TestNew_WithLoggerReachesPebble reproduces the review's nit that New had
+// no way to pass a logger through, so pebble (and aerospike) always opened
+// with slog.Default(): before this option existed, a caller embedding
+// fuelkeeper's own store inside a larger service had no way to route
+// pebble's own compaction/flush/WAL logging (see pebble.WithLogger) to that
+// service's logger.
+//
+// pebble's WithLogger doc comment notes it prints a WAL-replay summary
+// (Infof) on every reopen of an existing store; this opens the same path
+// twice through the factory with a recording handler and asserts that line
+// appears on the second open, proving factory.WithLogger's value reached
+// pebble.Open's own WithLogger, not just slog.Default().
+func TestNew_WithLoggerReachesPebble(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "pebble")
+	cfg := factory.Config{Backend: factory.BackendPebble, Pebble: factory.PebbleConfig{Path: path}}
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	s, err := factory.New(ctx, cfg, time.Now, factory.WithLogger(log))
+	require.NoError(t, err)
+	shard, rows := storetest.BuildShard("main", 1, store.ShardMined)
+	require.NoError(t, s.PutShard(ctx, shard, rows), "write something so there is WAL content for the next open to replay")
+	require.NoError(t, s.Close())
+	buf.Reset()
+
+	s2, err := factory.New(ctx, cfg, time.Now, factory.WithLogger(log))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, s2.Close()) }()
+
+	require.NotZero(t, buf.Len(), "reopening an existing pebble store must log its WAL-replay summary through the logger factory.WithLogger passed in")
+	require.Contains(t, buf.String(), "level=INFO")
+}
+
+// TestNew_WithoutLoggerStillOpensPebble confirms the variadic opts parameter
+// is fully optional: every pre-existing 3-argument call to New (with no
+// options at all) keeps compiling and opening pebble exactly as before.
+func TestNew_WithoutLoggerStillOpensPebble(t *testing.T) {
+	ctx := context.Background()
+	s, err := factory.New(ctx, factory.Config{
+		Backend: factory.BackendPebble,
+		Pebble:  factory.PebbleConfig{Path: filepath.Join(t.TempDir(), "pebble")},
+	}, time.Now)
+	require.NoError(t, err)
 	require.NoError(t, s.Close())
 }
 

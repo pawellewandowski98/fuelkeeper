@@ -267,13 +267,6 @@ func retireCascadeFilter(pool string, txid chainhash.Hash) bson.D {
 	}
 }
 
-// RetireCascadeFilter exposes RetireShard's own cascade filter for tests
-// (index/explain assertions), so they explain the exact query the code
-// issues rather than a hand-maintained copy that can drift from it.
-func RetireCascadeFilter(pool string, txid chainhash.Hash) bson.D {
-	return retireCascadeFilter(pool, txid)
-}
-
 // RetireShard implements store.Store. Rows are cascaded first and the shard
 // document is updated last -- the same "rows first, record last" rule
 // PutShard uses for non-atomic backends (see store.go) -- so a crash or
@@ -334,7 +327,14 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 		{Key: "$inc", Value: bson.D{{Key: "ver", Value: int64(1)}}},
 	}
 	if _, err := s.shards.UpdateOne(octx, filter, update); err != nil {
-		return n, wrap(err)
+		// Counts are meaningful only when err == nil (see store.go "Errors"):
+		// return 0, not the cascade's own n, so a caller that (incorrectly)
+		// inspected the count on error would not see a nonzero value that
+		// looks like a successful partial retire. The cascade itself already
+		// committed regardless -- a retry re-runs retireCascadeFilter, finds
+		// nothing left to do, and correctly reports 0 for that repair too
+		// (see the idempotency note above).
+		return 0, wrap(err)
 	}
 	// Whether this call itself just flipped the shard (a fresh retire) or
 	// found it already invalid (a repair of a prior partial attempt, or a

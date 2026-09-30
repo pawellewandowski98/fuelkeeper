@@ -23,6 +23,9 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 	if err := store.ValidatePutShard(shard, rows); err != nil {
 		return err
 	}
+	if err := validatePool(shard.Pool); err != nil {
+		return err
+	}
 	if s.closed.Load() {
 		return errClosed
 	}
@@ -128,7 +131,7 @@ func (s *Store) GetShard(ctx context.Context, pool string, txid chainhash.Hash) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return nil, err
 	}
 	if s.closed.Load() {
@@ -157,7 +160,7 @@ func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Has
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return err
 	}
 	if err := store.ValidateUpdateStatus(status); err != nil {
@@ -217,7 +220,7 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return 0, err
 	}
 	if s.closed.Load() {
@@ -307,7 +310,7 @@ func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, unti
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return nil, err
 	}
 	if err := store.ValidateHolder(holder); err != nil {
@@ -412,7 +415,7 @@ func (s *Store) RenewShard(ctx context.Context, pool string, txid chainhash.Hash
 	if err := ctx.Err(); err != nil {
 		return store.ShardHead{}, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return store.ShardHead{}, err
 	}
 	if err := store.ValidateHolder(holder); err != nil {
@@ -460,7 +463,7 @@ func (s *Store) ReleaseShard(ctx context.Context, pool string, txid chainhash.Ha
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return err
 	}
 	if err := store.ValidateHolder(holder); err != nil {
@@ -513,7 +516,7 @@ func (s *Store) ListShards(ctx context.Context, pool string, f store.ShardFilter
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return nil, err
 	}
 	if err := store.ValidateListShardsFilter(f); err != nil {

@@ -4,6 +4,7 @@ package factory
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
@@ -14,6 +15,27 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/postgres"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/sqlite"
 )
+
+// options collects the values Option functions set for New.
+type options struct {
+	// logger, when non-nil, is passed to backends that log their own runtime
+	// events (currently pebble and aerospike; see their own WithLogger
+	// options). Left nil (the default, when WithLogger is not passed to
+	// New), each such backend keeps its own default of slog.Default().
+	logger *slog.Logger
+}
+
+// Option configures New.
+type Option func(*options)
+
+// WithLogger passes l to any backend that logs its own runtime events
+// (currently pebble's compaction/flush/WAL logging and aerospike's
+// availability-mode warning; mongodb, postgres, sqlite and memory do not log
+// anything themselves). Without it, New leaves each such backend on its own
+// default (slog.Default()), exactly as before this option existed.
+func WithLogger(l *slog.Logger) Option {
+	return func(o *options) { o.logger = l }
+}
 
 // Backend names a store implementation.
 type Backend string
@@ -179,13 +201,20 @@ func (c Config) Validate() error {
 	}
 }
 
-// New opens the configured backend with the given clock.
-func New(ctx context.Context, cfg Config, now func() time.Time) (store.Store, error) {
+// New opens the configured backend with the given clock. opts is variadic so
+// every existing call (positional ctx, cfg, now, with no further arguments)
+// keeps compiling and behaving exactly as before; see WithLogger for the
+// only option New currently accepts.
+func New(ctx context.Context, cfg Config, now func() time.Time, opts ...Option) (store.Store, error) {
 	if now == nil {
 		now = time.Now
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	var o options
+	for _, opt := range opts {
+		opt(&o)
 	}
 	switch cfg.Backend {
 	case BackendMemory:
@@ -195,11 +224,19 @@ func New(ctx context.Context, cfg Config, now func() time.Time) (store.Store, er
 	case BackendPostgres:
 		return postgres.New(ctx, cfg.Postgres, postgres.WithClock(now))
 	case BackendPebble:
-		return pebble.Open(ctx, cfg.Pebble.toPebble(), pebble.WithClock(now))
+		pebbleOpts := []pebble.Option{pebble.WithClock(now)}
+		if o.logger != nil {
+			pebbleOpts = append(pebbleOpts, pebble.WithLogger(o.logger))
+		}
+		return pebble.Open(ctx, cfg.Pebble.toPebble(), pebbleOpts...)
 	case BackendMongoDB:
 		return mongodb.New(ctx, cfg.MongoDB.toMongoDB(), mongodb.WithClock(now))
 	case BackendAerospike:
-		return aerospike.New(ctx, cfg.Aerospike.toAerospike(), aerospike.WithClock(now))
+		aeroOpts := []aerospike.Option{aerospike.WithClock(now)}
+		if o.logger != nil {
+			aeroOpts = append(aeroOpts, aerospike.WithLogger(o.logger))
+		}
+		return aerospike.New(ctx, cfg.Aerospike.toAerospike(), aeroOpts...)
 	default:
 		// Unreachable: Validate rejects every other cfg.Backend value above.
 		return nil, fmt.Errorf("%w: unknown store backend %q", store.ErrInvalidArgument, cfg.Backend)

@@ -477,3 +477,109 @@ func TestRenewShardTouchesOnlyLease(t *testing.T) {
 	assert.Equal(t, acq.Version, got.Version)
 	assert.Equal(t, clk.Now().Add(time.Hour).Truncate(time.Microsecond), got.LeaseUntil)
 }
+
+// TestListQuarantinedProjectsDiscoveryAndPagesExactlyOnce reproduces the
+// review's finding that ListQuarantined's discovery query named no bins, so
+// it fetched a full record -- both scripts included -- for every row in
+// range on every single page, not just the page's own limit rows: paging a
+// backlog of n rows with page size limit cost ~n^2/(2*limit) full-record
+// transfers for a full walk instead of O(n). With 5,000 quarantined rows and
+// limit 100, this asserts two things: (1) the discovery query's own records
+// (caught via the queryHook, reused from TestShardDiscoveryNeverFetchesBEEF)
+// carry only the projected txid/vout/qx bins, never a script or any other
+// row bin; (2) a full paging walk driven by the returned cursor still
+// returns every row exactly once, in the documented (quarantined_at, txid
+// internal bytes, vout) order, and every returned Row is complete (full
+// LockingScript/UnlockingScript), proving the BatchGet fetch-back works.
+func TestListQuarantinedProjectsDiscoveryAndPagesExactlyOnce(t *testing.T) {
+	clk := storetest.NewClock(storetest.Start)
+	s := isolatedStore(t, testHost(t), clk.Now)
+	ctx := context.Background()
+
+	const (
+		perShard = maxBatch // 1000: Reserve/Spend's own batch cap
+		shards   = 5
+		total    = perShard * shards // 5,000 quarantined rows
+		limit    = 100
+	)
+	exp := clk.Now().Add(time.Minute)
+	allRows := make([]store.Row, 0, total)
+	for range shards {
+		_, rows := storetest.MintShard(t, s, "main", perShard, store.ShardMined)
+		tok := store.NewToken()
+		storetest.MustReserve(t, s, "main", rows, tok, exp)
+		got, err := s.Spend(ctx, "main", tok, storetest.Ops(rows), storetest.NewTxID(), false)
+		require.NoError(t, err)
+		require.Equal(t, perShard, got, "non-terminal spend must quarantine every row of this shard")
+		allRows = append(allRows, rows...)
+		clk.Advance(time.Millisecond) // vary quarantined_at across shards
+	}
+	require.Len(t, allRows, total)
+
+	// (1) The discovery query must only ever transfer the projected bins.
+	var mu sync.Mutex
+	var seen []*as.Record
+	s.queryHook = func(set string, recs []*as.Record) {
+		if set != s.rowsSet {
+			return
+		}
+		mu.Lock()
+		seen = append(seen, recs...)
+		mu.Unlock()
+	}
+	firstPage, err := s.ListQuarantined(ctx, "main", clk.Now().Add(time.Hour), nil, limit)
+	s.queryHook = nil
+	require.NoError(t, err)
+	require.Len(t, firstPage, limit)
+
+	require.NotEmpty(t, seen, "control: the discovery query must have run")
+	projected := map[string]bool{binTxID: true, binVout: true, binQX: true}
+	for _, rec := range seen {
+		for bin := range rec.Bins {
+			assert.True(t, projected[bin], "discovery record carried unexpected bin %q", bin)
+		}
+		_, hasLock := rec.Bins[binLock]
+		assert.False(t, hasLock, "discovery query must never transfer the locking script")
+		_, hasUnlock := rec.Bins[binUnl]
+		assert.False(t, hasUnlock, "discovery query must never transfer the unlocking script")
+	}
+	assert.Len(t, seen, total, "the discovery query still scans every row in range, only its bins are projected")
+
+	// (2) A full paging walk returns every row exactly once, in order, with
+	// every field intact (proving the BatchGet fetch-back of the selected
+	// candidates, not just their identity).
+	seenCount := make(map[store.Outpoint]int, total)
+	var walked []store.Row
+	var cursor *store.RowCursor
+	for {
+		page, perr := s.ListQuarantined(ctx, "main", clk.Now().Add(time.Hour), cursor, limit)
+		require.NoError(t, perr)
+		if len(page) == 0 {
+			break
+		}
+		walked = append(walked, page...)
+		for _, r := range page {
+			seenCount[r.Outpoint]++
+		}
+		last := page[len(page)-1]
+		cursor = &store.RowCursor{At: last.QuarantinedAt, Outpoint: last.Outpoint}
+		if len(page) < limit {
+			break
+		}
+	}
+	assert.Len(t, walked, total, "a full paging walk must return every quarantined row")
+	for op, count := range seenCount {
+		assert.Equal(t, 1, count, "outpoint %v must appear exactly once across the walk", op)
+	}
+	for i := 1; i < len(walked); i++ {
+		prev, cur := walked[i-1], walked[i]
+		assert.True(t,
+			quarantineCursorAfter(store.RowCursor{At: cur.QuarantinedAt, Outpoint: cur.Outpoint}, store.RowCursor{At: prev.QuarantinedAt, Outpoint: prev.Outpoint}),
+			"row %d must strictly follow row %d in (quarantined_at, txid, vout) order", i, i-1)
+	}
+	for _, r := range walked[:5] {
+		assert.NotEmpty(t, r.LockingScript, "a returned Row must be the complete record, not just its identity")
+		assert.NotEmpty(t, r.UnlockingScript)
+		assert.Equal(t, store.StateQuarantined, r.State)
+	}
+}

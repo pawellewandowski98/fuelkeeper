@@ -19,7 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -174,16 +174,51 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 }
 
 // connectHost extracts just the host(s) portion of a mongodb:// URI for use
-// in connection-error messages, without ever including embedded credentials
-// (net/url.URL.Host never includes userinfo). It falls back to a generic
-// label rather than failing New over a cosmetic detail if the URI cannot be
-// parsed as a URL (which New's own connection attempt will report anyway).
+// in connection-error messages, without ever including embedded credentials.
+//
+// It deliberately does not use net/url.Parse: a URI with an unescaped
+// special character in the userinfo (for example an unescaped "/" in the
+// password, as in "mongodb://alice:1234/s3cretPW@localhost:27017/") parses
+// "successfully" as a URL whose Host is actually a fragment of the
+// credentials (net/url stops the authority at the first "/", so
+// "alice:1234" -- part of the username:password pair -- is taken for the
+// host), silently leaking part of the credentials into logs/metrics via the
+// "mongodb: connect <host>" prefix. Parsing the authority by hand instead:
+// take everything after "://", cut at the LAST "@" that appears before any
+// "?" (so a password containing its own "@", as in "user:p@ss@host", still
+// resolves to the real host after the final "@"), and stop at the next "/"
+// or "?" to drop the path/query. This never looks at anything before that
+// last "@", so no prefix of the credentials can leak even when the URI is
+// malformed. It falls back to the literal "mongodb" rather than failing New
+// over a cosmetic detail if no host-like substring can be found (which
+// New's own connection attempt will report anyway).
 func connectHost(uri string) string {
-	u, err := url.Parse(uri)
-	if err != nil || u.Host == "" {
+	const sep = "://"
+	i := strings.Index(uri, sep)
+	if i < 0 {
 		return "mongodb"
 	}
-	return u.Host
+	rest := uri[i+len(sep):]
+
+	// Only look for credentials ahead of the query string: a "?" cannot be
+	// part of a legitimate userinfo/host, so anything after it is never
+	// mistaken for a later "@"-delimited host.
+	search := rest
+	if q := strings.IndexByte(search, '?'); q >= 0 {
+		search = search[:q]
+	}
+
+	host := search
+	if at := strings.LastIndexByte(search, '@'); at >= 0 {
+		host = search[at+1:]
+	}
+	if slash := strings.IndexByte(host, '/'); slash >= 0 {
+		host = host[:slash]
+	}
+	if host == "" {
+		return "mongodb"
+	}
+	return host
 }
 
 // ensureCollections creates every collection this package uses, explicitly

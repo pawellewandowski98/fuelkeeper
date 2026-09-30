@@ -15,12 +15,13 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/storetest"
 )
 
-// shardDocID mirrors shardID's unexported formula (pool + "|" + hex(txid)):
+// shardDocID mirrors shardID's unexported formula ("main" + "|" + hex(txid)):
 // the tests here reach into the raw fuel_shards collection, so they need the
 // same _id a real Store would use, without importing the mongodb package's
-// unexported helpers.
-func shardDocID(pool string, txid [32]byte) string {
-	return pool + "|" + hex.EncodeToString(txid[:])
+// unexported helpers. Every call in this file uses pool "main", so that is
+// hardcoded rather than threaded through as an always-identical argument.
+func shardDocID(txid [32]byte) string {
+	return "main|" + hex.EncodeToString(txid[:])
 }
 
 // TestRetireShardRepairsPartialCascade reproduces the review's HIGH finding
@@ -41,7 +42,7 @@ func TestRetireShardRepairsPartialCascade(t *testing.T) {
 	// Simulate a partial RetireShard: the shard document already flipped to
 	// invalid, but the row cascade never ran (all 10 rows are still
 	// available).
-	id := shardDocID("main", shard.TxID)
+	id := shardDocID(shard.TxID)
 	_, err := shardsColl.UpdateOne(ctx, bson.D{{Key: "_id", Value: id}}, bson.D{
 		{Key: "$set", Value: bson.D{{Key: "s", Value: int32(store.ShardInvalid)}}},
 	})
@@ -156,7 +157,7 @@ func TestRetireShardOrphanRowsWithoutShardDocument(t *testing.T) {
 	// shard-record-last) PutShard would have left behind.
 	require.NoError(t, s.PutShard(ctx, shard, rows))
 	shardsColl := s.Rows().Database().Collection("fuel_shards")
-	id := shardDocID("main", shard.TxID)
+	id := shardDocID(shard.TxID)
 	_, err := shardsColl.DeleteOne(ctx, bson.D{{Key: "_id", Value: id}})
 	require.NoError(t, err)
 
@@ -179,4 +180,42 @@ func TestRetireShardOrphanRowsWithoutShardDocument(t *testing.T) {
 	avail, err := s.ListAvailable(ctx, "main", shard.TxID, 0, 100)
 	require.NoError(t, err)
 	assert.Len(t, avail, 5)
+}
+
+// TestRetireShardReturnsZeroCountOnShardUpdateFailure reproduces the review's
+// nit that RetireShard returned the row cascade's own count (n, err) when the
+// final shard-document update itself failed, even though a count is only
+// meaningful when err == nil (see store.go "Errors"). It must return 0 in
+// that case, matching aerospike's RetireShard.
+//
+// The failure is injected cheaply and deterministically, with no fault
+// injection framework: the shard document's "ver" field is corrupted to a
+// non-numeric BSON type directly in the collection, so RetireShard's own
+// "$inc": {"ver": 1} write -- the shard-flipping half of the call, which
+// runs after the row cascade -- fails with a real server-side type-mismatch
+// error, while the row cascade (which never touches "ver") still goes
+// through untouched.
+func TestRetireShardReturnsZeroCountOnShardUpdateFailure(t *testing.T) {
+	uri := testURI(t)
+	clk := storetest.NewClock(storetest.Start)
+	s := isolatedStore(t, uri, clk.Now)
+	ctx := context.Background()
+	shardsColl := s.Rows().Database().Collection("fuel_shards")
+
+	shard, rows := storetest.MintShard(t, s, "main", 3, store.ShardMined)
+	require.Len(t, rows, 3)
+
+	id := shardDocID(shard.TxID)
+	_, err := shardsColl.UpdateOne(ctx, bson.D{{Key: "_id", Value: id}}, bson.D{
+		{Key: "$set", Value: bson.D{{Key: "ver", Value: "not-a-number"}}},
+	})
+	require.NoError(t, err, "precondition: corrupt the shard document's ver field")
+
+	n, err := s.RetireShard(ctx, "main", shard.TxID)
+	require.Error(t, err, "the corrupted ver field must make the shard-flipping $inc fail")
+	assert.Zero(t, n, "RetireShard must report 0, not the row cascade's own count, when the shard update itself fails")
+
+	avail, err := s.ListAvailable(ctx, "main", shard.TxID, 0, 100)
+	require.NoError(t, err)
+	assert.Empty(t, avail, "the row cascade runs before the shard update and is unaffected by its later failure")
 }

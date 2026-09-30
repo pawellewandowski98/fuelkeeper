@@ -41,7 +41,7 @@ func TestPutShardRejectsMismatchedTxidClaimBeforeInsertingRows(t *testing.T) {
 	// document (PutShard writes rows first, the shard record last): the txid
 	// claim and shardA's 3 rows are in place, but the shard document is not.
 	shardsColl := s.Rows().Database().Collection("fuel_shards")
-	_, err := shardsColl.DeleteOne(ctx, bson.D{{Key: "_id", Value: shardDocID("main", shardA.TxID)}})
+	_, err := shardsColl.DeleteOne(ctx, bson.D{{Key: "_id", Value: shardDocID(shardA.TxID)}})
 	require.NoError(t, err)
 
 	// A second, mismatched PutShard for the same txid: same pool, but 10 rows

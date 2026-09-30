@@ -81,6 +81,24 @@
 //     pool is ErrShardExists).
 //   - leases: keyed by lease name.
 //   - meta: a single "schema" record recording the schema version.
+//
+// Every secondary index is named Config.SetPrefix + one of the names below
+// (see indexSpecs, the single source of truth New's ensureIndexes builds
+// from):
+//
+//   - rows_ak (rows set, bin ak, string): ListAvailable's per-shard scan of
+//     available rows.
+//   - rows_pst (rows set, bin pst, string): Stats' per-(pool, state) counts.
+//   - rows_rx (rows set, bin rx, numeric): Quarantine's discovery scan of
+//     reserved rows whose expiry is due.
+//   - rows_qx (rows set, bin qx, numeric): ListQuarantined's paging scan of
+//     quarantined rows.
+//   - shards_ps (shards set, bin ps, string): ListShards' per-(pool, status)
+//     scan.
+//   - <set>_tn (one per set in {rows, shards, txids, leases, meta}, bin tn,
+//     string): created only when Config.KeyPrefix is set (production
+//     records carry no tn bin at all), and used only by Truncate to delete
+//     exactly one tenant's records from each set.
 package aerospike
 
 import (
@@ -224,6 +242,28 @@ func validateKeyPrefix(p string) error {
 	return nil
 }
 
+// validatePool checks a pool name for this package's own boundary, on top
+// of store.ValidatePool's generic checks: it must not contain '|'.
+//
+// '|' is this package's own field separator for every "[KeyPrefix|]pool|..."
+// key and secondary-index value (shardID, pstFor, psFor: see bins.go). A
+// pool name containing '|' would let two distinct logical stores collide on
+// the same underlying Aerospike sets: a store with no KeyPrefix using pool
+// "tX|main" derives exactly the same shardID/pst/ps/ak values as a store
+// with KeyPrefix "tX" using pool "main" ("tX|main|..." either way). The
+// top-level FuelKeeper config already rejects '|' in configured pool names,
+// but this package cannot assume every caller goes through that config, so
+// it enforces the same rule itself, in depth, with ErrInvalidArgument.
+func validatePool(pool string) error {
+	if err := store.ValidatePool(pool); err != nil {
+		return err
+	}
+	if strings.Contains(pool, "|") {
+		return fmt.Errorf("%w: aerospike: pool name must not contain '|'", store.ErrInvalidArgument)
+	}
+	return nil
+}
+
 // New connects to Aerospike, checks the namespace's consistency mode,
 // ensures the secondary indexes this package relies on exist, and
 // checks/records the schema version in the meta set.
@@ -312,6 +352,15 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 // strong-consistency mode, unless Config.AllowAvailabilityMode is set.
 var ErrNotStrongConsistency = errors.New("aerospike: namespace is not in strong-consistency mode")
 
+// infoNode is the subset of *as.Node's info API checkConsistency needs. It
+// exists so checkConsistency's own all-nodes decision logic (checkNodesSC)
+// can be unit-tested against a fake info responder instead of requiring a
+// live multi-node cluster; *as.Node satisfies it as-is.
+type infoNode interface {
+	RequestInfo(policy *as.InfoPolicy, name ...string) (map[string]string, as.Error)
+	GetName() string
+}
+
 // checkConsistency reads "namespace/<ns>" from every node and requires
 // strong-consistency=true on all of them, unless allowAP.
 func (s *Store) checkConsistency(allowAP bool) error {
@@ -319,31 +368,59 @@ func (s *Store) checkConsistency(allowAP bool) error {
 	if len(nodes) == 0 {
 		return fmt.Errorf("%w: aerospike: no cluster nodes", store.ErrUnavailable)
 	}
+	infoNodes := make([]infoNode, len(nodes))
+	for i, n := range nodes {
+		infoNodes[i] = n
+	}
+	sc, err := s.checkNodesSC(infoNodes, allowAP)
+	if err != nil {
+		return err
+	}
+	s.strongConsistency = sc
+	return nil
+}
+
+// checkNodesSC queries every node in nodes for the namespace's
+// strong-consistency setting and reports whether ALL of them have it
+// enabled, never just whether the first (or first non-conforming) one does:
+// stopping at the first availability-mode node -- as an earlier version of
+// this function did -- makes the result, and which node ends up named in
+// the log/error, depend on node iteration order, and silently skips
+// checking every node after it (including one that might itself fail to
+// respond or fail to parse). Every node is always queried and every
+// non-SC node is always collected, regardless of allowAP or of how many
+// non-SC nodes are found.
+//
+// A hard failure (RequestInfo error, or a response that fails to parse) is
+// always a hard error, even when allowAP is set: those are infrastructure/
+// configuration problems, not an availability-mode opt-out.
+func (s *Store) checkNodesSC(nodes []infoNode, allowAP bool) (bool, error) {
 	cmd := "namespace/" + s.ns
+	var apNodes []string
 	for _, n := range nodes {
 		info, aerr := n.RequestInfo(as.NewInfoPolicy(), cmd)
 		if aerr != nil {
-			return wrap(aerr)
+			return false, wrap(aerr)
 		}
 		sc, err := parseStrongConsistency(info[cmd])
 		if err != nil {
-			return fmt.Errorf("aerospike: node %s namespace %q: %w", n.GetName(), s.ns, err)
+			return false, fmt.Errorf("aerospike: node %s namespace %q: %w", n.GetName(), s.ns, err)
 		}
-		if sc {
-			s.strongConsistency = true
-			continue
+		if !sc {
+			apNodes = append(apNodes, n.GetName())
 		}
-		s.strongConsistency = false
-		if !allowAP {
-			return fmt.Errorf("%w: %q on node %s (set strong-consistency true, or Config.AllowAvailabilityMode for development only)",
-				ErrNotStrongConsistency, s.ns, n.GetName())
-		}
-		s.log.Warn("aerospike: namespace is NOT in strong-consistency mode and AllowAvailabilityMode is set: "+
-			"reservation exclusivity is NOT guaranteed across node failures or partitions; never use this in production",
-			"namespace", s.ns, "node", n.GetName())
-		return nil
 	}
-	return nil
+	if len(apNodes) == 0 {
+		return true, nil
+	}
+	if !allowAP {
+		return false, fmt.Errorf("%w: %q on node(s) %s (set strong-consistency true, or Config.AllowAvailabilityMode for development only)",
+			ErrNotStrongConsistency, s.ns, strings.Join(apNodes, ", "))
+	}
+	s.log.Warn("aerospike: namespace is NOT in strong-consistency mode on some nodes and AllowAvailabilityMode is set: "+
+		"reservation exclusivity is NOT guaranteed across node failures or partitions; never use this in production",
+		"namespace", s.ns, "ap_nodes", apNodes)
+	return false, nil
 }
 
 // parseStrongConsistency extracts strong-consistency from a "namespace/<ns>"

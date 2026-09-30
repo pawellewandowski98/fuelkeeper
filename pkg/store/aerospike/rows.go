@@ -25,7 +25,7 @@ func (s *Store) ListAvailable(ctx context.Context, pool string, txid chainhash.H
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return nil, err
 	}
 	if err := store.ValidateLimit(limit); err != nil {
@@ -68,7 +68,7 @@ func (s *Store) GetRows(ctx context.Context, pool string, ops []store.Outpoint) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return nil, err
 	}
 	if err := store.ValidateOutpoints(ops, maxBatch); err != nil {
@@ -120,7 +120,7 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return nil, err
 	}
 	if err := store.ValidateReserveOps(ops, maxBatch); err != nil {
@@ -202,7 +202,7 @@ func (s *Store) Release(ctx context.Context, pool string, token store.Token, ops
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return 0, err
 	}
 	if err := store.ValidateOutpoints(ops, maxBatch); err != nil {
@@ -254,7 +254,7 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return 0, err
 	}
 	if err := store.ValidateOutpoints(ops, maxBatch); err != nil {
@@ -321,7 +321,7 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return 0, err
 	}
 	if err := store.ValidateLimit(limit); err != nil {
@@ -412,16 +412,30 @@ func lessQuarantinedOrder(a, b store.Row) bool {
 	return lessOutpointBytes(a.Outpoint, b.Outpoint)
 }
 
-// ListQuarantined implements store.Store. Discovery is a range query on the
-// qx NUMERIC index, which only holds rows currently quarantined, starting at
-// the cursor's quarantined_at; the page is selected with a bounded heap
-// while streaming. A before at or before the epoch, or a cursor at or after
-// before, matches nothing and returns an empty page without querying.
+// ListQuarantined implements store.Store. Discovery is a two-phase read, the
+// same shape Quarantine already uses for its own discovery: a range query on
+// the qx NUMERIC index (which only holds rows currently quarantined),
+// projected to just the bins needed to order and identify a candidate --
+// txid, vout, qx -- keeps the top limit candidates in (quarantined_at, txid
+// internal bytes, vout) order in a bounded heap while streaming, starting at
+// the cursor's quarantined_at. Only those selected limit keys are then
+// fetched in full, by one BatchGet.
+//
+// Without the projection, this query (unlike Quarantine's) used to name no
+// bins at all, so it transferred a full record -- including both scripts --
+// for every row in [after, before), on every single page, not just the
+// limit rows the page returns: paging a backlog of n quarantined rows with
+// page size limit cost O(n) full-record transfers per page and
+// O(n^2/limit) overall for a full walk, instead of O(limit) full records
+// per page and O(n) overall.
+//
+// A before at or before the epoch, or a cursor at or after before, matches
+// nothing and returns an empty page without querying.
 func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Time, after *store.RowCursor, limit int) ([]store.Row, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return nil, err
 	}
 	if err := store.ValidateLimit(limit); err != nil {
@@ -442,7 +456,7 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 		return []store.Row{}, nil // matches nothing
 	}
 
-	stmt := as.NewStatement(s.ns, s.rowsSet)
+	stmt := as.NewStatement(s.ns, s.rowsSet, binTxID, binVout, binQX)
 	stmt.Filter = as.NewRangeFilter(binQX, afterUS, beforeUS-1)
 	qp := s.queryPolicy(ctx)
 	qp.FilterExpression = as.ExpAnd(
@@ -450,21 +464,25 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 		as.ExpEq(as.ExpStringBin(binPool), as.ExpStringVal(pool)),
 		as.ExpEq(as.ExpIntBin(binState), as.ExpIntVal(int64(store.StateQuarantined))),
 	)
+	// Candidates carry only Outpoint and QuarantinedAt -- exactly what
+	// lessQuarantinedOrder and quarantineCursorAfter need -- not a full Row;
+	// the full Row for each of the limit kept candidates is fetched below.
 	top := newBoundedTop(limit, lessQuarantinedOrder)
 	var derr error
 	err := s.query(qp, stmt, func(rec *as.Record) {
 		if derr != nil {
 			return
 		}
-		r, err := rowFromRecord(rec)
+		op, err := outpointFromBins(rec.Bins)
 		if err != nil {
 			derr = err
 			return
 		}
-		if ref != nil && !quarantineCursorAfter(store.RowCursor{At: r.QuarantinedAt, Outpoint: r.Outpoint}, *ref) {
+		cand := store.Row{Outpoint: op, QuarantinedAt: fromUS(toInt64(rec.Bins[binQX]))}
+		if ref != nil && !quarantineCursorAfter(store.RowCursor{At: cand.QuarantinedAt, Outpoint: cand.Outpoint}, *ref) {
 			return
 		}
-		top.push(r)
+		top.push(cand)
 	})
 	if err != nil {
 		return nil, err
@@ -472,7 +490,43 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 	if derr != nil {
 		return nil, derr
 	}
-	return top.sorted(), nil
+	candidates := top.sorted()
+	if len(candidates) == 0 {
+		return []store.Row{}, nil
+	}
+	return s.batchGetRowsOrdered(ctx, rowOutpoints(candidates))
+}
+
+// batchGetRowsOrdered fetches the full row for each of ops by key in one
+// BatchGet and returns them in ops' own order: the client returns records in
+// input order, with a nil slot for any key not found (never expected here --
+// this package never deletes rows -- but skipped defensively, matching
+// GetRows).
+func (s *Store) batchGetRowsOrdered(ctx context.Context, ops []store.Outpoint) ([]store.Row, error) {
+	keys := make([]*as.Key, len(ops))
+	for i, op := range ops {
+		k, err := s.rowKey(op)
+		if err != nil {
+			return nil, err
+		}
+		keys[i] = k
+	}
+	recs, aerr := s.client.BatchGet(s.readBatchPolicy(ctx), keys)
+	if aerr != nil {
+		return nil, wrap(aerr)
+	}
+	out := make([]store.Row, 0, len(ops))
+	for _, rec := range recs {
+		if rec == nil {
+			continue
+		}
+		r, err := rowFromRecord(rec)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 // quarantineCursorAfter reports whether cur is strictly after ref in the
@@ -489,7 +543,7 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return 0, err
 	}
 	if err := store.ValidateOutpoints(ops, maxBatch); err != nil {
@@ -531,7 +585,7 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 	if err := ctx.Err(); err != nil {
 		return store.Stats{}, err
 	}
-	if err := store.ValidatePool(pool); err != nil {
+	if err := validatePool(pool); err != nil {
 		return store.Stats{}, err
 	}
 	if s.closed.Load() {
