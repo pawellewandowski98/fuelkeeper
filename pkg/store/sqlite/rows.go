@@ -1,11 +1,9 @@
 package sqlite
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"errors"
-	"sort"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -13,34 +11,9 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 )
 
-// lessOutpoint orders outpoints by their txid's 32 internal bytes, then vout.
-// Reserve, updateReserved (Release/Spend) and Resolve each touch their ops as
-// individual single-row, primary-key statements in this order inside one
-// write transaction. Under this backend's single-writer model there is only
-// ever one write transaction in flight, so this ordering cannot itself cause
-// a deadlock the way it can under Postgres's row-level locking; it is kept
-// anyway to match that backend's on-disk access pattern and because it costs
-// nothing (see the package doc).
-func lessOutpoint(a, b store.Outpoint) bool {
-	if c := bytes.Compare(a.TxID[:], b.TxID[:]); c != 0 {
-		return c < 0
-	}
-	return a.Vout < b.Vout
-}
-
-func sortedOutpoints(ops []store.Outpoint) []store.Outpoint {
-	out := make([]store.Outpoint, len(ops))
-	copy(out, ops)
-	sort.Slice(out, func(i, j int) bool { return lessOutpoint(out[i], out[j]) })
-	return out
-}
-
-func sortedReserveOps(ops []store.ReserveOp) []store.ReserveOp {
-	out := make([]store.ReserveOp, len(ops))
-	copy(out, ops)
-	sort.Slice(out, func(i, j int) bool { return lessOutpoint(out[i].Outpoint, out[j].Outpoint) })
-	return out
-}
+// Reserve, updateReserved (Release/Spend) and Resolve process their ops one
+// row at a time via store.SortReserveOps/store.SortOutpoints (see its doc for
+// why); harmless but free to keep under this backend's single-writer model.
 
 const rowCols = `txid, vout, pool, satoshis, locking_script, unlocking_script, state, reserved_by, reserved_at, expires_at, quarantined_at, spent_hint, spent_by, updated_at`
 
@@ -228,7 +201,7 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 		return nil, err
 	}
 	now := s.now().UnixMicro()
-	sorted := sortedReserveOps(ops)
+	sorted := store.SortReserveOps(ops)
 	applied := make([]store.ReserveOp, 0, len(ops))
 	err := s.write(ctx, func(c querier) error {
 		stmt, err := c.PrepareContext(ctx, reserveRowSQL)
@@ -256,7 +229,7 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 }
 
 // updateReserved runs sqlText against rows in state reserved under token, one
-// row at a time in sorted order (see lessOutpoint). sqlText must be one of
+// row at a time in sorted order (see store.LessOutpoint). sqlText must be one of
 // releaseRowSQL, spendTerminalRowSQL or spendHintRowSQL.
 func (s *Store) updateReserved(ctx context.Context, pool string, token store.Token, ops []store.Outpoint, sqlText string, extra ...any) (int, error) {
 	if err := store.ValidatePool(pool); err != nil {
@@ -268,7 +241,7 @@ func (s *Store) updateReserved(ctx context.Context, pool string, token store.Tok
 	if token.IsZero() {
 		return 0, store.ErrInvalidArgument
 	}
-	sorted := sortedOutpoints(ops)
+	sorted := store.SortOutpoints(ops)
 	n := 0
 	err := s.write(ctx, func(c querier) error {
 		n = 0
@@ -353,7 +326,7 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 	if err := store.ValidateResolve(to, spentBy); err != nil {
 		return 0, err
 	}
-	sorted := sortedOutpoints(ops)
+	sorted := store.SortOutpoints(ops)
 	now := s.now().UnixMicro()
 	sqlText := resolveAvailableRowSQL
 	extra := []any{now}

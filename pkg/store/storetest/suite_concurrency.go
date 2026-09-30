@@ -635,3 +635,48 @@ func testRetireVsReserveRace(t *testing.T, s store.Store, clk *Clock) {
 	require.NoError(t, err)
 	assert.Equal(t, store.ShardInvalid, gotShard.Status)
 }
+
+// testReserveAllOrNothingOnCancel pins store.Caps.AtomicBatch: a backend that
+// declares it must never let a Reserve batch apply partway when the caller's
+// context expires mid-call, regardless of how tight the deadline is or what
+// error (if any) Reserve returns. This is a regression pin for a class of bug
+// where a backend's write-transaction wrapper hand-rolls
+// BEGIN/COMMIT/ROLLBACK over a context-aware Exec: once that context is
+// already cancelled, the final COMMIT or the failure-path ROLLBACK never
+// reaches the server, leaving the batch's per-row statements applied without
+// the transaction that was supposed to make them atomic ever actually
+// closing -- or, worse, poisoning the connection for every later call. The
+// test only runs for backends that claim AtomicBatch; a backend without it
+// makes no such promise.
+func testReserveAllOrNothingOnCancel(t *testing.T, s store.Store, clk *Clock) {
+	if !s.Capabilities().AtomicBatch {
+		t.Skip("backend does not declare AtomicBatch")
+	}
+	ctx := context.Background()
+	_, rows := MintShard(t, s, "main", 1000, store.ShardMined)
+	before, err := s.Stats(ctx, "main")
+	require.NoError(t, err)
+
+	timeouts := []time.Duration{time.Microsecond, 20 * time.Microsecond, 200 * time.Microsecond, 2 * time.Millisecond}
+	for _, to := range timeouts {
+		for i := 0; i < 5; i++ {
+			tctx, cancel := context.WithTimeout(ctx, to)
+			tok := store.NewToken()
+			_, _ = s.Reserve(tctx, "main", ReserveOps(rows, tok, clk.Now().Add(time.Hour)))
+			cancel()
+
+			st, statErr := s.Stats(ctx, "main")
+			require.NoError(t, statErr)
+			delta := st.Reserved - before.Reserved
+			require.True(t, delta == 0 || delta == int64(len(rows)),
+				"Reserve under a %s deadline must apply all-or-nothing, got delta %d more reserved than before", to, delta)
+		}
+	}
+
+	// The store must not be poisoned: a normal Reserve of a fresh, unrelated
+	// batch still succeeds.
+	_, freshRows := MintShard(t, s, "main", 10, store.ShardMined)
+	applied, err := s.Reserve(ctx, "main", ReserveOps(freshRows, store.NewToken(), clk.Now().Add(time.Hour)))
+	require.NoError(t, err)
+	require.Len(t, applied, 10, "store must not be poisoned by the cancelled attempts above")
+}

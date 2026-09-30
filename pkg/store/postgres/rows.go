@@ -1,10 +1,8 @@
 package postgres
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"sort"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -13,35 +11,15 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 )
 
-// lessOutpoint orders outpoints by their txid's 32 internal bytes, then vout.
 // Reserve, updateReserved (Release/Spend) and Resolve each touch their ops as
-// individual single-row, primary-key point UPDATEs, pipelined in this order as
-// one pgx.Batch inside one transaction: two concurrent batches that touch
-// overlapping rows then always request their locks in the same global order,
-// which rules out the deadlock a combined multi-row "UPDATE ... FROM
-// unnest(...)" statement can hit whenever Postgres's planner does not happen
-// to honour the array's input order (observed in practice under
+// individual single-row, primary-key point UPDATEs, pipelined via
+// store.SortReserveOps/store.SortOutpoints in ascending (txid internal bytes,
+// vout) order as one pgx.Batch inside one transaction: two concurrent batches
+// that touch overlapping rows then always request their locks in the same
+// global order, which rules out the deadlock a combined multi-row "UPDATE ...
+// FROM unnest(...)" statement can hit whenever Postgres's planner does not
+// happen to honour the array's input order (observed in practice under
 // ReserveExclusivityConcurrent / ReserveReleaseCycleConcurrent).
-func lessOutpoint(a, b store.Outpoint) bool {
-	if c := bytes.Compare(a.TxID[:], b.TxID[:]); c != 0 {
-		return c < 0
-	}
-	return a.Vout < b.Vout
-}
-
-func sortedOutpoints(ops []store.Outpoint) []store.Outpoint {
-	out := make([]store.Outpoint, len(ops))
-	copy(out, ops)
-	sort.Slice(out, func(i, j int) bool { return lessOutpoint(out[i], out[j]) })
-	return out
-}
-
-func sortedReserveOps(ops []store.ReserveOp) []store.ReserveOp {
-	out := make([]store.ReserveOp, len(ops))
-	copy(out, ops)
-	sort.Slice(out, func(i, j int) bool { return lessOutpoint(out[i].Outpoint, out[j].Outpoint) })
-	return out
-}
 
 // rowCols is qualified with the "r" alias so it stays unambiguous in queries
 // that join fuel_rows against an unnest(...) key CTE (GetRows, Reserve).
@@ -242,7 +220,7 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 		return nil, err
 	}
 	now := s.now()
-	sorted := sortedReserveOps(ops)
+	sorted := store.SortReserveOps(ops)
 
 	batch := &pgx.Batch{}
 	for _, op := range sorted {
@@ -273,7 +251,7 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 }
 
 // updateReserved runs sqlText against rows in state reserved under token, one
-// row at a time in sorted order (see lessOutpoint). sqlText must be one of
+// row at a time in sorted order (see store.LessOutpoint). sqlText must be one of
 // releaseRowSQL, spendTerminalRowSQL or spendHintRowSQL.
 func (s *Store) updateReserved(ctx context.Context, pool string, token store.Token, ops []store.Outpoint, sqlText string, extra ...any) (int, error) {
 	if err := store.ValidatePool(pool); err != nil {
@@ -285,7 +263,7 @@ func (s *Store) updateReserved(ctx context.Context, pool string, token store.Tok
 	if token.IsZero() {
 		return 0, store.ErrInvalidArgument
 	}
-	sorted := sortedOutpoints(ops)
+	sorted := store.SortOutpoints(ops)
 	now := s.now()
 	batch := &pgx.Batch{}
 	for _, op := range sorted {
@@ -368,7 +346,7 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 	if err := store.ValidateResolve(to, spentBy); err != nil {
 		return 0, err
 	}
-	sorted := sortedOutpoints(ops)
+	sorted := store.SortOutpoints(ops)
 	now := s.now()
 	sqlText := resolveAvailableRowSQL
 	var extra []any

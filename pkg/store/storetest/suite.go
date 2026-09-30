@@ -53,6 +53,7 @@ func subtests() []subtest {
 		{"LeaserExclusiveConcurrent", testLeaserExclusiveConcurrent},
 		{"LeaseTakeoverRace", testLeaseTakeoverRace},
 		{"RetireVsReserveRace", testRetireVsReserveRace},
+		{"ReserveAllOrNothingOnCancel", testReserveAllOrNothingOnCancel},
 	}
 }
 
