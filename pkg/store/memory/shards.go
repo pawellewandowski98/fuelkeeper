@@ -42,6 +42,7 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 		if _, exists := s.rows[r.Outpoint]; !exists {
 			s.rows[r.Outpoint] = &r
 			s.rowsByShard[shard.TxID] = append(s.rowsByShard[shard.TxID], r.Outpoint)
+			s.addCount(shard.Pool, store.StateAvailable, 1)
 		}
 	}
 	sh := cloneShard(&shard, true)
@@ -127,8 +128,10 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 		if !ok || r.Pool != pool || r.State.Terminal() {
 			continue
 		}
+		old := r.State
 		r.State = store.StateInvalid
 		r.UpdatedAt = now
+		s.moveCount(pool, old, store.StateInvalid)
 		n++
 	}
 	return n, nil

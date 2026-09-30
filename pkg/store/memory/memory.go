@@ -34,6 +34,12 @@ type Store struct {
 	// don't have to scan every row in the store.
 	rowsByShard map[chainhash.Hash][]store.Outpoint
 	leases      map[string]lease
+	// counts holds per-pool row-state counters, indexed by store.State (Available
+	// through Invalid), kept in sync at every insert and state transition so Stats
+	// can read them in O(1) instead of scanning every row (see counts.go). A pool
+	// with no entry has never had a row and reads as all-zero, matching an
+	// untouched pool's Stats.
+	counts map[string]*[5]int64
 }
 
 // Option configures New.
@@ -51,6 +57,7 @@ func New(opts ...Option) *Store {
 		rows:        map[store.Outpoint]*store.Row{},
 		rowsByShard: map[chainhash.Hash][]store.Outpoint{},
 		leases:      map[string]lease{},
+		counts:      map[string]*[5]int64{},
 	}
 	for _, o := range opts {
 		o(s)

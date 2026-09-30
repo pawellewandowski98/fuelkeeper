@@ -90,6 +90,7 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 			r.UpdatedAt = now
 			op.ExpiresAt = r.ExpiresAt // report the stored (truncated) expiry
 			applied = append(applied, op)
+			s.moveCount(pool, store.StateAvailable, store.StateReserved)
 		case r.State == store.StateReserved && r.ReservedBy == op.Token:
 			op.ExpiresAt = r.ExpiresAt // report the stored expiry on replay
 			applied = append(applied, op)
@@ -116,6 +117,7 @@ func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpo
 			continue
 		}
 		fn(r, now)
+		s.moveCount(pool, store.StateReserved, r.State) // fn always moves off reserved (Release/Spend)
 		r.UpdatedAt = now
 		n++
 	}
@@ -219,6 +221,7 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 		r.State = store.StateQuarantined
 		r.QuarantinedAt = now
 		r.UpdatedAt = now
+		s.moveCount(pool, store.StateReserved, store.StateQuarantined)
 	}
 	return len(due), nil
 }
@@ -300,6 +303,7 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 			r.State = store.StateSpent
 			r.SpentBy = &h
 		}
+		s.moveCount(pool, store.StateQuarantined, r.State)
 		r.UpdatedAt = now
 		n++
 	}
@@ -317,22 +321,12 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var st store.Stats
-	for _, r := range s.rows {
-		if r.Pool != pool {
-			continue
-		}
-		switch r.State {
-		case store.StateAvailable:
-			st.Available++
-		case store.StateReserved:
-			st.Reserved++
-		case store.StateQuarantined:
-			st.Quarantined++
-		case store.StateSpent:
-			st.Spent++
-		case store.StateInvalid:
-			st.Invalid++
-		}
+	if c := s.counts[pool]; c != nil {
+		st.Available = c[store.StateAvailable]
+		st.Reserved = c[store.StateReserved]
+		st.Quarantined = c[store.StateQuarantined]
+		st.Spent = c[store.StateSpent]
+		st.Invalid = c[store.StateInvalid]
 	}
 	for k, sh := range s.shards {
 		if k.pool != pool {
