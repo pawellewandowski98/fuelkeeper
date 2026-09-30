@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_USER: fuelkeeper
+      POSTGRES_PASSWORD: fuelkeeper
+      POSTGRES_DB: fuelkeeper
+    command: ["postgres", "-c", "max_connections=300"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fuelkeeper"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

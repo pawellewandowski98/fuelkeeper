@@ -1,0 +1,10 @@
+/bin/
+/dist/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+coverage.out
+.idea/
+.vscode/
+*.log

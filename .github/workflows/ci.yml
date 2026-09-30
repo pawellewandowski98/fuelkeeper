@@ -1,0 +1,31 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fuelkeeper
+          POSTGRES_PASSWORD: fuelkeeper
+          POSTGRES_DB: fuelkeeper
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U fuelkeeper"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make test
+      - run: make test-integration
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
