@@ -2,6 +2,7 @@ package pool
 
 import (
 	"bytes"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -46,17 +47,77 @@ const (
 // is a silent no-op otherwise, so calling either twice, or calling one after
 // the other has already resolved the row, can never double-queue a row or
 // double-hand it out from Pop.
+//
+// A tracked row stops being tracked once Forget resolves it, so tracking alone
+// cannot stop a store listing read before that Forget from re-adding it: the
+// row was available when listed, was then popped, reserved and forgotten by a
+// concurrent Reserve, and is now reserved in the store. Re-queuing it would
+// hand it out again only to miss its CAS. Listings are therefore bracketed by
+// BeginListing/EndListing and added with AddListed: while any listing is
+// open, Forget records a tombstone for each row it resolves, stamped with the
+// current listing generation, and AddListed skips every row tombstoned at or
+// after its own listing began. Tombstones older than every open listing are
+// pruned, so none are kept while no listing is open.
 type Allocator struct {
 	mu    sync.Mutex
 	order []*shardQueue // oldest first
 	byTx  map[chainhash.Hash]*shardQueue
 	rows  map[store.Outpoint]rowState
 	avail int
+
+	gen       uint64                    // generation of the most recently begun listing
+	listings  map[uint64]struct{}       // open listings, by generation
+	gone      map[store.Outpoint]uint64 // rows forgotten while a listing was open -> generation at Forget
+	goneOrder []goneEntry               // gone in Forget order (non-decreasing gen), for pruning
+}
+
+type goneEntry struct {
+	op  store.Outpoint
+	gen uint64
 }
 
 // NewAllocator returns an empty allocator.
 func NewAllocator() *Allocator {
-	return &Allocator{byTx: map[chainhash.Hash]*shardQueue{}, rows: map[store.Outpoint]rowState{}}
+	return &Allocator{
+		byTx:     map[chainhash.Hash]*shardQueue{},
+		rows:     map[store.Outpoint]rowState{},
+		listings: map[uint64]struct{}{},
+		gone:     map[store.Outpoint]uint64{},
+	}
+}
+
+// BeginListing opens a listing: call it before reading rows from the store
+// that will be passed to AddListed, and EndListing with the returned
+// generation once they have been added.
+func (a *Allocator) BeginListing() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.gen++
+	a.listings[a.gen] = struct{}{}
+	return a.gen
+}
+
+// EndListing closes the listing gen and prunes tombstones no open listing
+// needs any more.
+func (a *Allocator) EndListing(gen uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.listings, gen)
+	oldest := uint64(math.MaxUint64)
+	for g := range a.listings {
+		oldest = min(oldest, g)
+	}
+	i := 0
+	for ; i < len(a.goneOrder) && a.goneOrder[i].gen < oldest; i++ {
+		e := a.goneOrder[i]
+		if a.gone[e.op] == e.gen {
+			delete(a.gone, e.op)
+		}
+	}
+	a.goneOrder = a.goneOrder[i:]
+	if len(a.goneOrder) == 0 {
+		a.goneOrder = nil
+	}
 }
 
 func lessOwned(a, b OwnedShard) bool {
@@ -127,8 +188,20 @@ func (a *Allocator) UpdateHead(txid chainhash.Hash, status store.ShardStatus, ve
 
 // Add appends rows to the shard's FIFO as queued, skipping rows already
 // tracked (queued or inflight) and rows belonging to another shard. Returns
-// how many were added.
+// how many were added. Rows read from the store while this allocator is
+// serving go through AddListed instead.
 func (a *Allocator) Add(txid chainhash.Hash, rows []store.Row) int {
+	return a.add(txid, rows, 0, false)
+}
+
+// AddListed is Add for rows read from the store by the listing gen (see
+// BeginListing): it also skips rows Forget resolved at or after gen, which
+// were handed out after the listing began and so are stale in it.
+func (a *Allocator) AddListed(txid chainhash.Hash, rows []store.Row, gen uint64) int {
+	return a.add(txid, rows, gen, true)
+}
+
+func (a *Allocator) add(txid chainhash.Hash, rows []store.Row, gen uint64, listed bool) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	q, ok := a.byTx[txid]
@@ -141,6 +214,9 @@ func (a *Allocator) Add(txid chainhash.Hash, rows []store.Row) int {
 			continue
 		}
 		if _, tracked := a.rows[r.Outpoint]; tracked {
+			continue
+		}
+		if g, dead := a.gone[r.Outpoint]; listed && dead && g >= gen {
 			continue
 		}
 		a.rows[r.Outpoint] = rowQueued
@@ -252,6 +328,10 @@ func (a *Allocator) Forget(ops []store.Outpoint) {
 	for _, op := range ops {
 		if a.rows[op] == rowInflight {
 			delete(a.rows, op)
+			if len(a.listings) > 0 {
+				a.gone[op] = a.gen
+				a.goneOrder = append(a.goneOrder, goneEntry{op: op, gen: a.gen})
+			}
 		}
 	}
 }

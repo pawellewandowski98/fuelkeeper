@@ -893,10 +893,14 @@ func TestRotatedShardNotReacquiredWhileReleasePending(t *testing.T) {
 	assert.False(t, alloc.Has(shards[1].TxID))
 
 	close(wrapped.unblock)
-	require.Eventually(t, func() bool {
-		got, err := base.GetShard(ctx, poolName, shards[0].TxID)
-		return err == nil && got.Owner == ""
-	}, 2*time.Second, 5*time.Millisecond)
+	// Wait for the manager's own completion signal (the shard leaving the
+	// releasing set), not the store's owner field: the background goroutine
+	// clears the lease first and only then un-excludes the shard.
+	require.Eventually(t, func() bool { return !m.ReleasePending(shards[0].TxID) },
+		2*time.Second, time.Millisecond)
+	got, err := base.GetShard(ctx, poolName, shards[0].TxID)
+	require.NoError(t, err)
+	assert.Empty(t, got.Owner, "lease cleared before the shard is un-excluded")
 	adopted, err := m.AdoptOnce(ctx)
 	require.NoError(t, err)
 	assert.True(t, adopted)
@@ -1064,4 +1068,75 @@ func TestPoolServesEveryRowPastSpentOutShardsUnderConcurrentLoad(t *testing.T) {
 	}
 	wg.Wait()
 	assert.Equal(t, int64(total), served.Load(), "every row served (attempts: %d)", attempts.Load())
+}
+
+// listHookStore runs hook after the wrapped ListAvailable has read its
+// snapshot and before the snapshot is returned to the caller: the window in
+// which a concurrent Reserve can hand out, reserve and forget a listed row.
+type listHookStore struct {
+	store.Store
+	hook func(txid chainhash.Hash)
+}
+
+func (w *listHookStore) ListAvailable(ctx context.Context, pool string, txid chainhash.Hash, fromVout uint32, limit int) ([]store.Row, error) {
+	rows, err := w.Store.ListAvailable(ctx, pool, txid, fromVout, limit)
+	if err == nil && w.hook != nil {
+		w.hook(txid)
+	}
+	return rows, err
+}
+
+// TestRescanDoesNotReAddRowsHandedOutDuringListing pins the stale re-add
+// race: a rescan lists a shard's available rows, a concurrent Reserve then
+// pops, reserves and forgets some of those rows, and only afterwards does the
+// rescan add its (now stale) snapshot to the allocator. The rows handed out
+// in between must not be queued again: they are reserved in the store, so
+// handing them out a second time can only miss its CAS (inflating
+// cas_missed_total, the double-hand-out audit signal, and returning
+// exhausted to a request while fuel exists).
+func TestRescanDoesNotReAddRowsHandedOutDuringListing(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "stale-readd"
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	sh, _ := storetest.MintShard(t, base, poolName, 5, store.ShardMined)
+	wrapped := &listHookStore{Store: base}
+	cfg := testInstanceConfig()
+	cfg.LowWaterRows = 1
+	m, alloc := newMgr(t, wrapped, clk, cfg, pc)
+	require.NoError(t, m.FeedOnce(ctx))
+	require.Equal(t, 5, alloc.Available())
+
+	var handedOut []store.Row
+	tok := store.NewToken()
+	wrapped.hook = func(txid chainhash.Hash) {
+		if txid != sh.TxID || handedOut != nil {
+			return
+		}
+		handedOut = alloc.Pop(2) // a concurrent Reserve, exactly as Pool.Reserve does it
+		storetest.MustReserve(t, base, poolName, handedOut, tok, clk.Now().Add(time.Hour))
+		alloc.Forget(storetest.Ops(handedOut))
+	}
+	require.NoError(t, m.RescanOnce(ctx))
+	require.Len(t, handedOut, 2)
+
+	assert.Equal(t, 3, alloc.Available(), "only the 3 rows still available in the store are queued")
+	rest := alloc.Pop(10)
+	for _, r := range rest {
+		for _, h := range handedOut {
+			assert.NotEqual(t, h.Outpoint, r.Outpoint, "row handed out during the listing re-queued")
+		}
+	}
+
+	alloc.Return(rest)
+
+	// Rows genuinely released back later are picked up by the next rescan,
+	// whose listing starts after they were handed out.
+	wrapped.hook = nil
+	n, err := base.Release(ctx, poolName, tok, storetest.Ops(handedOut))
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+	require.NoError(t, m.RescanOnce(ctx))
+	assert.Equal(t, 5, alloc.Available())
 }

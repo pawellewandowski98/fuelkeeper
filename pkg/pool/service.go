@@ -346,6 +346,8 @@ func (p *Pool) noteReleased(ctx context.Context, ops []store.Outpoint) {
 	if len(owned) == 0 {
 		return
 	}
+	gen := p.alloc.BeginListing()
+	defer p.alloc.EndListing(gen)
 	rows, err := p.st.GetRows(ctx, p.cfg.Name, owned)
 	if err != nil {
 		return
@@ -356,7 +358,7 @@ func (p *Pool) noteReleased(ctx context.Context, ops []store.Outpoint) {
 			avail = append(avail, r)
 		}
 	}
-	p.mgr.NoteReleased(avail)
+	p.mgr.noteReleasedListed(avail, gen)
 }
 
 // Release returns reserved rows to the pool (trust) or parks them for the

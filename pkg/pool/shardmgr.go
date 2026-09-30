@@ -528,7 +528,13 @@ func (m *ShardManager) loadRows(ctx context.Context, txid chainhash.Hash) (int, 
 // loadRowsCounting is loadRows that also reports how many rows the store
 // listed as available, including ones the allocator already tracks (queued,
 // or popped and still in flight through the coalescer) and so did not re-add.
+//
+// The whole paged read is one allocator listing (BeginListing/AddListed), so
+// rows a concurrent Reserve hands out and forgets while it runs are not
+// re-added from a page read before that.
 func (m *ShardManager) loadRowsCounting(ctx context.Context, txid chainhash.Hash) (added, listed int, err error) {
+	gen := m.alloc.BeginListing()
+	defer m.alloc.EndListing(gen)
 	var from uint32
 	for {
 		opStart := time.Now()
@@ -538,7 +544,7 @@ func (m *ShardManager) loadRowsCounting(ctx context.Context, txid chainhash.Hash
 			return added, listed, err
 		}
 		listed += len(rows)
-		added += m.alloc.Add(txid, rows)
+		added += m.alloc.AddListed(txid, rows, gen)
 		if len(rows) < listPage {
 			return added, listed, nil
 		}
@@ -817,14 +823,28 @@ func (m *ShardManager) NoteCASMiss(txid chainhash.Hash) {
 // shard. Rows of a shard already rotated out (or otherwise dropped) are not
 // re-added: they stay available in the store for whoever adopts the shard,
 // which is not this instance until its emptyExclusion window has passed.
+//
+// rows must have been read from the store after rows it lists were last
+// handed out by this instance; Pool.noteReleased uses noteReleasedListed,
+// which enforces that with an allocator listing instead.
 func (m *ShardManager) NoteReleased(rows []store.Row) {
+	m.noteReleased(rows, func(txid chainhash.Hash, rs []store.Row) { m.alloc.Add(txid, rs) })
+}
+
+// noteReleasedListed is NoteReleased for rows read by the allocator listing
+// gen (see Allocator.BeginListing).
+func (m *ShardManager) noteReleasedListed(rows []store.Row, gen uint64) {
+	m.noteReleased(rows, func(txid chainhash.Hash, rs []store.Row) { m.alloc.AddListed(txid, rs, gen) })
+}
+
+func (m *ShardManager) noteReleased(rows []store.Row, add func(chainhash.Hash, []store.Row)) {
 	byShard := map[chainhash.Hash][]store.Row{}
 	for _, r := range rows {
 		byShard[r.TxID] = append(byShard[r.TxID], r)
 	}
 	for txid, rs := range byShard {
 		if m.alloc.Has(txid) {
-			m.alloc.Add(txid, rs)
+			add(txid, rs)
 		}
 	}
 }

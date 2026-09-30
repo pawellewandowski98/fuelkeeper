@@ -228,3 +228,42 @@ func BenchmarkAllocatorPopSteadyState100k(b *testing.B) {
 		a.Add(sh.TxID, got)
 	}
 }
+
+// TestAllocatorAddListedSkipsRowsForgottenDuringListing pins the listing
+// guard at the allocator level: a row forgotten after a listing began is
+// stale in that listing, a row forgotten before it began is not, and
+// tombstones are only kept while some listing that needs them is open.
+func TestAllocatorAddListedSkipsRowsForgottenDuringListing(t *testing.T) {
+	a := pool.NewAllocator()
+	sh := owned(storetest.Start)
+	require.True(t, a.AddShard(sh))
+	rows := mkRows(store.Outpoint{TxID: sh.TxID}, 4)
+	require.Equal(t, 4, a.Add(sh.TxID, rows))
+
+	before := a.Pop(1) // forgotten before any listing: no tombstone
+	a.Forget(storetest.Ops(before))
+	e, o := a.Tombstones()
+	assert.Zero(t, e+o, "no tombstones while no listing is open")
+
+	outer := a.BeginListing()
+	during := a.Pop(1)
+	a.Forget(storetest.Ops(during))
+	inner := a.BeginListing() // begins after `during` was forgotten
+	assert.Equal(t, 1, a.AddListed(sh.TxID, during, inner), "forgotten before the inner listing began: really back")
+	all := a.Pop(10)
+	require.Len(t, all, 3, "re-added at the back of the FIFO")
+	require.Equal(t, during[0].Outpoint, all[2].Outpoint)
+	a.Return(all[:2])
+	a.Forget(storetest.Ops(all[2:]))
+	assert.Zero(t, a.AddListed(sh.TxID, during, outer), "forgotten after the outer listing began: stale")
+	assert.Zero(t, a.AddListed(sh.TxID, during, inner), "forgotten again after the inner listing began: stale")
+	assert.Equal(t, 1, a.AddListed(sh.TxID, before, outer), "forgotten before the outer listing began: really back")
+
+	a.EndListing(outer)
+	e, _ = a.Tombstones()
+	assert.Equal(t, 1, e, "the inner listing still needs its tombstone")
+	a.EndListing(inner)
+	e, o = a.Tombstones()
+	assert.Zero(t, e+o, "all tombstones pruned once no listing is open")
+	assert.Equal(t, 1, a.Add(sh.TxID, during), "plain Add ignores tombstones")
+}
