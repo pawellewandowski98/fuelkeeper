@@ -109,18 +109,28 @@ func (c ReaperConfig) Validate() error {
 // lose a double-spend race before being mined. An unconfirmed, merely-known,
 // or rejected txid leaves the row quarantined for a later tick to resolve.
 //
-// Known gap (see TestReaperHintPathDoesNotVerifyInputs): TxStatus carries no
-// input list, so neither this Tx confirmation nor the outpoint oracle's own
-// verdict is cross-checked against it — the reaper trusts that a Spent
-// verdict or a client's hint names a txid that actually spends the outpoint
-// in question, once that txid is mined. This makes the outpoint oracle the
-// deployment's real safety boundary: it must answer Spent/Unspent correctly
-// for on-chain-confirmed spends. The Tx(hint) fallback (used when the
-// outpoint oracle answers Unknown or reports Spent without naming a txid) is
-// only safe when the outpoint oracle is authoritative for mempool-only
-// spends too; otherwise a hostile client under spend_policy=verify could name
-// any mined, unrelated txid as its hint and have the row incorrectly
-// resolved to spent.
+// Input verification: when TxStatus.Inputs is non-nil, every candidate
+// spending txid — the outpoint oracle's own SpendingTxID and a client's
+// SpentHint alike — is also required to actually spend the row's outpoint,
+// i.e. the outpoint must be a member of Inputs, before the row is resolved to
+// spent (see TestReaperHintPathRejectsSpenderThatDoesNotSpendTheOutpoint,
+// TestReaperHintPathAcceptsSpenderWhoseInputsIncludeTheOutpoint and
+// TestReaperOutpointOracleSpenderMustSpendTheOutpoint). This closes what was
+// formerly a gap: without it, a hostile client under spend_policy=verify
+// could name any mined, unrelated txid as its hint and have the row
+// incorrectly resolved to spent.
+//
+// When TxStatus.Inputs is nil — an oracle that cannot serve the raw
+// transaction (e.g. a gateway that only tracks broadcast status) reports
+// unknown inputs, never "no inputs" — this check cannot be performed and the
+// previous trust model applies: a Spent verdict or a client's hint is trusted
+// to name a txid that actually spends the outpoint in question, once that
+// txid is mined (see TestReaperSpenderWithNilInputsIsTrustedWhenMined). In
+// that configuration the outpoint oracle remains the deployment's real safety
+// boundary: it must answer Spent/Unspent correctly for on-chain-confirmed
+// spends, and the Tx(hint) fallback (used when the outpoint oracle answers
+// Unknown or reports Spent without naming a txid) is only as safe as the
+// outpoint oracle is authoritative for mempool-only spends too.
 type Reaper struct {
 	st    store.Store
 	orc   oracle.Oracle
@@ -270,7 +280,7 @@ func (r *Reaper) pageQuarantined(ctx context.Context, p string, before time.Time
 // non-nil only for context cancellation.
 func (r *Reaper) classify(ctx context.Context, p string, now time.Time, rows []store.Row) (toSpent map[chainhash.Hash][]store.Outpoint, toAvailable []store.Outpoint, err error) {
 	toSpent = map[chainhash.Hash][]store.Outpoint{}
-	txCache := map[chainhash.Hash]*oracle.TxStatus{}
+	txCache := map[chainhash.Hash]*txCacheEntry{}
 	txDown := false
 
 	for start := 0; start < len(rows); start += r.cfg.OracleBatch {
@@ -325,7 +335,7 @@ func sameOutpoints(batch []store.Row, results []oracle.Result) bool {
 func (r *Reaper) classifyOne(
 	ctx context.Context, p string, now time.Time, row store.Row, res oracle.Result,
 	toSpent map[chainhash.Hash][]store.Outpoint, toAvailable *[]store.Outpoint,
-	txCache map[chainhash.Hash]*oracle.TxStatus, txDown *bool,
+	txCache map[chainhash.Hash]*txCacheEntry, txDown *bool,
 ) error {
 	switch res.Status {
 	case oracle.StatusSpent:
@@ -363,18 +373,35 @@ func (r *Reaper) classifyOne(
 	return nil
 }
 
+// txCacheEntry caches one tick's Tx(txid) verdict alongside a membership set
+// built once from its Inputs, so resolveViaTx's per-row input check is O(1)
+// instead of an O(len(Inputs)) scan per row sharing the txid. inputs is nil
+// exactly when TxStatus.Inputs is nil (unknown inputs, trust the mined
+// verdict as-is); it is a non-nil, possibly-empty set otherwise. warned
+// records whether the input-mismatch warning has already been logged for
+// this txid this tick, so 1000 rows sharing one bogus hint produce at most
+// one warning, not 1000.
+type txCacheEntry struct {
+	ts     *oracle.TxStatus
+	inputs map[store.Outpoint]struct{}
+	warned bool
+}
+
 // resolveViaTx looks up a claimed spending txid — the outpoint oracle's own
 // SpendingTxID, or a client's SpentHint — through the tick's cache, and
 // counts it as proven only once it is mined (see the Reaper doc comment's
 // terminal-state policy). On an oracle failure it sets *txDown and logs once,
 // so 1000 rows sharing one txid cost at most one failed Tx call and one
-// warning per tick, not one per row. The returned error is non-nil only for
-// context cancellation.
+// warning per tick, not one per row. When the verdict's Inputs is non-nil,
+// outpoint must also be a member of it (see the Reaper doc comment's input
+// verification paragraph); a mismatch is logged at Warn once per txid per
+// tick via txCacheEntry.warned, not once per row. The returned error is
+// non-nil only for context cancellation.
 func (r *Reaper) resolveViaTx(
 	ctx context.Context, p string, outpoint store.Outpoint, txid chainhash.Hash,
-	toSpent map[chainhash.Hash][]store.Outpoint, txCache map[chainhash.Hash]*oracle.TxStatus, txDown *bool,
+	toSpent map[chainhash.Hash][]store.Outpoint, txCache map[chainhash.Hash]*txCacheEntry, txDown *bool,
 ) error {
-	ts, cached := txCache[txid]
+	entry, cached := txCache[txid]
 	if !cached {
 		if *txDown {
 			return nil
@@ -390,12 +417,30 @@ func (r *Reaper) resolveViaTx(
 			return nil
 		}
 		oracleRequests.WithLabelValues("tx", "ok").Inc()
-		ts = &got
-		txCache[txid] = ts
+		entry = &txCacheEntry{ts: &got}
+		if got.Inputs != nil {
+			entry.inputs = make(map[store.Outpoint]struct{}, len(got.Inputs))
+			for _, in := range got.Inputs {
+				entry.inputs[in] = struct{}{}
+			}
+		}
+		txCache[txid] = entry
 	}
-	if ts.Known && ts.Mined && !ts.Rejected {
-		toSpent[txid] = append(toSpent[txid], outpoint)
+	ts := entry.ts
+	if !ts.Known || !ts.Mined || ts.Rejected {
+		return nil
 	}
+	if entry.inputs != nil {
+		if _, spendsOutpoint := entry.inputs[outpoint]; !spendsOutpoint {
+			if !entry.warned {
+				r.log.Warn("mined spender's inputs do not include this outpoint; leaving quarantined",
+					"pool", p, "txid", txid)
+				entry.warned = true
+			}
+			return nil
+		}
+	}
+	toSpent[txid] = append(toSpent[txid], outpoint)
 	return nil
 }
 
