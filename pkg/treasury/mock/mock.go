@@ -188,13 +188,17 @@ func (t *Treasury) Send(_ context.Context, txid chainhash.Hash) error {
 	return nil
 }
 
-// MinedBEEF returns a synthetic mined BEEF: a marker, the txid and the BUMP bytes.
-func (t *Treasury) MinedBEEF(_ context.Context, txid chainhash.Hash, _, merklePath []byte) ([]byte, error) {
+// MinedBEEF returns a synthetic mined BEEF: a marker, the txid, the stored
+// unmined BEEF and the BUMP bytes. Incorporating unminedBEEF lets a caller
+// prove that the shard's actual stored BEEF (from GetShard, since ListShards
+// omits it) was threaded through, not e.g. a nil or truncated value.
+func (t *Treasury) MinedBEEF(_ context.Context, txid chainhash.Hash, unminedBEEF, merklePath []byte) ([]byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.failMinedBEEF != nil {
 		return nil, t.failMinedBEEF
 	}
 	out := append([]byte("mock-mined-beef-"), txid[:]...)
+	out = append(out, unminedBEEF...)
 	return append(out, merklePath...), nil
 }
