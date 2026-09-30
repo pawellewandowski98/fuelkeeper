@@ -249,6 +249,18 @@ func testAcquireRenewRelease(t *testing.T, s store.Store, clk *Clock) {
 	require.NoError(t, err)
 	assert.Equal(t, store.ShardHead{Status: store.ShardMined, Version: 1}, head)
 
+	// RenewShard is a heartbeat: it must update only lease_until, never
+	// stamping UpdatedAt or bumping Version (store.go, RenewShard).
+	pre, err := s.GetShard(ctx, "main", s1.TxID)
+	require.NoError(t, err)
+	clk.Advance(time.Second)
+	_, err = s.RenewShard(ctx, "main", s1.TxID, "a", clk.Now().Add(time.Minute))
+	require.NoError(t, err)
+	post, err := s.GetShard(ctx, "main", s1.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, pre.UpdatedAt, post.UpdatedAt, "RenewShard is a heartbeat: must not stamp UpdatedAt")
+	assert.Equal(t, pre.Version, post.Version, "RenewShard must not bump Version")
+
 	// Between s1's old 30s lease (now expired) and its renewed 1m lease (still
 	// active), s1 must stay protected by the renewal. s2 is excluded here so this
 	// check is only about s1 (s2's own, never-renewed lease is examined next).

@@ -46,22 +46,45 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 		return wrap(err)
 	}
 
-	// Reserve the txid globally across pools before writing anything else.
+	// Reserve the txid globally across pools before writing anything else. The
+	// claim also records this call's size/denomination/lock-mode so that, on a
+	// conflict below, a second PutShard for the same (pool, txid) whose params
+	// differ from whatever claimed the txid first is rejected right here --
+	// before it can insert any of its own (extra or different) rows. Without
+	// this, a mismatched second call would fall through to InsertMany below
+	// and successfully insert its own rows (any that don't collide by vout
+	// with what the first call already wrote), and then, since no shard
+	// document exists yet to catch the mismatch, successfully create the
+	// shard document too: the only params check that already existed (via
+	// sameShardParams, once a shard document exists) runs too late to prevent
+	// that.
 	txidHex := hex.EncodeToString(shard.TxID[:])
-	if _, err := s.txids.InsertOne(octx, bson.D{{Key: "_id", Value: txidHex}, {Key: "p", Value: shard.Pool}}); err != nil {
+	claim := bson.D{
+		{Key: "_id", Value: txidHex}, {Key: "p", Value: shard.Pool},
+		{Key: "n", Value: int32(shard.Size)},         //nolint:gosec // ValidatePutShard: 0 < size <= maxBatch
+		{Key: "d", Value: int64(shard.Denomination)}, //nolint:gosec // denominations fit in int64
+		{Key: "m", Value: int32(shard.LockMode)},     //nolint:gosec // small enum
+	}
+	if _, err := s.txids.InsertOne(octx, claim); err != nil {
 		if !mongo.IsDuplicateKeyError(err) {
 			return wrap(err)
 		}
-		var owner struct {
-			Pool string `bson:"p"`
-		}
+		var owner txidClaimDoc
 		if gerr := s.txids.FindOne(octx, bson.D{{Key: "_id", Value: txidHex}}).Decode(&owner); gerr != nil {
 			return wrap(gerr)
 		}
 		if owner.Pool != shard.Pool {
 			return store.ErrShardExists
 		}
-		// Same pool: a concurrent/partial PutShard is in flight; continue.
+		// owner.Size == 0 means the existing claim predates this field (a
+		// schema-v1 database upgraded mid-write): fall back to the original,
+		// pool-only check rather than a false mismatch against zero values.
+		if owner.Size != 0 && !sameClaimParams(owner, shard) {
+			return store.ErrShardExists
+		}
+		// Same pool, same params: a concurrent/partial PutShard for this exact
+		// shard is in flight; continue (InsertMany below tolerates rows it
+		// already wrote).
 	}
 
 	now := s.now().Truncate(time.Microsecond)
@@ -107,6 +130,27 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 func sameShardParams(d shardDoc, shard store.Shard) bool {
 	return int(d.Size) == shard.Size && uint64(d.Denom) == shard.Denomination && //nolint:gosec // stored from uint64
 		store.LockMode(d.Mode) == shard.LockMode //nolint:gosec // small enum
+}
+
+// txidClaimDoc is the BSON encoding of a fuel_shard_txids document: the
+// global (across pools) reservation of a txid, taken before any row or shard
+// document is written for it. Size/Denom/Mode are recorded so a later,
+// mismatched PutShard for the same txid can be rejected before it inserts
+// anything (see PutShard); they are absent (zero) on a claim written by a
+// schema-v1 build.
+type txidClaimDoc struct {
+	ID    string `bson:"_id"`
+	Pool  string `bson:"p"`
+	Size  int32  `bson:"n"`
+	Denom int64  `bson:"d"`
+	Mode  int32  `bson:"m"`
+}
+
+// sameClaimParams reports whether c's recorded size/denomination/lock-mode
+// match shard's own.
+func sameClaimParams(c txidClaimDoc, shard store.Shard) bool {
+	return int(c.Size) == shard.Size && uint64(c.Denom) == shard.Denomination && //nolint:gosec // stored from uint64
+		store.LockMode(c.Mode) == shard.LockMode //nolint:gosec // small enum
 }
 
 // GetShard implements store.Store.
@@ -183,7 +227,23 @@ func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Has
 	return store.ErrTerminalShard
 }
 
-// RetireShard implements store.Store.
+// RetireShard implements store.Store. Rows are cascaded first and the shard
+// document is updated last -- the same "rows first, record last" rule
+// PutShard uses for non-atomic backends (see store.go) -- so a crash or
+// timeout between the two steps always leaves the safe intermediate state
+// (rows already invalid, shard document not yet) rather than the unsafe one
+// (shard already invalid while ListAvailable/Reserve can still see or claim
+// its rows).
+//
+// This also makes RetireShard self-repairing: the cascade's own filter
+// (state in {available, reserved, quarantined}) is independent of the shard
+// document's current status, so it always runs, even when the shard is
+// already invalid -- which is exactly the state a previous call left behind
+// if it updated the shard but then failed or was interrupted before the
+// cascade ran. A retry after any such partial previous attempt therefore
+// finds and finishes whatever cascading remains, and once nothing is left to
+// do it simply reports 0, preserving the idempotency contract for a genuine
+// replay.
 func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Hash) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -200,25 +260,16 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 	id := shardID(pool, txid)
 	now := s.now().Truncate(time.Microsecond)
 
-	filter := bson.D{{Key: "_id", Value: id}, {Key: "s", Value: bson.D{{Key: "$ne", Value: int32(store.ShardInvalid)}}}}
-	update := bson.D{
-		{Key: "$set", Value: bson.D{{Key: "s", Value: int32(store.ShardInvalid)}, {Key: "o", Value: ""}, {Key: "ua", Value: us(now)}}},
-		{Key: "$unset", Value: bson.D{{Key: "lu", Value: ""}}},
-		{Key: "$inc", Value: bson.D{{Key: "ver", Value: int64(1)}}},
-	}
-	res, err := s.shards.UpdateOne(octx, filter, update)
-	if err != nil {
-		return 0, wrap(err)
-	}
-	if res.MatchedCount == 0 {
-		err = s.shards.FindOne(octx, bson.D{{Key: "_id", Value: id}}).Err()
+	// Confirm the shard exists before touching any rows: a txid can have rows
+	// inserted by a PutShard that crashed before writing the shard document
+	// (PutShard also writes rows first; see its own comment), and cascading
+	// those orphan rows here would corrupt a later, successful PutShard retry
+	// for the same txid, which never touches an existing row.
+	if err := s.shards.FindOne(octx, bson.D{{Key: "_id", Value: id}}).Err(); err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
 			return 0, store.ErrNotFound
 		}
-		if err != nil {
-			return 0, wrap(err)
-		}
-		return 0, nil // already invalid: idempotent no-op
+		return 0, wrap(err)
 	}
 
 	cascadeFilter := bson.D{
@@ -233,7 +284,25 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 	if err != nil {
 		return 0, wrap(err)
 	}
-	return int(ures.ModifiedCount), nil
+	n := int(ures.ModifiedCount)
+
+	filter := bson.D{{Key: "_id", Value: id}, {Key: "s", Value: bson.D{{Key: "$ne", Value: int32(store.ShardInvalid)}}}}
+	update := bson.D{
+		{Key: "$set", Value: bson.D{{Key: "s", Value: int32(store.ShardInvalid)}, {Key: "o", Value: ""}, {Key: "ua", Value: us(now)}}},
+		{Key: "$unset", Value: bson.D{{Key: "lu", Value: ""}}},
+		{Key: "$inc", Value: bson.D{{Key: "ver", Value: int64(1)}}},
+	}
+	if _, err := s.shards.UpdateOne(octx, filter, update); err != nil {
+		return n, wrap(err)
+	}
+	// Whether this call itself just flipped the shard (a fresh retire) or
+	// found it already invalid (a repair of a prior partial attempt, or a
+	// fully-idempotent replay), n is exactly what this call changed: the
+	// cascade's own filter already excludes rows an earlier attempt finished,
+	// so a fully-repaired replay correctly reports 0, and the shard's own
+	// Version/UpdatedAt are only bumped when this call is the one that
+	// transitions it.
+	return n, nil
 }
 
 // AcquireShard implements store.Store.

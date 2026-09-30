@@ -462,7 +462,16 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 	return s.bulkMutate(octx, models)
 }
 
-// Stats implements store.Store.
+// Stats implements store.Store. Its two aggregations ($match{p} + $group by
+// state/status) are covered by rows_pool_state_v2 ({p, st, sh}) and
+// shards_adopt ({p, s, ca, t}) respectively -- both start with the exact
+// {p, <grouped field>} prefix the pipeline needs -- so in practice this is
+// already an index-only scan (see indexes_test.go's TestExplainUsesIndexes,
+// "Stats"). That is incidental to how those indexes are shaped for their own
+// primary queries, not something Stats is specifically optimized for; if a
+// future index change ever made this a FETCH-per-document scan instead, that
+// would be an acceptable trade for Stats specifically (an operational/
+// monitoring query, not a per-row hot path), not worth a dedicated index.
 func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 	if err := ctx.Err(); err != nil {
 		return store.Stats{}, err

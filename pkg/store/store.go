@@ -130,6 +130,8 @@ type Store interface {
 	// successful AcquireShard by another holder, or ReleaseShard, clears Owner) and
 	// returns the current status and version. until must be non-zero
 	// (ErrInvalidArgument otherwise). Otherwise ErrNotOwner; missing: ErrNotFound.
+	// RenewShard is a heartbeat: it updates only lease_until and never stamps
+	// UpdatedAt or bumps Version.
 	RenewShard(ctx context.Context, pool string, txid chainhash.Hash, holder string, until time.Time) (ShardHead, error)
 	// ReleaseShard clears the lease if Owner == holder, after which the lease is free
 	// and a further RenewShard by the same holder returns ErrNotOwner; otherwise it is
