@@ -490,7 +490,7 @@ func (m *ShardManager) releaseLease(ctx context.Context, txid chainhash.Hash) {
 // returns false, doing nothing, when the shard is no longer owned (another
 // path dropped it first), so a shard is never dropped or counted twice.
 func (m *ShardManager) drop(ctx context.Context, txid chainhash.Hash, release bool, reason string) bool {
-	if !m.forget(txid, release, reason) {
+	if ok, _ := m.forget(txid, release, false, reason); !ok {
 		return false
 	}
 	if release {
@@ -503,15 +503,20 @@ func (m *ShardManager) drop(ctx context.Context, txid chainhash.Hash, release bo
 // background goroutine (bounded at 1 s like releaseLease; Run waits for it
 // before returning). Until that release completes the shard is kept out of
 // AcquireShard via the releasing set, so a late release can never clear a
-// lease this instance has meanwhile re-acquired.
+// lease this instance has meanwhile re-acquired. The background release is
+// registered (bg.Add, releasing insert) inside forget's critical section and
+// only while the manager is not closed: ReleaseAll sets closed under the same
+// mutex before Run calls bg.Wait, so no Add can race that Wait. Once closed,
+// the release runs synchronously here instead.
 func (m *ShardManager) dropAsync(ctx context.Context, txid chainhash.Hash, reason string) bool {
-	if !m.forget(txid, true, reason) {
+	ok, background := m.forget(txid, true, true, reason)
+	if !ok {
 		return false
 	}
-	m.mu.Lock()
-	m.releasing[txid] = struct{}{}
-	m.mu.Unlock()
-	m.bg.Add(1)
+	if !background {
+		m.releaseLease(ctx, txid)
+		return true
+	}
 	go func() {
 		defer m.bg.Done()
 		m.releaseLease(context.WithoutCancel(ctx), txid)
@@ -523,17 +528,25 @@ func (m *ShardManager) dropAsync(ctx context.Context, txid chainhash.Hash, reaso
 }
 
 // forget is drop's local half: check-and-delete txid from owned under mu
-// (false if it was already gone), count the drop, record the exclusion when
-// release is true, and remove the shard from the allocator.
-func (m *ShardManager) forget(txid chainhash.Hash, release bool, reason string) bool {
+// (ok false if it was already gone), count the drop, record the exclusion
+// when release is true, and remove the shard from the allocator. With
+// backgroundRelease it also, in the same critical section and only if the
+// manager is not closed, registers a background lease release (bg.Add and
+// the releasing insert) and reports that the caller must start it.
+func (m *ShardManager) forget(txid chainhash.Hash, release, backgroundRelease bool, reason string) (ok, background bool) {
 	m.mu.Lock()
-	if _, ok := m.owned[txid]; !ok {
+	if _, owned := m.owned[txid]; !owned {
 		m.mu.Unlock()
-		return false
+		return false, false
 	}
 	delete(m.owned, txid)
 	if release {
 		m.markRecentlyEmpty(txid, m.clock.Now())
+	}
+	if release && backgroundRelease && !m.closed {
+		m.releasing[txid] = struct{}{}
+		m.bg.Add(1)
+		background = true
 	}
 	m.mu.Unlock()
 	if c, ok := m.dropCounters[reason]; ok {
@@ -542,7 +555,7 @@ func (m *ShardManager) forget(txid chainhash.Hash, release bool, reason string) 
 		shardDrops.WithLabelValues(m.pc.Name, reason).Inc()
 	}
 	m.alloc.RemoveShard(txid)
-	return true
+	return true, background
 }
 
 func (m *ShardManager) ownedIDs() []chainhash.Hash {

@@ -155,8 +155,8 @@ wait for expiry; `spent` is reachable only through the oracle. With
   (as built, 2026-09-30): it rescans up to 2 drained shards oldest first,
   keeps any whose rows are back, releases those the store shows empty (60 s
   re-adoption exclusion), and adopts into the freed slots. Adoption never
-  writes fuel rows, so an instance crash loses nothing. Fairness across instances falls out of hunger-driven pulls and the
-  cap; no coordinator.
+  writes fuel rows, so an instance crash loses nothing. Fairness across
+  instances falls out of hunger-driven pulls and the cap; no coordinator.
 - Renewal outcomes: ok → refresh cached status/version (refetch BEEF if
   changed); `ErrNotOwner` → drop the shard now; status `retired`/`invalid` →
   drop. If the store is unreachable, keep serving owned shards (CAS keeps it

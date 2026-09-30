@@ -787,14 +787,17 @@ func TestRotationStopsAtFirstRefilledShard(t *testing.T) {
 	assert.Equal(t, m.Holder(), got.Owner)
 }
 
-// slowReleaseStore delays every ReleaseShard call.
+// slowReleaseStore delays ReleaseShard calls (only for txids in only, when set).
 type slowReleaseStore struct {
 	store.Store
 	delay time.Duration
+	only  map[chainhash.Hash]bool
 }
 
 func (w *slowReleaseStore) ReleaseShard(ctx context.Context, pool string, txid chainhash.Hash, holder string) error {
-	time.Sleep(w.delay)
+	if w.only == nil || w.only[txid] {
+		time.Sleep(w.delay)
+	}
 	return w.Store.ReleaseShard(ctx, pool, txid, holder)
 }
 
@@ -833,4 +836,142 @@ func TestEnsureRowsRotationDoesNotWaitForLeaseRelease(t *testing.T) {
 		}
 		return true
 	}, 3*time.Second, 10*time.Millisecond, "leases still released, asynchronously")
+}
+
+// blockingReleaseStore blocks every ReleaseShard call until unblock is closed
+// or the call's own context (releaseLease's 1 s budget) ends.
+type blockingReleaseStore struct {
+	store.Store
+	unblock chan struct{}
+}
+
+func (w *blockingReleaseStore) ReleaseShard(ctx context.Context, pool string, txid chainhash.Hash, holder string) error {
+	select {
+	case <-w.unblock:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return w.Store.ReleaseShard(ctx, pool, txid, holder)
+}
+
+// TestRotatedShardNotReacquiredWhileReleasePending pins the releasing guard:
+// while a request-path rotation's background ReleaseShard is still pending,
+// the shard stays out of AcquireShard even after emptyExclusion (and our own
+// lease) have lapsed and its rows are back, so a late release can never clear
+// a lease this instance has re-acquired.
+func TestRotatedShardNotReacquiredWhileReleasePending(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "rotate-pending"
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, _ := mintN(t, base, clk, poolName, 4, 10)
+	cfg := testInstanceConfig() // MaxShards=2
+	cfg.LowWaterRows = 100
+	wrapped := &blockingReleaseStore{Store: base, unblock: make(chan struct{})}
+	m, alloc := newMgr(t, wrapped, clk, cfg, pc)
+	require.NoError(t, m.FeedOnce(ctx))
+	tok, popped := drainAll(t, base, clk, poolName, alloc)
+
+	require.True(t, m.EnsureRows(ctx)) // rotates shards 0 and 1 out; their releases block
+	require.False(t, alloc.Has(shards[0].TxID))
+	var back []store.Row
+	for _, r := range popped {
+		if r.TxID == shards[0].TxID {
+			back = append(back, r)
+		}
+	}
+	_, err := base.Release(ctx, poolName, tok, storetest.Ops(back))
+	require.NoError(t, err)
+	clk.Advance(2 * time.Minute) // past emptyExclusion and LeaseTTL
+
+	for range 4 {
+		_, err := m.AdoptOnce(ctx)
+		require.NoError(t, err)
+	}
+	assert.False(t, alloc.Has(shards[0].TxID), "shard with a pending background release must not be re-acquired")
+	assert.False(t, alloc.Has(shards[1].TxID))
+
+	close(wrapped.unblock)
+	require.Eventually(t, func() bool {
+		got, err := base.GetShard(ctx, poolName, shards[0].TxID)
+		return err == nil && got.Owner == ""
+	}, 2*time.Second, 5*time.Millisecond)
+	adopted, err := m.AdoptOnce(ctx)
+	require.NoError(t, err)
+	assert.True(t, adopted)
+	assert.True(t, alloc.Has(shards[0].TxID), "adoptable again once its release completed")
+}
+
+// reentrantRenewStore reports every renewal as lost and, on the first call,
+// runs a nested RenewOnce on the same manager from inside RenewShard: both
+// the inner and the outer RenewOnce then try to drop the same shard.
+type reentrantRenewStore struct {
+	store.Store
+	m      *pool.ShardManager
+	nested atomic.Bool
+}
+
+func (w *reentrantRenewStore) RenewShard(ctx context.Context, _ string, _ chainhash.Hash, _ string, _ time.Time) (store.ShardHead, error) {
+	if w.nested.CompareAndSwap(false, true) {
+		_ = w.m.RenewOnce(ctx)
+	}
+	return store.ShardHead{}, store.ErrNotOwner
+}
+
+// TestDropCountsOnceWhenTwoPathsDropSameShard pins the double-drop guard: two
+// paths dropping the same shard count it in shard_drops_total once.
+func TestDropCountsOnceWhenTwoPathsDropSameShard(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "drop-twice"
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	sh, _ := storetest.MintShard(t, base, poolName, 3, store.ShardMined)
+	cfg := testInstanceConfig()
+	cfg.MaxShards = 1
+	wrapped := &reentrantRenewStore{Store: base}
+	m, alloc := newMgr(t, wrapped, clk, cfg, pc)
+	wrapped.m = m
+	require.NoError(t, m.FeedOnce(ctx))
+	require.True(t, alloc.Has(sh.TxID))
+	before := testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "not_owner"))
+
+	_ = m.RenewOnce(ctx)
+	assert.False(t, alloc.Has(sh.TxID))
+	assert.InDelta(t, before+1, testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "not_owner")), 0,
+		"dropped by both the nested and the outer RenewOnce, counted once")
+}
+
+// TestRunWaitsForBackgroundLeaseReleases pins that Run returns only after the
+// request-path rotation's background lease releases have completed.
+func TestRunWaitsForBackgroundLeaseReleases(t *testing.T) {
+	const poolName = "rotate-runwait"
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, _ := mintN(t, base, clk, poolName, 4, 10)
+	cfg := testInstanceConfig() // MaxShards=2
+	cfg.LowWaterRows = 100
+	cfg.LeaseTTL = time.Hour
+	cfg.RescanInterval = time.Hour
+	// Only the shards rotation will release are slow, so a Run that skipped
+	// waiting would return while their leases are still held.
+	wrapped := &slowReleaseStore{Store: base, delay: 300 * time.Millisecond, only: map[chainhash.Hash]bool{shards[0].TxID: true, shards[1].TxID: true}}
+	m, alloc := newMgr(t, wrapped, clk, cfg, pc)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx) }()
+	require.Eventually(t, func() bool { return alloc.Has(shards[0].TxID) && alloc.Has(shards[1].TxID) },
+		2*time.Second, 5*time.Millisecond)
+	drainAll(t, base, clk, poolName, alloc)
+
+	require.True(t, m.EnsureRows(context.Background())) // background releases of shards 0 and 1 now in flight
+	cancel()
+	require.NoError(t, <-done)
+	for _, sh := range shards {
+		got, err := base.GetShard(context.Background(), poolName, sh.TxID)
+		require.NoError(t, err)
+		assert.Empty(t, got.Owner, "every lease cleared by the time Run returns")
+	}
 }
