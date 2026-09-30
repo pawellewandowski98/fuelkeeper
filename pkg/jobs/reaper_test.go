@@ -362,6 +362,7 @@ func TestReaperOutpointOracleOverridesHint(t *testing.T) {
 	_, err := st.Spend(ctx, "main", tok, storetest.Ops(rows), hinted, false)
 	require.NoError(t, err)
 	orc.SetSpent(rows[0].Outpoint, actual)
+	orc.SetTx(actual, oracle.TxStatus{Known: true, Mined: true}) // the oracle's own SpendingTxID must also be confirmed mined
 
 	clk.Advance(cfg.QuarantineMinAge + time.Second)
 	require.NoError(t, r.RunOnce(ctx))
@@ -369,6 +370,62 @@ func TestReaperOutpointOracleOverridesHint(t *testing.T) {
 	require.Equal(t, store.StateSpent, got[rows[0].Outpoint].State)
 	require.NotNil(t, got[rows[0].Outpoint].SpentBy)
 	assert.Equal(t, actual, *got[rows[0].Outpoint].SpentBy)
+}
+
+// TestReaperSpentBySRequiresMinedTx covers point 1 of the final review: the
+// outpoint oracle's own SpendingTxID is only mempool evidence until Tx
+// confirms it is mined.
+func TestReaperSpentBySRequiresMinedTx(t *testing.T) {
+	ctx := context.Background()
+	clk, st, orc, r, cfg := reaperFixture(t)
+	_, rows := storetest.MintShard(t, st, "main", 1, store.ShardMined)
+	tok := store.NewToken()
+	spender := storetest.NewTxID()
+	storetest.MustReserve(t, st, "main", rows, tok, clk.Now().Add(time.Second))
+	orc.SetSpent(rows[0].Outpoint, spender)
+	orc.SetTx(spender, oracle.TxStatus{Known: true}) // seen, but not yet mined
+
+	clk.Advance(time.Second + cfg.Grace + time.Second)
+	require.NoError(t, r.RunOnce(ctx)) // quarantines; too fresh to consult the oracle yet
+	assert.Equal(t, store.StateQuarantined, states(t, st, rows)[0])
+
+	clk.Advance(cfg.QuarantineMinAge + time.Second)
+	require.NoError(t, r.RunOnce(ctx))
+	assert.Equal(t, store.StateQuarantined, states(t, st, rows)[0], "an unmined spender is not terminal yet")
+
+	orc.SetTx(spender, oracle.TxStatus{Known: true, Mined: true})
+	require.NoError(t, r.RunOnce(ctx))
+	got := storetest.RowsByOutpoint(t, st, "main", storetest.Ops(rows))
+	assert.Equal(t, store.StateSpent, got[rows[0].Outpoint].State)
+	require.NotNil(t, got[rows[0].Outpoint].SpentBy)
+	assert.Equal(t, spender, *got[rows[0].Outpoint].SpentBy)
+}
+
+// TestReaperHintPathDoesNotVerifyInputs documents a known gap recorded in the
+// Reaper doc comment: TxStatus carries no input list, so nothing checks that
+// a mined txid named by the outpoint oracle (with no SpendingTxID) or by a
+// client's hint actually spends THIS outpoint. Under spend_policy=verify, a
+// hostile client could name any unrelated mined txid and have the row
+// incorrectly resolved to spent. Written out (and skipped) so the gap is
+// executable once Plan 5 adds inputs to TxStatus.
+func TestReaperHintPathDoesNotVerifyInputs(t *testing.T) {
+	t.Skip("Plan 5: TxStatus must carry inputs so the hint path can verify the outpoint is spent by the hinted tx")
+	ctx := context.Background()
+	clk, st, orc, r, cfg := reaperFixture(t)
+	_, rows := storetest.MintShard(t, st, "main", 1, store.ShardMined)
+	tok := store.NewToken()
+	unrelated := storetest.NewTxID() // mined, but does not actually spend rows[0]
+	storetest.MustReserve(t, st, "main", rows, tok, clk.Now().Add(time.Minute))
+	_, err := st.Spend(ctx, "main", tok, storetest.Ops(rows), unrelated, false) // hostile client names an unrelated txid
+	require.NoError(t, err)
+	orc.SetTx(unrelated, oracle.TxStatus{Known: true, Mined: true}) // mined, but for a wholly different outpoint
+	// The outpoint oracle's Outpoints verdict for rows[0] stays Unknown, so
+	// the reaper falls back to Tx(hint) — which has no way to check whether
+	// `unrelated`'s inputs actually include rows[0].
+
+	clk.Advance(cfg.QuarantineMinAge + time.Second)
+	require.NoError(t, r.RunOnce(ctx))
+	assert.Equal(t, store.StateQuarantined, states(t, st, rows)[0], "must not resolve spent without verifying the hinted tx actually spends this outpoint")
 }
 
 // TestReaperResolveChunksToStoreMaxBatch covers the chunking test: Resolve is

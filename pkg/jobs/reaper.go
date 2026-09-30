@@ -101,11 +101,26 @@ func (c ReaperConfig) Validate() error {
 // the row quarantined.
 //
 // Terminal-state policy: only an oracle-proven, MINED spend may retire a row.
-// The outpoint oracle's own SpendingTxID is trusted directly (it is the
-// oracle's definitive answer for that outpoint), but a client's SpentHint —
-// and a "spent" verdict that names no spending txid — is only confirmed via
-// Tx and requires Known && Mined && !Rejected; an unconfirmed or merely-known
-// hint leaves the row quarantined for a later tick to resolve.
+// Every candidate spending txid — the outpoint oracle's own SpendingTxID, and
+// a client's SpentHint used as a fallback when the outpoint oracle names none
+// — is confirmed via Tx and requires Known && Mined && !Rejected before the
+// row is resolved to spent. A mempool-only spend is not enough on its own,
+// even one the outpoint oracle itself reports: it could still be evicted or
+// lose a double-spend race before being mined. An unconfirmed, merely-known,
+// or rejected txid leaves the row quarantined for a later tick to resolve.
+//
+// Known gap (see TestReaperHintPathDoesNotVerifyInputs): TxStatus carries no
+// input list, so neither this Tx confirmation nor the outpoint oracle's own
+// verdict is cross-checked against it — the reaper trusts that a Spent
+// verdict or a client's hint names a txid that actually spends the outpoint
+// in question, once that txid is mined. This makes the outpoint oracle the
+// deployment's real safety boundary: it must answer Spent/Unspent correctly
+// for on-chain-confirmed spends. The Tx(hint) fallback (used when the
+// outpoint oracle answers Unknown or reports Spent without naming a txid) is
+// only safe when the outpoint oracle is authoritative for mempool-only
+// spends too; otherwise a hostile client under spend_policy=verify could name
+// any mined, unrelated txid as its hint and have the row incorrectly
+// resolved to spent.
 type Reaper struct {
 	st    store.Store
 	orc   oracle.Oracle
@@ -314,18 +329,22 @@ func (r *Reaper) classifyOne(
 ) error {
 	switch res.Status {
 	case oracle.StatusSpent:
-		if res.SpendingTxID != nil {
-			toSpent[*res.SpendingTxID] = append(toSpent[*res.SpendingTxID], row.Outpoint)
+		spender := res.SpendingTxID
+		if spender == nil && hasHint(row) {
+			spender = row.SpentHint
+		}
+		if spender == nil {
+			// Proven spent, but neither the oracle nor the client tells us by
+			// what: SpentBy must be an oracle-proven fact, so we do not
+			// fabricate one. Leave the row quarantined.
+			r.log.Warn("oracle reports spent with no spending txid and no hint; leaving quarantined",
+				"pool", p, "outpoint", row.Outpoint)
 			return nil
 		}
-		if hasHint(row) {
-			return r.resolveHintViaTx(ctx, p, row, toSpent, txCache, txDown)
-		}
-		// Proven spent, but neither the oracle nor the client tells us by
-		// what: SpentBy must be an oracle-proven fact, so we do not fabricate
-		// one. Leave the row quarantined.
-		r.log.Warn("oracle reports spent with no spending txid and no hint; leaving quarantined",
-			"pool", p, "outpoint", row.Outpoint)
+		// Even the outpoint oracle's own SpendingTxID is only mempool
+		// evidence until Tx confirms it is mined: see the terminal-state
+		// policy in the Reaper doc comment.
+		return r.resolveViaTx(ctx, p, row.Outpoint, *spender, toSpent, txCache, txDown)
 	case oracle.StatusUnspent:
 		wait := r.cfg.MinUnspentAge
 		if hasHint(row) {
@@ -336,7 +355,7 @@ func (r *Reaper) classifyOne(
 		}
 	case oracle.StatusUnknown:
 		if hasHint(row) {
-			return r.resolveHintViaTx(ctx, p, row, toSpent, txCache, txDown)
+			return r.resolveViaTx(ctx, p, row.Outpoint, *row.SpentHint, toSpent, txCache, txDown)
 		}
 	case oracle.StatusConflicting:
 		// Leave quarantined; an operator decides.
@@ -344,18 +363,18 @@ func (r *Reaper) classifyOne(
 	return nil
 }
 
-// resolveHintViaTx looks up a row's claimed spending txid, through the tick's
-// cache, and counts it as proven only once it is mined (see the Reaper doc
-// comment's terminal-state policy). On an oracle failure it sets *txDown and
-// logs once, so 1000 rows sharing one hint cost at most one failed Tx call
-// and one warning per tick, not one per row. The returned error is non-nil
-// only for context cancellation.
-func (r *Reaper) resolveHintViaTx(
-	ctx context.Context, p string, row store.Row,
+// resolveViaTx looks up a claimed spending txid — the outpoint oracle's own
+// SpendingTxID, or a client's SpentHint — through the tick's cache, and
+// counts it as proven only once it is mined (see the Reaper doc comment's
+// terminal-state policy). On an oracle failure it sets *txDown and logs once,
+// so 1000 rows sharing one txid cost at most one failed Tx call and one
+// warning per tick, not one per row. The returned error is non-nil only for
+// context cancellation.
+func (r *Reaper) resolveViaTx(
+	ctx context.Context, p string, outpoint store.Outpoint, txid chainhash.Hash,
 	toSpent map[chainhash.Hash][]store.Outpoint, txCache map[chainhash.Hash]*oracle.TxStatus, txDown *bool,
 ) error {
-	hint := *row.SpentHint
-	ts, cached := txCache[hint]
+	ts, cached := txCache[txid]
 	if !cached {
 		if *txDown {
 			return nil
@@ -363,19 +382,19 @@ func (r *Reaper) resolveHintViaTx(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		got, err := r.orc.Tx(ctx, hint)
+		got, err := r.orc.Tx(ctx, txid)
 		if err != nil {
 			oracleRequests.WithLabelValues("tx", "error").Inc()
 			*txDown = true
-			r.log.Warn("oracle Tx lookup unavailable; leaving hinted rows quarantined this tick", "pool", p, "err", err)
+			r.log.Warn("oracle Tx lookup unavailable; leaving quarantined rows waiting on it this tick", "pool", p, "err", err)
 			return nil
 		}
 		oracleRequests.WithLabelValues("tx", "ok").Inc()
 		ts = &got
-		txCache[hint] = ts
+		txCache[txid] = ts
 	}
 	if ts.Known && ts.Mined && !ts.Rejected {
-		toSpent[hint] = append(toSpent[hint], row.Outpoint)
+		toSpent[txid] = append(toSpent[txid], outpoint)
 	}
 	return nil
 }
