@@ -28,7 +28,11 @@ type Output struct {
 	UnlockingScript []byte
 }
 
-// ShardRef points a client at the BEEF it needs (GET /v1/beef/{txid}).
+// ShardRef points a client at the BEEF it needs (GET /v1/beef/{txid}). Version
+// is this instance's last-seen shard version; it is 0 ("unknown") when the
+// shard was no longer owned locally by the time the response was built.
+// Clients treat 0 as "fetch": always re-GET the BEEF/version rather than
+// trusting a cached copy.
 type ShardRef struct {
 	TxID    chainhash.Hash
 	Version int64
@@ -58,8 +62,19 @@ type Pool struct {
 
 // NewPool wires allocator, shard manager and coalescer for pc. The coalescer
 // batch is at least MaxCount so one request always fits one flush.
+//
+// pc.MaxCount can never exceed the store's max batch size: a single Reserve
+// call submits up to MaxCount ops in one coalescer flush, and the coalescer
+// rejects an over-size batch with ErrBadRequest. A config asking for more
+// than the store can batch is a misconfiguration, not a per-request fault, so
+// it is clamped here (and logged) rather than surfaced to callers.
 func NewPool(st store.Store, pc Config, ic InstanceConfig, clock Clock, log *slog.Logger) *Pool {
 	caps := st.Capabilities()
+	if pc.MaxCount > caps.MaxBatch {
+		log.Error("pool max_count exceeds store max batch; clamping",
+			"pool", pc.Name, "max_count", pc.MaxCount, "store_max_batch", caps.MaxBatch)
+		pc.MaxCount = caps.MaxBatch
+	}
 	maxBatch := ic.MaxBatch
 	if maxBatch <= 0 {
 		maxBatch = 256
@@ -140,9 +155,13 @@ func (p *Pool) validate(req ReserveRequest) (count, minCount int, ttl time.Durat
 // Reserve implements the spec's request flow.
 func (p *Pool) Reserve(ctx context.Context, req ReserveRequest) (*Reservation, error) {
 	start := time.Now()
+	defer func() { reserveLatency.WithLabelValues(p.cfg.Name).Observe(time.Since(start).Seconds()) }()
 	count, minCount, ttl, err := p.validate(req)
 	if err != nil {
 		reserveRequests.WithLabelValues(p.cfg.Name, "bad_request").Inc()
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, p.icfg.ReserveTimeout)
@@ -154,16 +173,22 @@ func (p *Pool) Reserve(ctx context.Context, req ReserveRequest) (*Reservation, e
 	var applied []store.ReserveOp
 	byOutpoint := make(map[store.Outpoint]store.Row, count)
 	var flowErr error
+	triedAdopt := false
 
 	for round := 0; round < 3 && need > 0; round++ {
 		rows := p.alloc.Pop(need)
+		if len(rows) < need && !triedAdopt {
+			// One bounded adoption attempt per request, whether the FIFO was
+			// empty or merely short of need: a partially filled request must
+			// still get a chance to top up from another owned or newly
+			// adopted shard before falling back to min_count/insufficient.
+			triedAdopt = true
+			if p.mgr.EnsureRows(ctx) {
+				rows = append(rows, p.alloc.Pop(need-len(rows))...)
+			}
+		}
 		if len(rows) == 0 {
-			if round > 0 || !p.mgr.EnsureRows(ctx) {
-				break
-			}
-			if rows = p.alloc.Pop(need); len(rows) == 0 {
-				break
-			}
+			break
 		}
 		for _, r := range rows {
 			byOutpoint[r.Outpoint] = r
@@ -219,6 +244,15 @@ func (p *Pool) Reserve(ctx context.Context, req ReserveRequest) (*Reservation, e
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		// Enough rows were gathered, but the client is gone (or our own
+		// ReserveTimeout fired) between the last round and here: don't hand a
+		// reservation to nobody, release it back instead.
+		p.releaseBestEffort(token, applied)
+		reserveRequests.WithLabelValues(p.cfg.Name, "canceled").Inc()
+		return nil, err
+	}
+
 	out := &Reservation{Token: token, ExpiresAt: expiresAt, TTL: ttl, LockMode: p.cfg.LockMode, Outputs: make([]Output, 0, len(applied))}
 	shardSeen := map[chainhash.Hash]bool{}
 	versions := map[chainhash.Hash]int64{}
@@ -230,24 +264,25 @@ func (p *Pool) Reserve(ctx context.Context, req ReserveRequest) (*Reservation, e
 		out.Outputs = append(out.Outputs, Output{Outpoint: r.Outpoint, Satoshis: r.Satoshis, LockingScript: r.LockingScript, UnlockingScript: r.UnlockingScript})
 		if !shardSeen[op.TxID] {
 			shardSeen[op.TxID] = true
-			ver, ok := versions[op.TxID]
-			if !ok {
-				ver = 1
-			}
-			out.Shards = append(out.Shards, ShardRef{TxID: op.TxID, Version: ver})
+			// 0 ("unknown") when the shard is no longer owned; see ShardRef.
+			out.Shards = append(out.Shards, ShardRef{TxID: op.TxID, Version: versions[op.TxID]})
 		}
 	}
 	reserveRequests.WithLabelValues(p.cfg.Name, "ok").Inc()
 	reserveOutputs.WithLabelValues(p.cfg.Name).Add(float64(len(out.Outputs)))
-	reserveLatency.WithLabelValues(p.cfg.Name).Observe(time.Since(start).Seconds())
 	return out, nil
 }
 
 func mapFlowErr(err error) error {
 	switch {
+	case errors.Is(err, context.Canceled):
+		// The client went away; that is not a store outage.
+		return err
 	case errors.Is(err, ErrBackpressure), errors.Is(err, ErrUnavailable), errors.Is(err, ErrBadRequest):
 		return err
 	default:
+		// Includes context.DeadlineExceeded: our own timeout firing looks like
+		// unavailability to the caller.
 		return fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 }

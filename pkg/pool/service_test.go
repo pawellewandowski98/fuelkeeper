@@ -208,6 +208,71 @@ func TestPoolSpendPolicies(t *testing.T) {
 	assert.Equal(t, store.StateSpent, gt[rt.Outputs[0].Outpoint].State)
 }
 
+func TestPoolReserveAdoptsWhenPartiallyFilled(t *testing.T) {
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.MinTTL = time.Second
+	require.NoError(t, pc.Validate())
+	ic := testInstanceConfig()
+	ic.LowWaterRows = 0 // keep the background hunger loop from adopting shard B on its own
+	p := pool.NewPool(st, pc, ic, pool.ClockFunc(clk.Now), slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = p.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	storetest.MintShard(t, st, "main", 1, store.ShardMined) // shard A: 1 row
+	require.True(t, p.EnsureRows(ctx), "adopts shard A and loads its single row")
+	clk.Advance(time.Second)
+	storetest.MintShard(t, st, "main", 5, store.ShardMined) // shard B: 5 rows, not yet adopted
+
+	res, err := p.Reserve(ctx, pool.ReserveRequest{Count: 3, MinCount: 3})
+	require.NoError(t, err, "a partially filled request must still get one bounded adoption attempt")
+	assert.Len(t, res.Outputs, 3)
+	assert.Len(t, res.Shards, 2, "rows drawn from both the already-owned shard and the newly adopted one")
+}
+
+func TestPoolReserveFlushErrorForgetsRows(t *testing.T) {
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	faulty := storetest.NewFaulty(base)
+	var lastFlushed []store.Outpoint
+	faulty.BeforeReserve = func(ops []store.ReserveOp) {
+		outs := make([]store.Outpoint, len(ops))
+		for i, op := range ops {
+			outs[i] = op.Outpoint
+		}
+		lastFlushed = outs
+	}
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.MinTTL = time.Second
+	require.NoError(t, pc.Validate())
+	ic := testInstanceConfig()
+	p := pool.NewPool(faulty, pc, ic, pool.ClockFunc(clk.Now), slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = p.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	storetest.MintShard(t, base, "main", 3, store.ShardMined)
+	require.True(t, p.EnsureRows(ctx))
+
+	faulty.InDoubtNext(10) // every retry attempt commits but reports ErrUnavailable, so the flush fails
+	_, err := p.Reserve(ctx, pool.ReserveRequest{Count: 2})
+	require.ErrorIs(t, err, pool.ErrUnavailable)
+	require.Len(t, lastFlushed, 2, "the failed flush carried the 2 rows it popped")
+	failedOps := append([]store.Outpoint(nil), lastFlushed...)
+
+	faulty.InDoubtNext(0)
+	res, err := p.Reserve(ctx, pool.ReserveRequest{Count: 1})
+	require.NoError(t, err, "the failed rows were forgotten, not requeued, so the third row is still in memory")
+	require.Len(t, res.Outputs, 1)
+	for _, fo := range failedOps {
+		assert.NotEqual(t, fo, res.Outputs[0].Outpoint, "a row from the failed flush must never be handed out from memory again")
+	}
+}
+
 func TestPoolStatsAndBEEF(t *testing.T) {
 	f := newFixture(t, nil)
 	ctx := context.Background()
