@@ -1,0 +1,374 @@
+package pool
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
+)
+
+// CoalescerConfig tunes group commit.
+type CoalescerConfig struct {
+	Slots          int           // concurrent flushes (store Caps.MaxConcurrentFlushes)
+	MaxBatch       int           // ops per flush (<= store Caps.MaxBatch)
+	Window         time.Duration // optional accumulation window when a slot is free (0 = none)
+	MaxInflightOps int           // backpressure threshold; 0 = 4*Slots*MaxBatch
+	Retries        int           // retries after the first attempt on ErrUnavailable; default 2
+	RetryBackoff   time.Duration // first backoff; doubles; default 20ms
+	FlushTimeout   time.Duration // per-attempt store timeout; default 5s
+	CompensateTime time.Duration // budget for compensating releases; default 2s
+}
+
+func (c CoalescerConfig) withDefaults() CoalescerConfig {
+	if c.Slots <= 0 {
+		c.Slots = 1
+	}
+	if c.MaxBatch <= 0 {
+		c.MaxBatch = 256
+	}
+	if c.MaxInflightOps <= 0 {
+		c.MaxInflightOps = 4 * c.Slots * c.MaxBatch
+	}
+	if c.Retries < 0 {
+		c.Retries = 0
+	} else if c.Retries == 0 {
+		c.Retries = 2
+	}
+	if c.RetryBackoff <= 0 {
+		c.RetryBackoff = 20 * time.Millisecond
+	}
+	if c.FlushTimeout <= 0 {
+		c.FlushTimeout = 5 * time.Second
+	}
+	if c.CompensateTime <= 0 {
+		c.CompensateTime = 2 * time.Second
+	}
+	return c
+}
+
+// Result is what Submit returns.
+type Result struct {
+	Applied   []store.ReserveOp // committed under the request's token; safe to hand out
+	Missed    []store.Outpoint  // CAS failed (not available / other token); caller forgets and picks others
+	Unflushed bool              // the request never reached the store; caller may Return its rows
+	Err       error             // ErrBadRequest, ErrBackpressure, ctx error, or ErrUnavailable
+}
+
+const (
+	reqPending   int32 = 0
+	reqDelivered int32 = 1
+	reqAbandoned int32 = 2
+)
+
+type request struct {
+	ops    []store.ReserveOp
+	state  atomic.Int32
+	done   chan struct{}
+	result Result
+}
+
+// Coalescer groups concurrent reserve requests into batched, idempotent
+// store.Reserve calls. Start it with Run; submit with Submit.
+type Coalescer struct {
+	st   store.Store
+	pool string
+	cfg  CoalescerConfig
+
+	mu         sync.Mutex
+	pending    []*request
+	pendingOps int
+	inflight   atomic.Int64 // ops in pending + in flight
+	kick       chan struct{}
+	slots      chan struct{}
+	runCtx     context.Context //nolint:containedctx // dispatcher context for detached flush contexts
+	stopped    atomic.Bool
+}
+
+// NewCoalescer creates a coalescer for one pool.
+func NewCoalescer(st store.Store, pool string, cfg CoalescerConfig) *Coalescer {
+	cfg = cfg.withDefaults()
+	return &Coalescer{
+		st:     st,
+		pool:   pool,
+		cfg:    cfg,
+		kick:   make(chan struct{}, 1),
+		slots:  make(chan struct{}, cfg.Slots),
+		runCtx: context.Background(),
+	}
+}
+
+// PendingOps returns the number of ops queued and not yet taken by a flush (tests, metrics).
+func (c *Coalescer) PendingOps() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pendingOps
+}
+
+// InflightOps returns ops queued plus ops in flight (backpressure gauge).
+func (c *Coalescer) InflightOps() int64 { return c.inflight.Load() }
+
+// Submit enqueues ops under one token (all ops must share it) and waits for the
+// flush that carries them, or for ctx.
+func (c *Coalescer) Submit(ctx context.Context, ops []store.ReserveOp) Result {
+	if len(ops) == 0 || len(ops) > c.cfg.MaxBatch {
+		return Result{Unflushed: true, Err: fmt.Errorf("%w: reserve batch must have 1..%d ops", ErrBadRequest, c.cfg.MaxBatch)}
+	}
+	if err := store.ValidateReserveOps(ops, c.cfg.MaxBatch); err != nil {
+		return Result{Unflushed: true, Err: fmt.Errorf("%w: %w", ErrBadRequest, err)}
+	}
+	if c.stopped.Load() {
+		return Result{Unflushed: true, Err: ErrUnavailable}
+	}
+	req := &request{ops: ops, done: make(chan struct{})}
+	if !c.enqueue(req) {
+		return Result{Unflushed: true, Err: ErrBackpressure}
+	}
+	select {
+	case <-req.done:
+		return req.result
+	case <-ctx.Done():
+	}
+	if c.withdraw(req) {
+		return Result{Unflushed: true, Err: ctx.Err()}
+	}
+	// Already taken by a flush. Whoever wins the state CAS handles applied rows.
+	if req.state.CompareAndSwap(reqPending, reqAbandoned) {
+		return Result{Err: ctx.Err()}
+	}
+	<-req.done // delivered concurrently: the result is ours to clean up
+	c.releaseApplied(req.result.Applied)
+	return Result{Err: ctx.Err()}
+}
+
+func (c *Coalescer) enqueue(req *request) bool {
+	n := int64(len(req.ops))
+	if c.inflight.Add(n) > int64(c.cfg.MaxInflightOps) {
+		c.inflight.Add(-n)
+		return false
+	}
+	c.mu.Lock()
+	if c.stopped.Load() { // drain already ran; do not strand this request
+		c.mu.Unlock()
+		c.inflight.Add(-n)
+		return false
+	}
+	c.pending = append(c.pending, req)
+	c.pendingOps += len(req.ops)
+	c.mu.Unlock()
+	select {
+	case c.kick <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// withdraw removes a request that has not been taken by a flush yet.
+func (c *Coalescer) withdraw(req *request) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, p := range c.pending {
+		if p == req {
+			c.pending = append(c.pending[:i], c.pending[i+1:]...)
+			c.pendingOps -= len(req.ops)
+			c.inflight.Add(-int64(len(req.ops)))
+			return true
+		}
+	}
+	return false
+}
+
+// takeBatch pops whole requests until MaxBatch ops are collected.
+func (c *Coalescer) takeBatch() []*request {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var batch []*request
+	n := 0
+	for len(c.pending) > 0 {
+		next := c.pending[0]
+		if n > 0 && n+len(next.ops) > c.cfg.MaxBatch {
+			break
+		}
+		batch = append(batch, next)
+		n += len(next.ops)
+		c.pending = c.pending[1:]
+		c.pendingOps -= len(next.ops)
+	}
+	return batch
+}
+
+func (c *Coalescer) hasPending() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.pending) > 0
+}
+
+// Run dispatches flushes until ctx is done, then fails queued requests as
+// Unflushed. In-flight flushes settle on their own detached contexts.
+func (c *Coalescer) Run(ctx context.Context) error {
+	c.runCtx = ctx
+	for {
+		select {
+		case <-ctx.Done():
+			c.drain(ctx.Err())
+			return nil
+		case <-c.kick:
+		}
+		for c.hasPending() {
+			select {
+			case c.slots <- struct{}{}:
+			case <-ctx.Done():
+				c.drain(ctx.Err())
+				return nil
+			}
+			if c.cfg.Window > 0 {
+				timer := time.NewTimer(c.cfg.Window)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+				}
+			}
+			batch := c.takeBatch()
+			if len(batch) == 0 {
+				<-c.slots
+				continue
+			}
+			go c.flush(batch)
+		}
+	}
+}
+
+func (c *Coalescer) drain(err error) {
+	c.mu.Lock()
+	c.stopped.Store(true)
+	pending := c.pending
+	c.pending = nil
+	c.pendingOps = 0
+	c.mu.Unlock()
+	for _, req := range pending {
+		c.inflight.Add(-int64(len(req.ops)))
+		c.deliver(req, Result{Unflushed: true, Err: err})
+	}
+}
+
+// flush sends one batch of requests to the store as a single Reserve call,
+// retrying in-doubt failures idempotently and compensating as a last resort.
+//
+// Requests are guaranteed by the allocator's known set never to name the same
+// outpoint twice, but flush defends against it anyway: if two requests in the
+// same batch do name the same outpoint, only the first request's op is sent
+// to the store; every later request that named it is reported Missed without
+// ever reaching the store, so at most one request can ever believe it owns a
+// given outpoint out of a single flush.
+func (c *Coalescer) flush(batch []*request) {
+	defer func() {
+		<-c.slots
+		select {
+		case c.kick <- struct{}{}:
+		default:
+		}
+	}()
+	total := 0
+	for _, r := range batch {
+		total += len(r.ops)
+	}
+	defer c.inflight.Add(-int64(total))
+
+	ops := make([]store.ReserveOp, 0, total)
+	owner := make(map[store.Outpoint]int, total)
+	forcedMissed := make([]map[store.Outpoint]struct{}, len(batch))
+	for i, r := range batch {
+		for _, op := range r.ops {
+			if _, dup := owner[op.Outpoint]; dup {
+				if forcedMissed[i] == nil {
+					forcedMissed[i] = make(map[store.Outpoint]struct{})
+				}
+				forcedMissed[i][op.Outpoint] = struct{}{}
+				continue
+			}
+			owner[op.Outpoint] = i
+			ops = append(ops, op)
+		}
+	}
+
+	base := context.WithoutCancel(c.runCtx)
+	var applied []store.ReserveOp
+	var err error
+	backoff := c.cfg.RetryBackoff
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+		fctx, cancel := context.WithTimeout(base, c.cfg.FlushTimeout)
+		applied, err = c.st.Reserve(fctx, c.pool, ops)
+		cancel()
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, store.ErrUnavailable) && !errors.Is(err, context.DeadlineExceeded) {
+			break // not retryable
+		}
+	}
+	if err != nil {
+		// Outcome unknown: compensate by token. Release on a never-applied row is a no-op.
+		for _, r := range batch {
+			c.releaseApplied(r.ops)
+			c.deliver(r, Result{Err: fmt.Errorf("%w: %w", ErrUnavailable, err)})
+		}
+		return
+	}
+
+	appliedBy := make(map[store.Outpoint]store.ReserveOp, len(applied))
+	for _, op := range applied {
+		appliedBy[op.Outpoint] = op
+	}
+	for i, r := range batch {
+		res := Result{}
+		for _, op := range r.ops {
+			if _, forced := forcedMissed[i][op.Outpoint]; forced {
+				res.Missed = append(res.Missed, op.Outpoint)
+				continue
+			}
+			if a, ok := appliedBy[op.Outpoint]; ok && a.Token == op.Token {
+				res.Applied = append(res.Applied, a)
+			} else {
+				res.Missed = append(res.Missed, op.Outpoint)
+			}
+		}
+		c.deliver(r, res)
+	}
+}
+
+// deliver hands the result to the waiter, or releases applied rows if the
+// waiter abandoned the request.
+func (c *Coalescer) deliver(req *request, res Result) {
+	req.result = res
+	if req.state.CompareAndSwap(reqPending, reqDelivered) {
+		close(req.done)
+		return
+	}
+	// abandoned: nobody will use these rows
+	close(req.done)
+	c.releaseApplied(res.Applied)
+}
+
+// releaseApplied best-effort releases ops grouped by token under a detached context.
+func (c *Coalescer) releaseApplied(ops []store.ReserveOp) {
+	if len(ops) == 0 {
+		return
+	}
+	byToken := map[store.Token][]store.Outpoint{}
+	for _, op := range ops {
+		byToken[op.Token] = append(byToken[op.Token], op.Outpoint)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.CompensateTime)
+	defer cancel()
+	for tok, outs := range byToken {
+		_, _ = c.st.Release(ctx, c.pool, tok, outs) // errors leave rows to the expiry path
+	}
+}
