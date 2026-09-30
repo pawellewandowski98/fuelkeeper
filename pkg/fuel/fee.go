@@ -8,6 +8,8 @@ const (
 
 // FeeSats is ceil(sizeBytes × satPerKB / 1000), the rounding ARC, arcade, go-sdk
 // and the wallet toolboxes use (the node floors, so ceil always satisfies it).
+// sizeBytes must be a real transaction size (at most a few GB); the product
+// sizeBytes×satPerKB is computed in uint64 without overflow checks.
 func FeeSats(sizeBytes int, satPerKB uint64) uint64 {
 	if sizeBytes <= 0 {
 		return 0

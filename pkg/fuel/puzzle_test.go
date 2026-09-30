@@ -38,6 +38,36 @@ func TestPuzzleRoundTrip(t *testing.T) {
 	assert.False(t, fuel.VerifyPuzzle(lock, []byte{0x01, 0x02}))
 }
 
+func TestParsePuzzleLock_RightLengthWrongOpcode(t *testing.T) {
+	seed := fuel.NewSeed()
+	lock := fuel.PuzzleLock(fuel.PuzzleHash(fuel.Preimage(seed, 0)))
+
+	bad := append([]byte(nil), lock...)
+	bad[0] = 0x76 // OP_DUP: right length, wrong leading opcode
+	_, ok := fuel.ParsePuzzleLock(bad)
+	assert.False(t, ok)
+
+	bad2 := append([]byte(nil), lock...)
+	bad2[1] = 0x21 // wrong push-length byte
+	_, ok = fuel.ParsePuzzleLock(bad2)
+	assert.False(t, ok)
+
+	bad3 := append([]byte(nil), lock...)
+	bad3[34] = 0x88 // OP_EQUALVERIFY: wrong trailing opcode
+	_, ok = fuel.ParsePuzzleLock(bad3)
+	assert.False(t, ok)
+}
+
+func TestVerifyPuzzle_RightLengthWrongFirstByte(t *testing.T) {
+	seed := fuel.NewSeed()
+	p := fuel.Preimage(seed, 0)
+	lock := fuel.PuzzleLock(fuel.PuzzleHash(p))
+	unlock := fuel.PuzzleUnlock(p)
+	unlock[0] = 0x21 // right length (33), wrong first byte
+	assert.False(t, fuel.VerifyPuzzle(lock, unlock))
+	assert.False(t, fuel.VerifyPuzzle([]byte{0x76, 0xa9}, fuel.PuzzleUnlock(p)), "invalid lock never verifies")
+}
+
 func TestFeeSats(t *testing.T) {
 	assert.Equal(t, uint64(1), fuel.FeeSats(1, 100))
 	assert.Equal(t, uint64(10), fuel.FeeSats(100, 100))
