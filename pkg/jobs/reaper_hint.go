@@ -152,6 +152,10 @@ func (r *Reaper) applyHintRules(
 	// 2. Competitors (a rejected or double-spend-attempted hint): a mined
 	// competitor that spends the outpoint (or whose inputs are unknown) is
 	// the spender.
+	// otherInputsSpent: at least one competitor is mined and every mined
+	// competitor's known inputs exclude the fuel output, i.e. the conflict
+	// was on another input and the output is positively unspent by them.
+	otherInputsSpent := false
 	if comps := competitors(ts, hint); len(comps) > 0 {
 		minedAny := false
 		for _, c := range comps {
@@ -186,13 +190,21 @@ func (r *Reaper) applyHintRules(
 		}
 		// Only mined competitors that do not spend the outpoint: fall
 		// through to the reject rules.
+		otherInputsSpent = true
 	}
 
 	if ts.Rejected {
 		switch ts.RejectReason {
 		case oracle.RejectReasonInputsSpent:
-			// 3. The fuel output is gone. SpentBy records the attempt (the
-			// hint), not the unknown spender.
+			// 3. The hint was rejected because one of its inputs is spent
+			// or conflicting; the fuel output is assumed gone. SpentBy
+			// records the attempt (the hint), not the unknown spender.
+			// Held instead when the evidence says the fuel output is not
+			// the spent input: mined competitors that provably spend other
+			// inputs, or hint inputs that exclude it.
+			if otherInputsSpent {
+				return r.hintWait(p, t, row, hint, heldHintPending, v), nil
+			}
 			if !entry.spends(op) {
 				r.inputMismatch(p, hint, inputMismatchSourceHint, entry)
 				return r.hintWait(p, t, row, hint, heldHintPending, v), nil

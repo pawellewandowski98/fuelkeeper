@@ -226,8 +226,9 @@ func TestReaperCompetitorInputsCheckedWhenResolverExists(t *testing.T) {
 			if tc.includes {
 				assert.Equal(t, []chainhash.Hash{comp}, e.spentBy(t, rows), "a mined competitor spending the outpoint is the spender")
 			} else {
-				assert.Equal(t, []chainhash.Hash{hint}, e.spentBy(t, rows),
-					"a mined competitor that does not spend the outpoint is ignored; the inputs-spent reject rule applies")
+				assert.Equal(t, store.StateQuarantined, statesIn(t, e.st, e.p, rows)[0],
+					"the only mined competitor provably spends other inputs: the fuel output is not assumed gone")
+				assert.InDelta(t, 1, e.held("hint_pending"), 0)
 			}
 		})
 	}
@@ -495,4 +496,42 @@ func TestReaperHeldGaugeCoversEveryExaminedRow(t *testing.T) {
 	e.tick(t)
 	assert.InDelta(t, 3, e.held("oracle_down"), 0, "rows skipped by an outpoint-oracle outage are counted")
 	assert.InDelta(t, 0, e.held("spent_no_txid"), 0)
+}
+
+// TestReaperInputsSpentHintWhoseInputsExcludeOutputHolds pins rule 3's own
+// input check: an inputs-spent rejection of a hint whose known inputs do not
+// include the fuel output says nothing about that output.
+func TestReaperInputsSpentHintWhoseInputsExcludeOutputHolds(t *testing.T) {
+	e := newHintEnv(t, "hint-inputs-spent-excl", jobs.DefaultReaperConfig(), nil)
+	hint := storetest.NewTxID()
+	rows := e.hinted(t, 1, hint)
+	ts := rejected(oracle.RejectReasonInputsSpent)
+	ts.Inputs = []store.Outpoint{{TxID: storetest.NewTxID(), Vout: 0}}
+	e.orc.SetTx(hint, ts)
+	before := e.spent("inputs_spent")
+
+	e.clk.Advance(e.cfg.QuarantineMinAge + time.Second)
+	e.tick(t)
+	assert.Equal(t, store.StateQuarantined, statesIn(t, e.st, e.p, rows)[0])
+	assert.InDelta(t, 1, e.held("hint_pending"), 0)
+	assert.InDelta(t, before, e.spent("inputs_spent"), 0)
+}
+
+// TestReaperEmptyExpiryPolicyHolds pins that a pool whose ExpiryPolicy was
+// never set (a Go caller skipping pool.Config.Validate) is treated as hold,
+// never as requeue.
+func TestReaperEmptyExpiryPolicyHolds(t *testing.T) {
+	const p = "expiry-empty"
+	cfg := jobs.DefaultReaperConfig()
+	pools := testPools(p)
+	pools[0].ExpiryPolicy = ""
+	clk, st, _, r := unhintedFixture(t, cfg, pools)
+	_, rows := storetest.MintShard(t, st, p, 1, store.ShardMined)
+	reserveToExpire(t, st, clk, p, rows)
+	quarantineTick(t, r, clk, cfg)
+
+	clk.Advance(cfg.UnknownRequeueAge + time.Hour)
+	require.NoError(t, r.RunOnce(context.Background()))
+	assert.Equal(t, store.StateQuarantined, statesIn(t, st, p, rows)[0])
+	assert.InDelta(t, 1, testutil.ToFloat64(jobs.ReaperHeld.WithLabelValues(p, "expiry_hold")), 0)
 }

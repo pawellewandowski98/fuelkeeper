@@ -35,15 +35,15 @@ var (
 	}, []string{"pool", "source"})
 	reaperRequeued = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fuelkeeper_reaper_requeued_total",
-		Help: "Quarantined rows returned to available, by reason (unspent: an Unspent verdict; unknown_aged: an unhinted row with no verdict after unknown_requeue_age).",
+		Help: "Quarantined rows returned to available, by reason (unspent: an Unspent verdict; unknown_aged: an unhinted row with no verdict after unknown_requeue_age; rejected: a hint rejected as invalid, after hint_patience; hint_expired: a hint never mined or classified, after hint_max_wait).",
 	}, []string{"pool", "reason"})
 	reaperSpent = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fuelkeeper_reaper_spent_total",
-		Help: "Quarantined rows resolved to spent, by the source of the proven spending txid (oracle: the outpoint oracle's SpendingTxID; hint: a client's SpentHint).",
+		Help: "Quarantined rows resolved to spent, by source (oracle: the outpoint oracle's mined SpendingTxID; hint: a client's mined SpentHint; competitor: a mined competitor of the hint; inputs_spent: the hint was rejected for a spent or conflicting input, SpentBy is the hint).",
 	}, []string{"pool", "source"})
 	reaperHeld = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "fuelkeeper_reaper_held",
-		Help: "Quarantined rows the reaper examined and left quarantined on its last tick, by reason.",
+		Help: "Quarantined rows the reaper examined and left quarantined on its last tick, by reason (oracle_down, unknown_fresh, expiry_hold, unspent_fresh, spent_no_txid, spender_pending, hint_pending, hint_unseen, competitor_pending, rejected_fresh, rejected_unknown, conflicting, tx_down).",
 	}, []string{"pool", "reason"})
 )
 
@@ -269,10 +269,17 @@ func (c ReaperConfig) Validate() error {
 //     known inputs exclude the outpoint is ignored. No mined competitor:
 //     held (competitor_pending) as in rule 5. Only non-spending mined
 //     competitors: fall through to rules 3-5.
-//  3. Rejected, RejectReasonInputsSpent: spent with SpentBy = the hint
-//     (source "inputs_spent"). SpentBy here records the attempt, not the
-//     spender, which arcade does not name. When the hint's inputs are known
-//     and exclude the outpoint it is held (hint_pending) instead.
+//  3. Rejected, RejectReasonInputsSpent: the hint was rejected because one
+//     of its inputs is spent or conflicting; the fuel output is assumed gone
+//     and the row is retired with SpentBy = the hint (source
+//     "inputs_spent"). SpentBy here records the attempt, not the spender,
+//     which arcade does not name. The assumption is bounded to the client's
+//     own row: an honest wallet whose transaction failed on another input
+//     loses that fuel output, counted under spent{source="inputs_spent"}.
+//     Positive evidence to the contrary holds the row (hint_pending, as in
+//     rule 5) instead: at least one mined competitor with every mined
+//     competitor's known inputs excluding the outpoint, or the hint's own
+//     known inputs excluding it.
 //  4. Rejected, RejectReasonTxInvalid: the fuel output is untouched; the
 //     row is requeued (reason "rejected") once quarantined for HintPatience,
 //     held (rejected_fresh) before that.
