@@ -24,10 +24,14 @@ stop waiting for the reservation to expire.
 **Reservation TTL.** Every reservation carries `ttl_seconds` (defaulting to
 the pool's `default_ttl` when omitted, and clamped to the pool's `min_ttl`..
 `max_ttl`). If the client neither spends nor releases before `expires_at`,
-the reaper quarantines the row, asks the chain oracle whether it is actually
-spent, and either requeues it to `available` or resolves it to `spent`. A
-client that lets a reservation expire is not charged for it beyond the delay:
-an unused, unspent output always makes its way back to the pool.
+the reaper quarantines the row and asks the chain oracle whether it is
+actually spent, resolving it to `spent` or `available` accordingly; with an
+arcade-only oracle (the default), which cannot answer that question at all,
+an unreported reservation is instead requeued blind after
+`jobs.reaper.unknown_requeue_age` (10 m default) under a pool's
+`expiry_policy: requeue` -- or held for an operator under
+`expiry_policy: hold`. A client that lets a reservation expire is not
+charged for it beyond that delay, in the normal case.
 
 **`min_count`.** A reserve request can ask for `count` outputs but accept a
 partial fill of at least `min_count` (default: `count`). Fewer than
@@ -78,24 +82,42 @@ server for the same error.
 | Your broadcast attempt | Go: `client.Settle(..., Settlement{...})` | TS wallet-toolbox equivalent | What FuelKeeper does |
 |---|---|---|---|
 | Gateway accepted the transaction | `Outcome: OutcomeBroadcast, TxID: txid` | `createAction` returned normally (no `WERR_REVIEW_ACTIONS`), or a review result with status `success` | `Spend(token, outpoints, txid)`: reserved -> quarantined (hint), or straight to `spent` under `spend_policy: trust` |
-| The transaction provably never reached a gateway: it was never sent, or a gateway said so definitively -- a well-formed rejection naming no competing transaction (bad format/script/fee/policy; the output itself is untouched), or backpressure/shedding before the request was ever accepted | `Outcome: OutcomeNotBroadcast` | `WERR_REVIEW_ACTIONS` review result status `invalidTx` | `Release(token, outpoints)`: reserved -> available (or, under `release_policy: verify`, quarantined and requeued once the oracle/reaper confirms it -- see `docs/OPERATIONS.md`'s oracle x policy table) |
-| Rejected because an input was already spent, or a competing transaction is known | `Outcome: OutcomeDoubleSpend, TxID: txid, CompetingTxIDs: [...]` (the first well-formed competitor is reported; falls back to `TxID` when none of `CompetingTxIDs` is well-formed) | `WERR_REVIEW_ACTIONS` review result status `doubleSpend` (`CompetingTxIDs` from its `competingTxs`) | `Spend(token, outpoints, hint)`: reserved -> quarantined (hint); the reaper resolves it to `spent` once it can prove the fuel output is gone -- a mined competitor, a gateway that names the spent inputs and this outpoint is among them, or (failing either) the bounded-loss assumption that the client's own rejected input was this one (see `docs/OPERATIONS.md`'s reaper lifecycle table, rule 3) |
-| Fate not known: the request may have already reached the gateway and its outcome is simply unclear -- a transport error *after* the request was already sent, `ctx` ending mid-request, an unexpected HTTP status such as a `5xx`, or a 2xx response your own client failed to decode | `Outcome: OutcomeUnknown` | `WERR_REVIEW_ACTIONS` review result status `serviceError`, or the action's own deadline expired | No call. The reservation is left in place; if it is never settled, it expires and resolves through the reaper's usual quarantine/requeue path (see below) |
+| The transaction provably never reached a gateway: a dial-phase failure (connection refused, or any error before the request body was written -- it was never sent), or a gateway's well-formed rejection naming no competing transaction, sent before the gateway ever accepted the request (bad format/script/fee/policy; the output itself is untouched) | `Outcome: OutcomeNotBroadcast` | `WERR_REVIEW_ACTIONS` review result status `invalidTx` | `Release(token, outpoints)`: reserved -> available (or, under `release_policy: verify`, quarantined and requeued blind after `jobs.reaper.unknown_requeue_age` -- arcade alone cannot confirm it, see `docs/OPERATIONS.md`'s oracle x policy table) |
+| Rejected because an input was already spent, or a competing transaction is known | `Outcome: OutcomeDoubleSpend, TxID: txid, CompetingTxIDs: [...]` (the first well-formed competitor is reported; falls back to `TxID` when none of `CompetingTxIDs` is well-formed) | `WERR_REVIEW_ACTIONS` review result status `doubleSpend` (`CompetingTxIDs` from its `competingTxs`) | `Spend(token, outpoints, hint)`: reserved -> quarantined (hint); the reaper resolves it to `spent` once it can prove the fuel output is gone -- a gateway that names the spent inputs and this outpoint is among them (checked first, resolved in one tick), a mined competitor (only when the gateway named no spent inputs), or (failing either) the bounded-loss assumption that the client's own rejected input was this one (see `docs/OPERATIONS.md`'s reaper lifecycle table, rule 3) |
+| Fate not known: the request may have reached the gateway and been accepted, and its outcome is simply unclear -- a transport error *past* the dial phase (so the request, or part of it, may already be on the wire), `ctx` ending mid-request, an unexpected HTTP status such as a `5xx`, a 2xx response your own client failed to decode, **or the gateway's own backpressure/shedding response** | `Outcome: OutcomeUnknown` | `WERR_REVIEW_ACTIONS` review result status `serviceError`, or the action's own deadline expired | No call. The reservation is left in place; if it is never settled, it expires and resolves through the reaper's usual quarantine/requeue path (see below) |
+
+Backpressure belongs under "fate not known," not "never reached a gateway":
+against arcade specifically, a 503/backpressure response does not mean the
+submission was refused -- arcade persists a `RECEIVED` row carrying the raw
+transaction *before* the downstream publish that can answer 503, and
+arcade's own propagation reaper rebroadcasts a stale `RECEIVED` row an hour
+later. Releasing on a gateway's backpressure response can therefore hand an
+already-queued output to the next consumer the same way releasing on any
+other ambiguous failure can. Treat a gateway's backpressure response as
+`OutcomeNotBroadcast` only if you know that specific gateway rejects before
+persisting anything; arcade does not.
 
 **Do not treat an ambiguous failure as "not broadcast."** Release only once
 you know the transaction definitely never reached a gateway (`docs/API.md`
-uses this same wording); if you're not sure -- a timeout, a `5xx` -- make no
-call and let the reservation expire instead. If the request might have
-reached the gateway before failing, report `OutcomeUnknown`, not
+uses this same wording); if you're not sure -- a timeout, a `5xx`, backpressure
+-- make no call and let the reservation expire instead. If the request might
+have reached the gateway before failing, report `OutcomeUnknown`, not
 `OutcomeNotBroadcast`: releasing an output that was in fact already
-broadcast hands it to the next consumer, whose own attempt to spend it then
-fails as a double-spend. `OutcomeNotBroadcast` is only for a gateway's
-definitive "no" (or a request that never went out at all). `cmd/fueldemo`'s
-raw-mode worker (`pkg/client`'s own reference consumer) draws this same
-line: a `*arcadeclient.BackpressureError`, or a well-formed rejection naming
-no competitor, is `OutcomeNotBroadcast`; a transport failure, `ctx` ending
-mid-POST, an unexpected status, or an undecodable 2xx body is
-`OutcomeUnknown`.
+broadcast (or merely accepted and queued) hands it to the next consumer,
+whose own attempt to spend it then fails as a double-spend.
+`OutcomeNotBroadcast` is only for a gateway's definitive "no" (or a request
+that never went out at all). `cmd/fueldemo`'s raw-mode worker
+(`pkg/client`'s own reference consumer) draws this same line: a dial-phase
+failure (connection refused), or a well-formed rejection naming no
+competitor, is `OutcomeNotBroadcast`; a `*arcadeclient.BackpressureError`, a
+transport failure past the dial phase, `ctx` ending mid-POST, an unexpected
+status, a 2xx body with a terminal `REJECTED` verdict inline, or an
+undecodable 2xx body is `OutcomeUnknown` -- and, since a dial failure or
+backpressure or an undecodable/unexpected response is also evidence the
+*gateway itself* may be struggling, the worker abandons the rest of its
+current batch (releasing its untried outputs) and backs off before its next
+`Reserve`, rather than retrying every remaining output individually against
+a gateway that is probably still down.
 
 **Against arcade specifically**, a double-spend is not knowable at
 submission time: POST /tx's synchronous responses never carry a competing
@@ -114,17 +136,39 @@ gateways that do name a competitor synchronously, and for a go-wallet-toolbox-ba
 whose own asynchronous review process (`WERR_REVIEW_ACTIONS`) learns of one
 after the fact but before it calls `Settle`.
 
+**The consequence for `spend_policy: trust` (the default, arcade-only).**
+Because arcade's 202 accepted response is not a guarantee -- the
+transaction can still be rejected asynchronously (one of *your own*
+transaction's other inputs already spent, `TX_INVALID`, or a transient
+`TX_LOCKED` if you chained off a fuel output whose own split transaction was
+still settling) -- reporting `OutcomeBroadcast` on that 202 under
+`spend_policy: trust` moves the row straight to the terminal `spent` state,
+and nothing ever re-examines it afterward. If arcade does go on to reject
+the transaction, the fuel output you spent is lost for good, not merely
+delayed. If your deployment cannot tolerate that, ask the operator to
+configure `spend_policy: verify` for the pool: your report is then held as
+a hint and resolved by the reaper from the transaction's own eventual fate
+instead of trusted outright (see `docs/OPERATIONS.md`'s "The
+`spend_policy: trust` blind spot with arcade-only").
+
 **Expiry behaviour.** A reservation nobody settles (no `spend`, `release` or
 `Settle` call before `expires_at`) is quarantined by the reaper like any
 other expired reservation: with an arcade-only oracle (the expected shape --
 see `docs/OPERATIONS.md`'s "Oracle kinds and policies"), it requeues to
-`available` after `jobs.reaper.unknown_requeue_age` (10 m default) under a
-pool's `expiry_policy: requeue` (default), or stays quarantined for an
-operator under `expiry_policy: hold`. A hinted row (you called `Spend` or
-`Settle` under `spend_policy: verify`) instead follows its own transaction's
-fate, requeuing after `hint_max_wait` (24 h default) only as a last resort
-if that transaction is never mined or classified. Either way, pool capacity
-never leaks: an unspent output always makes its way back.
+`available` blind, with no proof either way, after
+`jobs.reaper.unknown_requeue_age` (10 m default) under a pool's
+`expiry_policy: requeue` (default), or stays quarantined for an operator
+under `expiry_policy: hold`. A hinted row (you called `Spend` or `Settle`
+under `spend_policy: verify`) instead follows its own transaction's fate,
+requeuing after `hint_max_wait` (24 h default) only as a last resort if that
+transaction is never mined or classified. This is not an absolute
+guarantee that every unspent output eventually comes back, or that a
+released/requeued output was never in fact spent: see "The
+`spend_policy: trust` blind spot" and the reaper's rule 3 bounded loss in
+`docs/OPERATIONS.md`'s "Oracle kinds and policies" for the cases where an
+output is genuinely lost, not merely delayed, and `expiry_policy: hold`'s
+effect of leaving a row quarantined until an operator acts rather than
+requeuing it automatically.
 
 > **This contract is the safety boundary.** FuelKeeper's reaper trusts the
 > outcome you report, within these two invariants:

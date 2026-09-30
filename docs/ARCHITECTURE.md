@@ -97,26 +97,41 @@ forever: a pool's `expiry_policy: requeue` (default) returns it to
 (default 10 m) -- a blind requeue, with no proof either way, that a rare
 stale hand-out then surfaces as a double-spend rejection at its next
 consumer (see `docs/CLIENTS.md#when-your-broadcast-fails`); `expiry_policy:
-hold` keeps such a row quarantined for an operator instead. Pool capacity
-never leaks either way.
+hold` keeps such a row quarantined for an operator instead, rather than
+requeuing it automatically. This requeue path is precise, not a blanket
+leak-free guarantee: it only ever returns an *unreported* reservation to
+`available`, after `unknown_requeue_age`, under `expiry_policy: requeue`. An
+output can still be genuinely lost -- not merely delayed -- in two
+documented cases: a client's own `spend_policy: trust` report of a
+transaction arcade later rejects asynchronously (nothing re-examines a
+trusted `Spend`; see `docs/OPERATIONS.md`'s "The `spend_policy: trust`
+blind spot with arcade-only"), and the reaper's hinted rule 3 bounded loss
+(a rejected `inputs_spent` hint whose gateway does not name which input was
+spent; see the reaper lifecycle table below).
 
 **Reaper terminal-state policy** (`pkg/jobs/reaper.go`): only an
 oracle-proven, **mined** spend retires a row, with one exception: a hinted
 row (`spend_policy=verify`) whose own transaction is rejected because one of
 its inputs is already spent is retired too, `SpentBy` the hint itself (not
-the unknown spender), decided in this order: (a) the hint's own known inputs
-exclude the fuel output -- holds the row (it says nothing about this
-output); (b) the gateway named the spent inputs
-(`oracle.TxStatus.SpentInputs`, parsed from arcade's `UTXO_SPENT` line) --
-includes the fuel output: retire it (confirmed); excludes it: requeue it
-like an invalid transaction after `hint_patience` (confirmed untouched, this
-outranks (c)); (c) no named spent inputs, but a mined competitor provably
-spends only some *other* input -- holds the row; (d) otherwise (the gateway
-named no spent input at all) the fuel output is assumed gone and the row is
-retired -- the bounded-loss case: an honest wallet whose transaction died on
-an unrelated input, against a gateway that does not name which input, still
-loses this one fuel output. Short of that one exception, a candidate
-spending txid --
+the unknown spender). When the gateway named the spent inputs
+(`oracle.TxStatus.SpentInputs`, parsed from arcade's `UTXO_SPENT` line --
+non-nil), this is decided in one tick, *before* any competitor lookup: (a)
+the hint's own known inputs exclude the fuel output -- holds the row (it
+says nothing about this output); (b) `SpentInputs` includes the fuel output
+-- retire it (confirmed); excludes it -- requeue it like an invalid
+transaction after `hint_patience` (confirmed untouched). Running the
+competitor lookup first would be wrong for arcade's actual shape here
+(`SpentInputs` set, the named spender appended to but not distinguished
+within `CompetingTxs`, never `Inputs`): a mined spender would be trusted as
+the fuel output's spender even when the gateway's own list excludes it, and
+an unmined or unknown one would hold the row as `competitor_pending` where
+the list already decides it. Only when the gateway names no spent input at
+all (`SpentInputs` nil) does the competitor lookup run: (c) a mined
+competitor provably spends only some *other* input -- holds the row; (d)
+otherwise the fuel output is assumed gone and the row is retired -- the
+bounded-loss case: an honest wallet whose transaction died on an unrelated
+input, against a gateway that does not name which input, still loses this
+one fuel output. Short of that one exception, a candidate spending txid --
 whether it is the outpoint oracle's own `SpendingTxID` or a client's
 `SpentHint` used as a fallback -- is confirmed via `Oracle.Tx` and must be
 `Known && Mined && !Rejected`; a mempool-only spend is never enough on its
@@ -441,8 +456,12 @@ therefore never directly confirms an outpoint spent or unspent; the reaper inste
 resolves what it can from `Tx(hint)` (hinted rows) and requeues what it
 cannot after `unknown_requeue_age`/`hint_max_wait` (unhinted and
 exhausted-hinted rows respectively) -- quarantine does not grow without
-bound, and pool capacity never leaks. Configuring `oracle.teranode_url`
-(`oracle.kind: composite`) is optional: teranode then answers `Outpoints`
+bound, though under `spend_policy: trust` (the default) a row arcade
+accepts and the consumer reports `OutcomeBroadcast` for is spent
+immediately and unconditionally: an asynchronous arcade rejection after
+that point is never seen again (see `docs/OPERATIONS.md`'s "The
+`spend_policy: trust` blind spot with arcade-only"). Configuring
+`oracle.teranode_url` (`oracle.kind: composite`) is optional: teranode then answers `Outpoints`
 directly and supplies `Inputs` for the reaper's cross-check, resolving those
 same rows immediately from the UTXO set instead of waiting out the delay.
 `teranode` alone can never report a shard mined, so config rejects
