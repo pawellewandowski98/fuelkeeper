@@ -193,7 +193,13 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 		{Key: "st", Value: int32(store.StateReserved)},
 	}
 	projection := bson.D{{Key: "_id", Value: 1}, {Key: "rb", Value: 1}, {Key: "ea", Value: 1}}
-	cur, err := s.rows.Find(octx, filter, options.Find().SetProjection(projection))
+	// Hint _id_: an _id $in always uses the primary-key index in practice, but
+	// pinning it explicitly means a future index cannot win this query by
+	// planner heuristics instead (see RetireShard's cascade filter for why an
+	// _id-stable scan matters here: this read-back must see every row this
+	// call's own BulkWrite just touched, not skip or double-count one whose st
+	// a concurrent write also moved).
+	cur, err := s.rows.Find(octx, filter, options.Find().SetProjection(projection).SetHint("_id_"))
 	if err != nil {
 		return nil, wrap(err)
 	}

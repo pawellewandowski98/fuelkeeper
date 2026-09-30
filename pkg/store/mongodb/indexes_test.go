@@ -14,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/store/mongodb"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/storetest"
 )
 
@@ -259,25 +260,27 @@ func TestExplainUsesIndexes(t *testing.T) {
 	})
 
 	t.Run("RetireShardCascade", func(t *testing.T) {
-		// Matches shards.go RetireShard's own cascade filter/update.
+		// Built through mongodb.RetireCascadeFilter -- the exact function
+		// shards.go's RetireShard itself calls -- not a hand-maintained copy,
+		// so this test cannot silently drift from the real query. The cascade
+		// is bounded by an _id range and hinted to force the _id_ index: see
+		// retireCascadeFilter's own comment for why a {p, st, sh} index (st
+		// being both part of the index key and the field this very update,
+		// and any concurrent Release/Reserve-replay/Spend/Quarantine/Resolve,
+		// changes) cannot safely drive a multi-document update.
 		cmd := bson.D{
 			{Key: "update", Value: "fuel_rows"},
 			{Key: "updates", Value: bson.A{bson.D{
-				{Key: "q", Value: bson.D{
-					{Key: "p", Value: "main"},
-					{Key: "sh", Value: target.TxID[:]},
-					{Key: "st", Value: bson.D{{Key: "$in", Value: bson.A{
-						int32(store.StateAvailable), int32(store.StateReserved), int32(store.StateQuarantined),
-					}}}},
-				}},
+				{Key: "q", Value: mongodb.RetireCascadeFilter("main", target.TxID)},
 				{Key: "u", Value: bson.D{{Key: "$set", Value: bson.D{{Key: "st", Value: int32(store.StateInvalid)}}}}},
 				{Key: "multi", Value: true},
+				{Key: "hint", Value: "_id_"},
 			}}},
 		}
 		info, keys, docs := explainWinningPlan(ctx, t, db, cmd)
-		assert.Equal(t, []string{"rows_pool_state_v2"}, info.indexNames)
+		assert.Equal(t, []string{"_id_"}, info.indexNames, "the cascade must be driven by the stable _id index, not one keyed on st")
 		assert.False(t, info.sawSort)
-		assert.LessOrEqual(t, int(keys), 3*rowsPerShard+10, "keysExamined must scale with the shard, not the pool")
+		assert.LessOrEqual(t, int(keys), rowsPerShard+5, "keysExamined must be bounded by this shard's own row count, not the pool")
 		assert.LessOrEqual(t, int(docs), rowsPerShard, "must only touch this shard's own rows")
 		t.Logf("RetireShardCascade: indexes=%v sort=%v keysExamined=%d docsExamined=%d", info.indexNames, info.sawSort, keys, docs)
 	})
@@ -300,9 +303,13 @@ func TestExplainUsesIndexes(t *testing.T) {
 	})
 
 	t.Run("ReserveReadback", func(t *testing.T) {
-		// Matches rows.go Reserve's classification read. MintShard numbers a
-		// shard's rows by vout 0..rowsPerShard-1, so the target's first 50
-		// outpoints can be built directly without a round-trip.
+		// Matches rows.go Reserve's classification read, including its _id_
+		// hint (added alongside the RetireShard cascade fix: an _id $in
+		// already uses the primary-key index in practice, but the hint pins
+		// it so a future index cannot win this query by planner heuristics
+		// instead). MintShard numbers a shard's rows by vout 0..rowsPerShard-1,
+		// so the target's first 50 outpoints can be built directly without a
+		// round-trip.
 		ids := make(bson.A, 50)
 		for i := range ids {
 			id := make([]byte, 0, 36)
@@ -318,10 +325,13 @@ func TestExplainUsesIndexes(t *testing.T) {
 				{Key: "st", Value: int32(store.StateReserved)},
 			}},
 			{Key: "projection", Value: bson.D{{Key: "_id", Value: 1}, {Key: "rb", Value: 1}, {Key: "ea", Value: 1}}},
+			{Key: "hint", Value: "_id_"},
 		}
-		info, _, _ := explainWinningPlan(ctx, t, db, cmd)
+		info, keys, docs := explainWinningPlan(ctx, t, db, cmd)
 		assert.Equal(t, []string{"_id_"}, info.indexNames, "an _id $in must use the default primary-key index")
 		assert.False(t, info.sawSort)
+		assert.LessOrEqual(t, int(keys), len(ids)+1, "keysExamined must be bounded by the requested ids, not the pool")
+		t.Logf("ReserveReadback: indexes=%v sort=%v keysExamined=%d docsExamined=%d", info.indexNames, info.sawSort, keys, docs)
 	})
 
 	t.Run("AcquireShard", func(t *testing.T) {

@@ -227,6 +227,53 @@ func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Has
 	return store.ErrTerminalShard
 }
 
+// retireCascadeFilter is RetireShard's own cascade filter, factored out so
+// tests (indexes_test.go's TestExplainUsesIndexes) can explain the exact
+// query the code issues rather than a hand-maintained copy that can drift
+// from it.
+//
+// It is bounded by an _id range (a row's _id is its txid's 32 bytes followed
+// by its big-endian vout, see rowID) rather than by the sh (shard txid)
+// equality clause alone, and the UpdateMany call below forces the _id_
+// index via a hint. This matters because rows_pool_state_v2 is keyed
+// {p, st, sh}: st is part of that index's key, and st is exactly the field
+// this cascade's own update (and any concurrent Release/Reserve-replay/
+// Spend/Quarantine/Resolve) changes. A multi-document update that visits
+// documents via an index whose key includes a field the update -- or any
+// concurrent write -- can change is not guaranteed to visit every matching
+// document exactly once: a row whose st moves (e.g. reserved -> available
+// via a concurrent Release) after the scan's cursor has already passed that
+// new position, but before it would otherwise have reached the row's old
+// position, is skipped entirely (this was reproduced by
+// storetest's RetireVsReleaseRace: ~6/20 runs under-cascaded by exactly the
+// rows that raced a concurrent Release). _id never changes for a row, so an
+// _id-ordered (or, as here, _id-range-bounded and _id-hinted) scan visits
+// every row in [lo, hi] exactly once regardless of concurrent writes, and
+// MongoDB re-evaluates cascadeFilter's st/p/sh predicate against each row's
+// *current* document at the moment it is visited -- so a row already moved
+// to invalid, spent, or otherwise terminal by a concurrent write is
+// correctly skipped, while one still in {available, reserved, quarantined}
+// at visit time is correctly cascaded, however its st changed mid-scan.
+func retireCascadeFilter(pool string, txid chainhash.Hash) bson.D {
+	lo := rowID(store.Outpoint{TxID: txid, Vout: 0})
+	hi := rowID(store.Outpoint{TxID: txid, Vout: ^uint32(0)})
+	return bson.D{
+		{Key: "_id", Value: bson.D{{Key: "$gte", Value: lo}, {Key: "$lte", Value: hi}}},
+		{Key: "p", Value: pool},
+		{Key: "sh", Value: txid[:]},
+		{Key: "st", Value: bson.D{{Key: "$in", Value: bson.A{
+			int32(store.StateAvailable), int32(store.StateReserved), int32(store.StateQuarantined),
+		}}}},
+	}
+}
+
+// RetireCascadeFilter exposes RetireShard's own cascade filter for tests
+// (index/explain assertions), so they explain the exact query the code
+// issues rather than a hand-maintained copy that can drift from it.
+func RetireCascadeFilter(pool string, txid chainhash.Hash) bson.D {
+	return retireCascadeFilter(pool, txid)
+}
+
 // RetireShard implements store.Store. Rows are cascaded first and the shard
 // document is updated last -- the same "rows first, record last" rule
 // PutShard uses for non-atomic backends (see store.go) -- so a crash or
@@ -272,15 +319,9 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 		return 0, wrap(err)
 	}
 
-	cascadeFilter := bson.D{
-		{Key: "p", Value: pool},
-		{Key: "sh", Value: txid[:]},
-		{Key: "st", Value: bson.D{{Key: "$in", Value: bson.A{
-			int32(store.StateAvailable), int32(store.StateReserved), int32(store.StateQuarantined),
-		}}}},
-	}
+	cascadeFilter := retireCascadeFilter(pool, txid)
 	cascadeUpdate := bson.D{{Key: "$set", Value: bson.D{{Key: "st", Value: int32(store.StateInvalid)}, {Key: "ua", Value: us(now)}}}}
-	ures, err := s.rows.UpdateMany(octx, cascadeFilter, cascadeUpdate)
+	ures, err := s.rows.UpdateMany(octx, cascadeFilter, cascadeUpdate, options.UpdateMany().SetHint("_id_"))
 	if err != nil {
 		return 0, wrap(err)
 	}
