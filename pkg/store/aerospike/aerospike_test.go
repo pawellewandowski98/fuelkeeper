@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -18,40 +19,62 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/storetest"
 )
 
-// testHost skips the test when FUELKEEPER_TEST_AEROSPIKE_HOST is unset.
+// testHost skips the test unless FUELKEEPER_TEST_AEROSPIKE_HOST (or the
+// Makefile's AERO_HOST) names a server.
 func testHost(t *testing.T) string {
 	t.Helper()
 	host := os.Getenv("FUELKEEPER_TEST_AEROSPIKE_HOST")
+	if host == "" {
+		host = os.Getenv("AERO_HOST")
+	}
 	if host == "" {
 		t.Skip("FUELKEEPER_TEST_AEROSPIKE_HOST not set")
 	}
 	return host
 }
 
-// isolatedStore opens a store scoped to a fresh, randomly-prefixed set of
-// sets in the shared "test" namespace, and truncates them on cleanup.
+// testSetPrefix is the FIXED set-name prefix every test store shares.
+// Aerospike never frees a set name and caps a namespace at ~4K of them, so
+// tests must never generate set names; they isolate by KeyPrefix instead.
+const testSetPrefix = "fk_"
+
+// randKeyPrefix returns a fresh tenant KeyPrefix.
+func randKeyPrefix() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return "t" + hex.EncodeToString(b[:])
+}
+
+// openTestStore opens a store on the fixed test sets under keyPrefix (in
+// availability mode: the test server is Community Edition). It registers
+// Close but not Truncate.
+func openTestStore(t *testing.T, host, keyPrefix string, now func() time.Time) *Store {
+	t.Helper()
+	// PoolSize: 8, not the package default of 128: RunSuite runs 33 subtests
+	// in parallel, each opening its own client against the same single-node
+	// server, so 33 * PoolSize must stay reasonable for one process.
+	s, err := New(context.Background(), Config{
+		Hosts:                 []string{host},
+		Namespace:             "test",
+		SetPrefix:             testSetPrefix,
+		KeyPrefix:             keyPrefix,
+		AllowAvailabilityMode: true,
+		PoolSize:              8,
+	}, WithClock(now), WithLogger(slog.New(slog.DiscardHandler)))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// isolatedStore opens a store isolated by a fresh random KeyPrefix on the
+// fixed test sets, and deletes exactly its records on cleanup; a Truncate
+// failure fails the test.
 func isolatedStore(t *testing.T, host string, now func() time.Time) *Store {
 	t.Helper()
-	ctx := context.Background()
-
-	var b [4]byte
-	_, _ = rand.Read(b[:])
-	prefix := "fk" + hex.EncodeToString(b[:]) + "_"
-
-	// PoolSize: 8, not the package default of 128: RunSuite runs 32 subtests in
-	// parallel, each opening its own client against the same single-node
-	// Community Edition server (the local docker-compose service), so
-	// 32 * PoolSize must stay reasonable for one process to serve without
-	// contention skewing latencies past individual operations' timeouts.
-	s, err := New(ctx, Config{
-		Hosts:     []string{host},
-		Namespace: "test",
-		SetPrefix: prefix,
-		PoolSize:  8,
-	}, WithClock(now))
-	require.NoError(t, err)
-
-	t.Cleanup(s.Truncate)
+	s := openTestStore(t, host, randKeyPrefix(), now)
+	// Registered before RunSuite's own Close cleanup, so it runs after it:
+	// Truncate uses its own connection.
+	t.Cleanup(func() { assert.NoError(t, s.Truncate(), "truncate") })
 	return s
 }
 
@@ -62,8 +85,9 @@ func TestConformance(t *testing.T) {
 	})
 }
 
-// TestIndexesExist asserts the five secondary indexes this package relies on
-// exist, via the sindex-list info command.
+// TestIndexesExist asserts every secondary index this package relies on
+// exists with the expected set, bin and type, via the sindex-list info
+// command.
 func TestIndexesExist(t *testing.T) {
 	host := testHost(t)
 	clk := storetest.NewClock(storetest.Start)
@@ -75,8 +99,11 @@ func TestIndexesExist(t *testing.T) {
 	require.Nil(t, aerr)
 	list := info["sindex-list:ns=test"]
 
+	entries := parseSindexList(list)
 	for _, spec := range s.indexSpecs() {
-		assert.Contains(t, list, spec.indexName, "index %q must exist", spec.indexName)
+		ready, err := matchExistingIndex(entries, spec)
+		require.NoError(t, err)
+		assert.True(t, ready, "index %q must exist and be readable", spec.indexName)
 	}
 }
 

@@ -54,8 +54,8 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 	if err != nil {
 		return err
 	}
-	if aerr := s.client.Put(s.createPolicy(ctx), txidKey, as.BinMap{binPool: shard.Pool}); aerr != nil {
-		if !aerr.Matches(types.KEY_EXISTS_ERROR) {
+	if aerr := s.client.Put(s.createPolicy(ctx), txidKey, s.withTenant(as.BinMap{binPool: shard.Pool})); aerr != nil {
+		if !isCode(aerr, types.KEY_EXISTS_ERROR) {
 			return wrap(aerr)
 		}
 		owner, gerr := s.client.Get(s.readPolicy(ctx), txidKey, binPool)
@@ -81,7 +81,7 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 		if kerr != nil {
 			return kerr
 		}
-		bins := rowBins(r)
+		bins := s.rowBins(r)
 		ops := make([]*as.Operation, 0, len(bins))
 		for name, val := range bins {
 			ops = append(ops, as.PutOp(as.NewBin(name, val)))
@@ -89,8 +89,8 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 		rowRecords[i] = as.NewBatchWrite(s.batchCreatePolicy(ctx), key, ops...)
 	}
 	if len(rowRecords) > 0 {
-		if aerr := s.client.BatchOperate(s.batchPolicy(ctx), rowRecords); aerr != nil {
-			return fmt.Errorf("%w: %w", store.ErrUnavailable, aerr)
+		if err := s.batchOperate(ctx, rowRecords); err != nil {
+			return err
 		}
 		if _, cerr := classifyBatch(rowRecords, types.KEY_EXISTS_ERROR); cerr != nil {
 			return cerr
@@ -99,12 +99,12 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 		// partial prior write (PutShard never touches an existing row).
 	}
 
-	sd := shardBins(&store.Shard{
+	sd := s.shardBins(&store.Shard{
 		Pool: shard.Pool, TxID: shard.TxID, Size: shard.Size, Denomination: shard.Denomination,
 		LockMode: shard.LockMode, Status: shard.Status, BEEF: shard.BEEF, CreatedAt: now, UpdatedAt: now,
-	})
+	}, rows)
 	if aerr := s.client.Put(s.createPolicy(ctx), shardKey, sd); aerr != nil {
-		if !aerr.Matches(types.KEY_EXISTS_ERROR) {
+		if !isCode(aerr, types.KEY_EXISTS_ERROR) {
 			return wrap(aerr)
 		}
 		// A concurrent, identical PutShard just landed: compare and settle.
@@ -179,7 +179,7 @@ func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Has
 	)
 	ops := []*as.Operation{
 		as.PutOp(as.NewBin(binStatus, int64(status))),
-		as.PutOp(as.NewBin(binPS, psFor(pool, status))),
+		as.PutOp(as.NewBin(binPS, s.psFor(pool, status))),
 		as.PutOp(as.NewBin(binUA, us(now))),
 		as.AddOp(as.NewBin(binVer, int64(1))),
 	}
@@ -199,7 +199,20 @@ func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Has
 	}
 }
 
-// RetireShard implements store.Store.
+// RetireShard implements store.Store. Rows are cascaded FIRST and the
+// shard is marked invalid LAST, and the cascade runs even when the shard is
+// already invalid, so a call that failed partway (ErrUnavailable, crash)
+// is repaired by any retry: a shard can never be invalid while one of its
+// rows is still available/reserved/quarantined for longer than the failed
+// call. In the normal already-invalid case every row is already terminal,
+// the cascade changes nothing and the call returns 0 without touching the
+// shard record (store.go: no-op, Version/UpdatedAt unchanged).
+//
+// Rows are addressed by key from the shard's own vout list (vo bin), never
+// discovered by state: a query-by-state discovery races with concurrent
+// Release/Resolve moving a row between states and can miss it. One
+// BatchOperate per maxBatch rows applies the non-terminal -> invalid CAS to
+// each row; the cost is O(shard size), independent of the pool's size.
 func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Hash) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -214,39 +227,49 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 	if err != nil {
 		return 0, err
 	}
+	rec, aerr := s.client.Get(s.readPolicy(ctx), key, binSize, binVO)
+	if aerr != nil {
+		if isKeyNotFound(aerr) {
+			return 0, store.ErrNotFound
+		}
+		return 0, wrap(aerr)
+	}
+	outpoints := shardOutpoints(txid, toBytes(rec.Bins[binVO]), int(toInt64(rec.Bins[binSize])))
+
 	now := s.now().Truncate(time.Microsecond)
+	n, err := s.retireRows(ctx, pool, outpoints, now)
+	if err != nil {
+		return 0, err
+	}
 
 	wp := s.writePolicy(ctx)
 	wp.FilterExpression = as.ExpNotEq(as.ExpIntBin(binStatus), as.ExpIntVal(int64(store.ShardInvalid)))
 	ops := []*as.Operation{
 		as.PutOp(as.NewBin(binStatus, int64(store.ShardInvalid))),
-		as.PutOp(as.NewBin(binPS, psFor(pool, store.ShardInvalid))),
+		as.PutOp(as.NewBin(binPS, s.psFor(pool, store.ShardInvalid))),
 		as.PutOp(as.NewBin(binOwner, "")),
 		as.PutOp(as.NewBin(binLU, int64(0))),
 		as.PutOp(as.NewBin(binUA, us(now))),
 		as.AddOp(as.NewBin(binVer, int64(1))),
 	}
-	_, aerr := s.client.Operate(wp, key, ops...)
+	_, aerr = s.client.Operate(wp, key, ops...)
 	switch {
-	case aerr == nil:
-		// fall through to the row cascade below
+	case aerr == nil, isFiltered(aerr):
+		// Filtered: already invalid. n is 0 unless this call repaired a
+		// cascade an earlier call left unfinished.
+		return n, nil
 	case isKeyNotFound(aerr):
 		return 0, store.ErrNotFound
-	case isFiltered(aerr):
-		return 0, nil // already invalid: idempotent no-op
 	default:
 		return 0, wrap(aerr)
 	}
+}
 
-	candidates, err := s.retireCascadeCandidates(ctx, pool, txid)
-	if err != nil {
-		return 0, err
-	}
-	if len(candidates) == 0 {
-		return 0, nil
-	}
-
-	cascadeFilter := as.ExpAnd(
+// retireRows moves every non-terminal row among ops to invalid, keeping all
+// provenance (store.go "Provenance") and removing the index-only ak/rx/qx
+// bins, and returns how many rows it changed.
+func (s *Store) retireRows(ctx context.Context, pool string, ops []store.Outpoint, now time.Time) (int, error) {
+	filter := as.ExpAnd(
 		as.ExpEq(as.ExpStringBin(binPool), as.ExpStringVal(pool)),
 		as.ExpOr(
 			as.ExpEq(as.ExpIntBin(binState), as.ExpIntVal(int64(store.StateAvailable))),
@@ -254,61 +277,26 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 			as.ExpEq(as.ExpIntBin(binState), as.ExpIntVal(int64(store.StateQuarantined))),
 		),
 	)
-	return s.mutateRowsCount(ctx, candidates, cascadeFilter, func(store.Outpoint) []*as.Operation {
-		return []*as.Operation{
-			as.PutOp(as.NewBin(binState, int64(store.StateInvalid))),
-			as.PutOp(as.NewBin(binPST, pstFor(pool, store.StateInvalid))),
-			as.PutOp(as.NewBin(binUA, us(now))),
-			as.PutOp(as.NewBin(binAK, nil)), // no-op unless the row was available
-		}
-	})
-}
-
-// retireCascadeCandidates discovers every non-terminal row of (pool, txid):
-// available rows are found directly via the shard-scoped ak index; reserved
-// and quarantined rows have no shard-scoped index, so every reserved/
-// quarantined row of the whole pool is scanned and filtered client-side by
-// txid (documented O(pool rows), matching Stats).
-func (s *Store) retireCascadeCandidates(ctx context.Context, pool string, txid chainhash.Hash) ([]store.Outpoint, error) {
-	seen := make(map[store.Outpoint]struct{})
-	var out []store.Outpoint
-	add := func(op store.Outpoint) {
-		if _, dup := seen[op]; dup {
-			return
-		}
-		seen[op] = struct{}{}
-		out = append(out, op)
-	}
-
-	avail, err := s.queryEqual(ctx, s.rowsSet, binAK, akFor(pool, txid), nil)
-	if err != nil {
-		return nil, err
-	}
-	for _, rec := range avail {
-		op, derr := outpointFromBins(rec.Bins)
-		if derr != nil {
-			return nil, derr
-		}
-		add(op)
-	}
-
-	for _, st := range []store.State{store.StateReserved, store.StateQuarantined} {
-		recs, qerr := s.queryEqual(ctx, s.rowsSet, binPST, pstFor(pool, st), nil)
-		if qerr != nil {
-			return nil, qerr
-		}
-		for _, rec := range recs {
-			op, derr := outpointFromBins(rec.Bins)
-			if derr != nil {
-				return nil, derr
+	total := 0
+	for len(ops) > 0 {
+		chunk := ops[:min(len(ops), maxBatch)]
+		ops = ops[len(chunk):]
+		n, err := s.mutateRowsCount(ctx, chunk, filter, func(store.Outpoint) []*as.Operation {
+			return []*as.Operation{
+				as.PutOp(as.NewBin(binState, int64(store.StateInvalid))),
+				as.PutOp(as.NewBin(binPST, s.pstFor(pool, store.StateInvalid))),
+				as.PutOp(as.NewBin(binUA, us(now))),
+				as.PutOp(as.NewBin(binAK, nil)),
+				as.PutOp(as.NewBin(binRX, nil)),
+				as.PutOp(as.NewBin(binQX, nil)),
 			}
-			if op.TxID != txid {
-				continue
-			}
-			add(op)
+		})
+		if err != nil {
+			return 0, err
 		}
+		total += n
 	}
-	return out, nil
+	return total, nil
 }
 
 // AcquireShard implements store.Store.
@@ -339,24 +327,27 @@ func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, unti
 		excluded[h] = struct{}{}
 	}
 
+	// Discovery fetches only txid and created_at (never BEEF); the
+	// lease-free predicate runs server-side.
+	leaseFree := as.ExpOr(
+		as.ExpEq(as.ExpStringBin(binOwner), as.ExpStringVal("")),
+		as.ExpLessEq(as.ExpIntBin(binLU), as.ExpIntVal(us(now))),
+	)
 	var candidates []store.Shard
 	for _, status := range statuses {
-		recs, err := s.queryEqual(ctx, s.shardsSet, binPS, psFor(pool, status), nil)
+		recs, err := s.queryEqual(ctx, s.shardsSet, binPS, s.psFor(pool, status), leaseFree, binTxID, binCA)
 		if err != nil {
 			return nil, err
 		}
 		for _, rec := range recs {
-			sh, derr := shardFromRecord(rec, false)
+			h, derr := chainhash.NewHash(toBytes(rec.Bins[binTxID]))
 			if derr != nil {
-				return nil, derr
+				return nil, fmt.Errorf("aerospike: decode shard txid: %w", derr)
 			}
-			if _, skip := excluded[sh.TxID]; skip {
+			if _, skip := excluded[*h]; skip {
 				continue
 			}
-			if sh.Owner != "" && sh.LeaseUntil.After(now) {
-				continue // held, unexpired
-			}
-			candidates = append(candidates, sh)
+			candidates = append(candidates, store.Shard{TxID: *h, CreatedAt: fromUS(toInt64(rec.Bins[binCA]))})
 		}
 	}
 	sort.Slice(candidates, func(i, j int) bool {
@@ -366,19 +357,29 @@ func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, unti
 		return lessOutpointBytes(store.Outpoint{TxID: candidates[i].TxID}, store.Outpoint{TxID: candidates[j].TxID})
 	})
 
+	statusExprs := make([]*as.Expression, len(statuses))
+	for i, st := range statuses {
+		statusExprs[i] = as.ExpEq(as.ExpIntBin(binStatus), as.ExpIntVal(int64(st)))
+	}
+	statusIn := statusExprs[0]
+	if len(statusExprs) > 1 {
+		statusIn = as.ExpOr(statusExprs...)
+	}
+
 	storeNow := s.now().Truncate(time.Microsecond)
 	for _, cand := range candidates {
 		key, err := s.shardKey(pool, cand.TxID)
 		if err != nil {
 			return nil, err
 		}
+		// The winning write re-asserts everything discovery checked: the
+		// shard may have been acquired, retired or had its status changed
+		// since the query saw it.
 		wp := s.writePolicy(ctx)
 		wp.FilterExpression = as.ExpAnd(
 			as.ExpEq(as.ExpStringBin(binPool), as.ExpStringVal(pool)),
-			as.ExpOr(
-				as.ExpEq(as.ExpStringBin(binOwner), as.ExpStringVal("")),
-				as.ExpLessEq(as.ExpIntBin(binLU), as.ExpIntVal(us(now))),
-			),
+			statusIn,
+			leaseFree,
 		)
 		ops := []*as.Operation{
 			as.PutOp(as.NewBin(binOwner, holder)),
@@ -500,7 +501,11 @@ func (s *Store) ReleaseShard(ctx context.Context, pool string, txid chainhash.Ha
 	return nil
 }
 
-// ListShards implements store.Store.
+// shardHeadBins are every shard bin ListShards decodes: everything but beef
+// (and vo), so listing never transfers BEEF.
+var shardHeadBins = []string{binPool, binTxID, binSize, binDenom, binMode, binStatus, binOwner, binLU, binVer, binCA, binUA}
+
+// ListShards implements store.Store. The owner filter runs server-side.
 func (s *Store) ListShards(ctx context.Context, pool string, f store.ShardFilter) ([]store.Shard, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -520,9 +525,13 @@ func (s *Store) ListShards(ctx context.Context, pool string, f store.ShardFilter
 		statuses = []store.ShardStatus{store.ShardUnmined, store.ShardMined, store.ShardRetired, store.ShardInvalid}
 	}
 
+	var ownerExpr *as.Expression
+	if f.Owner != nil {
+		ownerExpr = as.ExpEq(as.ExpStringBin(binOwner), as.ExpStringVal(*f.Owner))
+	}
 	var out []store.Shard
 	for _, status := range statuses {
-		recs, err := s.queryEqual(ctx, s.shardsSet, binPS, psFor(pool, status), nil)
+		recs, err := s.queryEqual(ctx, s.shardsSet, binPS, s.psFor(pool, status), ownerExpr, shardHeadBins...)
 		if err != nil {
 			return nil, err
 		}
@@ -530,9 +539,6 @@ func (s *Store) ListShards(ctx context.Context, pool string, f store.ShardFilter
 			sh, derr := shardFromRecord(rec, false)
 			if derr != nil {
 				return nil, derr
-			}
-			if f.Owner != nil && sh.Owner != *f.Owner {
-				continue
 			}
 			out = append(out, sh)
 		}

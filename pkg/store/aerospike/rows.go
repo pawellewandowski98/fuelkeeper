@@ -2,7 +2,6 @@ package aerospike
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"time"
 
@@ -37,7 +36,7 @@ func (s *Store) ListAvailable(ctx context.Context, pool string, txid chainhash.H
 	}
 
 	filterExpr := as.ExpGreaterEq(as.ExpIntBin(binVout), as.ExpIntVal(int64(fromVout)))
-	recs, err := s.queryEqual(ctx, s.rowsSet, binAK, akFor(pool, txid), filterExpr)
+	recs, err := s.queryEqual(ctx, s.rowsSet, binAK, s.akFor(pool, txid), filterExpr)
 	if err != nil {
 		return nil, err
 	}
@@ -142,10 +141,10 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 		}
 		bwp := s.batchWritePolicy(ctx)
 		bwp.FilterExpression = reserveFilter(pool, op.Token)
-		records[i] = as.NewBatchWrite(bwp, key, reserveOps(pool, op.Token, now, op.ExpiresAt.Truncate(time.Microsecond))...)
+		records[i] = as.NewBatchWrite(bwp, key, s.reserveOps(pool, op.Token, now, op.ExpiresAt.Truncate(time.Microsecond))...)
 	}
-	if aerr := s.client.BatchOperate(s.batchPolicy(ctx), records); aerr != nil {
-		return nil, fmt.Errorf("%w: %w", store.ErrUnavailable, aerr)
+	if err := s.batchOperate(ctx, records); err != nil {
+		return nil, err
 	}
 
 	applied, err := classifyBatch(records, types.FILTERED_OUT, types.KEY_NOT_FOUND_ERROR)
@@ -178,18 +177,21 @@ func reserveFilter(pool string, tok store.Token) *as.Expression {
 
 // reserveOps builds the per-record write for the available->reserved edge
 // (or a same-token replay, which the ExpCond below leaves untouched).
-func reserveOps(pool string, tok store.Token, now, exp time.Time) []*as.Operation {
+func (s *Store) reserveOps(pool string, tok store.Token, now, exp time.Time) []*as.Operation {
 	isAvail := as.ExpEq(as.ExpIntBin(binState), as.ExpIntVal(int64(store.StateAvailable)))
 	raExpr := as.ExpCond(isAvail, as.ExpIntVal(us(now)), as.ExpIntBin(binRA))
 	eaExpr := as.ExpCond(isAvail, as.ExpIntVal(us(exp)), as.ExpIntBin(binEA))
 	uaExpr := as.ExpCond(isAvail, as.ExpIntVal(us(now)), as.ExpIntBin(binUA))
+	// rx mirrors ea while reserved; on a replay it already holds ea.
+	rxExpr := as.ExpCond(isAvail, as.ExpIntVal(us(exp)), as.ExpIntBin(binEA))
 	return []*as.Operation{
 		as.ExpWriteOp(binRA, raExpr, as.ExpWriteFlagDefault),
 		as.ExpWriteOp(binEA, eaExpr, as.ExpWriteFlagDefault),
+		as.ExpWriteOp(binRX, rxExpr, as.ExpWriteFlagDefault),
 		as.ExpWriteOp(binUA, uaExpr, as.ExpWriteFlagDefault),
 		as.PutOp(as.NewBin(binState, int64(store.StateReserved))),
 		as.PutOp(as.NewBin(binRB, tok[:])),
-		as.PutOp(as.NewBin(binPST, pstFor(pool, store.StateReserved))),
+		as.PutOp(as.NewBin(binPST, s.pstFor(pool, store.StateReserved))),
 		as.PutOp(as.NewBin(binAK, nil)),
 		as.GetBinOp(binEA),
 	}
@@ -221,7 +223,7 @@ func (s *Store) Release(ctx context.Context, pool string, token store.Token, ops
 		as.ExpEq(as.ExpBlobBin(binRB), as.ExpBlobVal(token[:])),
 	)
 	return s.mutateRowsCount(ctx, sorted, filterExpr, func(op store.Outpoint) []*as.Operation {
-		return releaseOrResolveAvailableOps(pool, op, now)
+		return s.releaseOrResolveAvailableOps(pool, op, now)
 	})
 }
 
@@ -229,26 +231,25 @@ func (s *Store) Release(ctx context.Context, pool string, token store.Token, ops
 // available use: return to available, restoring ak and clearing every
 // provenance field (store.go, "Provenance": "Only Release, or Resolve to
 // available, clears all five").
-func releaseOrResolveAvailableOps(pool string, op store.Outpoint, now time.Time) []*as.Operation {
+func (s *Store) releaseOrResolveAvailableOps(pool string, op store.Outpoint, now time.Time) []*as.Operation {
 	return []*as.Operation{
 		as.PutOp(as.NewBin(binState, int64(store.StateAvailable))),
-		as.PutOp(as.NewBin(binPST, pstFor(pool, store.StateAvailable))),
-		as.PutOp(as.NewBin(binAK, akFor(pool, op.TxID))),
+		as.PutOp(as.NewBin(binPST, s.pstFor(pool, store.StateAvailable))),
+		as.PutOp(as.NewBin(binAK, s.akFor(pool, op.TxID))),
 		as.PutOp(as.NewBin(binUA, us(now))),
 		as.PutOp(as.NewBin(binRB, nil)),
 		as.PutOp(as.NewBin(binRA, nil)),
 		as.PutOp(as.NewBin(binEA, nil)),
 		as.PutOp(as.NewBin(binQA, nil)),
 		as.PutOp(as.NewBin(binHint, nil)),
+		as.PutOp(as.NewBin(binRX, nil)),
+		as.PutOp(as.NewBin(binQX, nil)),
 	}
 }
 
-// Spend implements store.Store. ea/ra/rb are never removed here: store.go's
-// "Provenance" rule keeps them across every transition that is not a return
-// to available, and the ea NUMERIC index is only ever queried (Quarantine)
-// together with a state==reserved FilterExpression, so a value left behind
-// by an earlier reservation cannot produce a wrong result there, only a
-// larger index (see bins.go).
+// Spend implements store.Store. ea/ra/rb are kept for provenance (store.go
+// "Provenance"); only the index-only rx bin is removed, so the row leaves
+// Quarantine's discovery index in the same atomic write (see bins.go).
 func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops []store.Outpoint, txid chainhash.Hash, terminal bool) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -281,14 +282,17 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 			return []*as.Operation{
 				as.PutOp(as.NewBin(binState, int64(store.StateSpent))),
 				as.PutOp(as.NewBin(binSB, txid[:])),
-				as.PutOp(as.NewBin(binPST, pstFor(pool, store.StateSpent))),
+				as.PutOp(as.NewBin(binPST, s.pstFor(pool, store.StateSpent))),
 				as.PutOp(as.NewBin(binUA, us(now))),
+				as.PutOp(as.NewBin(binRX, nil)),
 			}
 		}
 		spendOps := []*as.Operation{
 			as.PutOp(as.NewBin(binState, int64(store.StateQuarantined))),
 			as.PutOp(as.NewBin(binQA, us(now))),
-			as.PutOp(as.NewBin(binPST, pstFor(pool, store.StateQuarantined))),
+			as.PutOp(as.NewBin(binQX, us(now))),
+			as.PutOp(as.NewBin(binRX, nil)),
+			as.PutOp(as.NewBin(binPST, s.pstFor(pool, store.StateQuarantined))),
 			as.PutOp(as.NewBin(binUA, us(now))),
 		}
 		if txid != (chainhash.Hash{}) {
@@ -299,11 +303,20 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 }
 
 // Quarantine implements store.Store: due rows are discovered by a range
-// query on the ea NUMERIC index (gated by state == reserved), sorted
-// client-side (Aerospike query results are unordered) and capped at limit,
-// then moved one at a time via BatchOperate, each record's own filter
-// re-checking state and expiry so a row a concurrent Release/Reserve-replay
-// already moved away from reserved is simply skipped.
+// query on the rx NUMERIC index, which only holds rows currently reserved
+// (see bins.go), so terminal rows never cost anything here. Aerospike query
+// results are unordered, so the limit smallest (expires_at, txid, vout)
+// candidates are kept in a bounded max-heap while streaming (O(limit)
+// memory, and only txid/vout/ea are transferred), then moved via one
+// BatchOperate whose per-record filter re-checks state and expiry, so a row
+// a concurrent Release/Spend already moved away from reserved is skipped.
+//
+// The limit cannot be pushed into the query (MaxRecords) without breaking
+// the contract's pick order: the server returns an arbitrary subset.
+//
+// A before at or before the Unix epoch, or a zero before, matches nothing
+// (every stored expiry is strictly after the epoch; see store.ValidateTime)
+// and returns 0 without querying.
 func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, limit int) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -319,36 +332,44 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 	}
 
 	beforeUS := us(before.Truncate(time.Microsecond))
-	stateReservedExpr := as.ExpAnd(
+	if beforeUS <= 1 {
+		return 0, nil // matches nothing: no expiry is <= the epoch
+	}
+	stmt := as.NewStatement(s.ns, s.rowsSet, binTxID, binVout, binEA)
+	stmt.Filter = as.NewRangeFilter(binRX, 1, beforeUS-1)
+	qp := s.queryPolicy(ctx)
+	qp.FilterExpression = as.ExpAnd(
+		s.tenantExpr(),
 		as.ExpEq(as.ExpStringBin(binPool), as.ExpStringVal(pool)),
 		as.ExpEq(as.ExpIntBin(binState), as.ExpIntVal(int64(store.StateReserved))),
 	)
-	stmt := as.NewStatement(s.ns, s.rowsSet)
-	stmt.Filter = as.NewRangeFilter(binEA, 0, beforeUS-1)
-	qp := s.queryPolicy(ctx)
-	qp.FilterExpression = stateReservedExpr
-	rs, aerr := s.client.Query(qp, stmt)
-	if aerr != nil {
-		return 0, wrap(aerr)
-	}
-	recs, err := collectRecords(rs)
+	top := newBoundedTop(limit, lessQuarantineCandidate)
+	var derr error
+	err := s.query(qp, stmt, func(rec *as.Record) {
+		if derr != nil {
+			return
+		}
+		op, err := outpointFromBins(rec.Bins)
+		if err != nil {
+			derr = err
+			return
+		}
+		top.push(store.Row{Outpoint: op, ExpiresAt: fromUS(toInt64(rec.Bins[binEA]))})
+	})
 	if err != nil {
 		return 0, err
 	}
-	rows, err := rowsFromRecords(recs)
-	if err != nil {
-		return 0, err
+	if derr != nil {
+		return 0, derr
 	}
-	sort.Slice(rows, func(i, j int) bool { return lessQuarantineCandidate(rows[i], rows[j]) })
-	if limit < len(rows) {
-		rows = rows[:limit]
-	}
+	rows := top.sorted()
 	if len(rows) == 0 {
 		return 0, nil
 	}
 
 	now := s.now().Truncate(time.Microsecond)
 	mutateFilter := as.ExpAnd(
+		as.ExpEq(as.ExpStringBin(binPool), as.ExpStringVal(pool)),
 		as.ExpEq(as.ExpIntBin(binState), as.ExpIntVal(int64(store.StateReserved))),
 		as.ExpLess(as.ExpIntBin(binEA), as.ExpIntVal(beforeUS)),
 	)
@@ -356,7 +377,9 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 		return []*as.Operation{
 			as.PutOp(as.NewBin(binState, int64(store.StateQuarantined))),
 			as.PutOp(as.NewBin(binQA, us(now))),
-			as.PutOp(as.NewBin(binPST, pstFor(pool, store.StateQuarantined))),
+			as.PutOp(as.NewBin(binQX, us(now))),
+			as.PutOp(as.NewBin(binRX, nil)),
+			as.PutOp(as.NewBin(binPST, s.pstFor(pool, store.StateQuarantined))),
 			as.PutOp(as.NewBin(binUA, us(now))),
 		}
 	})
@@ -389,7 +412,11 @@ func lessQuarantinedOrder(a, b store.Row) bool {
 	return lessOutpointBytes(a.Outpoint, b.Outpoint)
 }
 
-// ListQuarantined implements store.Store.
+// ListQuarantined implements store.Store. Discovery is a range query on the
+// qx NUMERIC index, which only holds rows currently quarantined, starting at
+// the cursor's quarantined_at; the page is selected with a bounded heap
+// while streaming. A before at or before the epoch, or a cursor at or after
+// before, matches nothing and returns an empty page without querying.
 func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Time, after *store.RowCursor, limit int) ([]store.Row, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -405,51 +432,47 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 	}
 
 	beforeUS := us(before.Truncate(time.Microsecond))
-	var afterUS int64
-	var afterOp store.Outpoint
-	hasAfter := after != nil
-	if hasAfter {
-		afterUS = us(after.At.Truncate(time.Microsecond))
-		afterOp = after.Outpoint
+	var afterUS int64 = 1
+	var ref *store.RowCursor
+	if after != nil {
+		afterUS = max(afterUS, us(after.At.Truncate(time.Microsecond)))
+		ref = &store.RowCursor{At: fromUS(us(after.At.Truncate(time.Microsecond))), Outpoint: after.Outpoint}
+	}
+	if beforeUS <= 1 || afterUS >= beforeUS {
+		return []store.Row{}, nil // matches nothing
 	}
 
-	filterExpr := as.ExpAnd(
+	stmt := as.NewStatement(s.ns, s.rowsSet)
+	stmt.Filter = as.NewRangeFilter(binQX, afterUS, beforeUS-1)
+	qp := s.queryPolicy(ctx)
+	qp.FilterExpression = as.ExpAnd(
+		s.tenantExpr(),
 		as.ExpEq(as.ExpStringBin(binPool), as.ExpStringVal(pool)),
 		as.ExpEq(as.ExpIntBin(binState), as.ExpIntVal(int64(store.StateQuarantined))),
 	)
-	stmt := as.NewStatement(s.ns, s.rowsSet)
-	stmt.Filter = as.NewRangeFilter(binQA, afterUS, beforeUS-1)
-	qp := s.queryPolicy(ctx)
-	qp.FilterExpression = filterExpr
-	rs, aerr := s.client.Query(qp, stmt)
-	if aerr != nil {
-		return nil, wrap(aerr)
-	}
-	recs, err := collectRecords(rs)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := rowsFromRecords(recs)
-	if err != nil {
-		return nil, err
-	}
-
-	if hasAfter {
-		filtered := rows[:0]
-		for _, r := range rows {
-			cur := store.RowCursor{At: r.QuarantinedAt, Outpoint: r.Outpoint}
-			if quarantineCursorAfter(cur, store.RowCursor{At: fromUS(afterUS), Outpoint: afterOp}) {
-				filtered = append(filtered, r)
-			}
+	top := newBoundedTop(limit, lessQuarantinedOrder)
+	var derr error
+	err := s.query(qp, stmt, func(rec *as.Record) {
+		if derr != nil {
+			return
 		}
-		rows = filtered
+		r, err := rowFromRecord(rec)
+		if err != nil {
+			derr = err
+			return
+		}
+		if ref != nil && !quarantineCursorAfter(store.RowCursor{At: r.QuarantinedAt, Outpoint: r.Outpoint}, *ref) {
+			return
+		}
+		top.push(r)
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	sort.Slice(rows, func(i, j int) bool { return lessQuarantinedOrder(rows[i], rows[j]) })
-	if limit < len(rows) {
-		rows = rows[:limit]
+	if derr != nil {
+		return nil, derr
 	}
-	return rows, nil
+	return top.sorted(), nil
 }
 
 // quarantineCursorAfter reports whether cur is strictly after ref in the
@@ -487,15 +510,16 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 	)
 	if to == store.StateAvailable {
 		return s.mutateRowsCount(ctx, sorted, filterExpr, func(op store.Outpoint) []*as.Operation {
-			return releaseOrResolveAvailableOps(pool, op, now)
+			return s.releaseOrResolveAvailableOps(pool, op, now)
 		})
 	}
 	return s.mutateRowsCount(ctx, sorted, filterExpr, func(store.Outpoint) []*as.Operation {
 		return []*as.Operation{
 			as.PutOp(as.NewBin(binState, int64(store.StateSpent))),
 			as.PutOp(as.NewBin(binSB, spentBy[:])),
-			as.PutOp(as.NewBin(binPST, pstFor(pool, store.StateSpent))),
+			as.PutOp(as.NewBin(binPST, s.pstFor(pool, store.StateSpent))),
 			as.PutOp(as.NewBin(binUA, us(now))),
+			as.PutOp(as.NewBin(binQX, nil)),
 		}
 	})
 }
@@ -516,31 +540,31 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 
 	var st store.Stats
 	var err error
-	if st.Available, err = s.countEqual(ctx, s.rowsSet, binPST, pstFor(pool, store.StateAvailable)); err != nil {
+	if st.Available, err = s.countEqual(ctx, s.rowsSet, binPST, s.pstFor(pool, store.StateAvailable)); err != nil {
 		return store.Stats{}, err
 	}
-	if st.Reserved, err = s.countEqual(ctx, s.rowsSet, binPST, pstFor(pool, store.StateReserved)); err != nil {
+	if st.Reserved, err = s.countEqual(ctx, s.rowsSet, binPST, s.pstFor(pool, store.StateReserved)); err != nil {
 		return store.Stats{}, err
 	}
-	if st.Quarantined, err = s.countEqual(ctx, s.rowsSet, binPST, pstFor(pool, store.StateQuarantined)); err != nil {
+	if st.Quarantined, err = s.countEqual(ctx, s.rowsSet, binPST, s.pstFor(pool, store.StateQuarantined)); err != nil {
 		return store.Stats{}, err
 	}
-	if st.Spent, err = s.countEqual(ctx, s.rowsSet, binPST, pstFor(pool, store.StateSpent)); err != nil {
+	if st.Spent, err = s.countEqual(ctx, s.rowsSet, binPST, s.pstFor(pool, store.StateSpent)); err != nil {
 		return store.Stats{}, err
 	}
-	if st.Invalid, err = s.countEqual(ctx, s.rowsSet, binPST, pstFor(pool, store.StateInvalid)); err != nil {
+	if st.Invalid, err = s.countEqual(ctx, s.rowsSet, binPST, s.pstFor(pool, store.StateInvalid)); err != nil {
 		return store.Stats{}, err
 	}
-	if st.ShardsUnmined, err = s.countEqual(ctx, s.shardsSet, binPS, psFor(pool, store.ShardUnmined)); err != nil {
+	if st.ShardsUnmined, err = s.countEqual(ctx, s.shardsSet, binPS, s.psFor(pool, store.ShardUnmined)); err != nil {
 		return store.Stats{}, err
 	}
-	if st.ShardsMined, err = s.countEqual(ctx, s.shardsSet, binPS, psFor(pool, store.ShardMined)); err != nil {
+	if st.ShardsMined, err = s.countEqual(ctx, s.shardsSet, binPS, s.psFor(pool, store.ShardMined)); err != nil {
 		return store.Stats{}, err
 	}
-	if st.ShardsRetired, err = s.countEqual(ctx, s.shardsSet, binPS, psFor(pool, store.ShardRetired)); err != nil {
+	if st.ShardsRetired, err = s.countEqual(ctx, s.shardsSet, binPS, s.psFor(pool, store.ShardRetired)); err != nil {
 		return store.Stats{}, err
 	}
-	if st.ShardsInvalid, err = s.countEqual(ctx, s.shardsSet, binPS, psFor(pool, store.ShardInvalid)); err != nil {
+	if st.ShardsInvalid, err = s.countEqual(ctx, s.shardsSet, binPS, s.psFor(pool, store.ShardInvalid)); err != nil {
 		return store.Stats{}, err
 	}
 	return st, nil

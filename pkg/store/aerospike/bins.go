@@ -14,13 +14,14 @@ import (
 )
 
 // Bin names (rows set). Every name is <= 15 bytes, the server's bin-name
-// limit. ea and qa double as both the provenance value (kept across every
-// transition that is not a return to available, per store.go "Provenance")
-// and the source bin for the ea/qa secondary indexes; unlike ak/pst they are
-// never removed on a state transition, since removing them would destroy
-// provenance data the suite pins. Every query that ranges over ea or qa also
-// carries a FilterExpression re-checking state, so a value left over from an
-// earlier reservation never produces a wrong result, only a larger index.
+// limit. ea and qa are provenance only (store.go "Provenance" keeps them
+// across every transition that is not a return to available) and are NOT
+// indexed: a terminal row would otherwise stay in the expiry/quarantine
+// index forever and every Quarantine/ListQuarantined call would have to
+// examine it again. The indexed bins are index-only copies whose presence
+// exactly tracks state, like ak: rx (== ea) exists only while the row is
+// reserved and qx (== qa) only while it is quarantined; every operate that
+// changes state writes or removes them in the same atomic operation.
 const (
 	binPool  = "pool"
 	binTxID  = "txid"
@@ -37,12 +38,21 @@ const (
 	binSB    = "sb"
 	binUA    = "ua"
 	// binAK is present iff state == available: it is the sole discovery path
-	// for ListAvailable, so unlike ea/qa its presence must exactly track
-	// state (see rows.go).
+	// for ListAvailable.
 	binAK = "ak"
+	// binRX is present iff state == reserved, holding ExpiresAt (NUMERIC
+	// index; Quarantine's discovery path).
+	binRX = "rx"
+	// binQX is present iff state == quarantined, holding QuarantinedAt
+	// (NUMERIC index; ListQuarantined's discovery path).
+	binQX = "qx"
 	// binPST ("pool|state") is always present and always current.
 	binPST = "pst"
 )
+
+// binTN is the tenant bin every record carries when Config.KeyPrefix is
+// non-empty (absent otherwise); see Truncate and tenantExpr.
+const binTN = "tn"
 
 // Bin names (shards set).
 const (
@@ -57,6 +67,9 @@ const (
 	binCA     = "ca"
 	// binPS ("pool|status") is always present and always current.
 	binPS = "ps"
+	// binVO is the shard's vouts as packed big-endian uint32s, written once
+	// by PutShard; RetireShard addresses the shard's rows by key from it.
+	binVO = "vo"
 )
 
 // Bin names (leases and meta sets).
@@ -118,30 +131,31 @@ func toBytes(v any) []byte {
 	return b
 }
 
-// rowKeyBytes returns the rows-set user key for op: its txid's 32 internal
-// bytes followed by its big-endian uint32 vout.
-func rowKeyBytes(op store.Outpoint) []byte {
-	b := make([]byte, 0, 36)
+// rowKeyBytes returns the rows-set user key for op: the store's KeyPrefix
+// bytes, then its txid's 32 internal bytes, then its big-endian uint32 vout.
+func (s *Store) rowKeyBytes(op store.Outpoint) []byte {
+	b := make([]byte, 0, len(s.keyPrefix)+36)
+	b = append(b, s.keyPrefix...)
 	b = append(b, op.TxID[:]...)
 	return binary.BigEndian.AppendUint32(b, op.Vout)
 }
 
 func (s *Store) rowKey(op store.Outpoint) (*as.Key, error) {
-	k, err := as.NewKey(s.ns, s.rowsSet, rowKeyBytes(op))
+	k, err := as.NewKey(s.ns, s.rowsSet, s.rowKeyBytes(op))
 	if err != nil {
 		return nil, fmt.Errorf("aerospike: row key: %w", err)
 	}
 	return k, nil
 }
 
-// shardIDStr is the shards-set user key and the ak/ps index-bin value prefix
-// for (pool, txid): "pool|txidhex".
-func shardIDStr(pool string, txid chainhash.Hash) string {
-	return joinPoolTxID(pool, hex.EncodeToString(txid[:]))
+// shardID is the shards-set user key and the ak index-bin value for
+// (pool, txid): "[KeyPrefix|]pool|txidhex".
+func (s *Store) shardID(pool string, txid chainhash.Hash) string {
+	return s.tenant + joinPoolTxID(pool, hex.EncodeToString(txid[:]))
 }
 
 func (s *Store) shardKey(pool string, txid chainhash.Hash) (*as.Key, error) {
-	k, err := as.NewKey(s.ns, s.shardsSet, shardIDStr(pool, txid))
+	k, err := as.NewKey(s.ns, s.shardsSet, s.shardID(pool, txid))
 	if err != nil {
 		return nil, fmt.Errorf("aerospike: shard key: %w", err)
 	}
@@ -149,7 +163,7 @@ func (s *Store) shardKey(pool string, txid chainhash.Hash) (*as.Key, error) {
 }
 
 func (s *Store) txidKey(txid chainhash.Hash) (*as.Key, error) {
-	k, err := as.NewKey(s.ns, s.txidsSet, hex.EncodeToString(txid[:]))
+	k, err := as.NewKey(s.ns, s.txidsSet, s.tenant+hex.EncodeToString(txid[:]))
 	if err != nil {
 		return nil, fmt.Errorf("aerospike: txid key: %w", err)
 	}
@@ -157,7 +171,7 @@ func (s *Store) txidKey(txid chainhash.Hash) (*as.Key, error) {
 }
 
 func (s *Store) leaseKey(name string) (*as.Key, error) {
-	k, err := as.NewKey(s.ns, s.leasesSet, name)
+	k, err := as.NewKey(s.ns, s.leasesSet, s.tenant+name)
 	if err != nil {
 		return nil, fmt.Errorf("aerospike: lease key: %w", err)
 	}
@@ -165,7 +179,7 @@ func (s *Store) leaseKey(name string) (*as.Key, error) {
 }
 
 func (s *Store) metaKey() (*as.Key, error) {
-	k, err := as.NewKey(s.ns, s.metaSet, "schema")
+	k, err := as.NewKey(s.ns, s.metaSet, s.tenant+"schema")
 	if err != nil {
 		return nil, fmt.Errorf("aerospike: meta key: %w", err)
 	}
@@ -173,19 +187,66 @@ func (s *Store) metaKey() (*as.Key, error) {
 }
 
 // akFor is the rows.ak index-bin value for every available row of (pool, txid).
-func akFor(pool string, txid chainhash.Hash) string { return shardIDStr(pool, txid) }
+func (s *Store) akFor(pool string, txid chainhash.Hash) string { return s.shardID(pool, txid) }
 
 // pstFor is the rows.pst index-bin value for (pool, state).
-func pstFor(pool string, st store.State) string { return pool + "|" + strconv.Itoa(int(st)) }
+func (s *Store) pstFor(pool string, st store.State) string {
+	return s.tenant + pool + "|" + strconv.Itoa(int(st))
+}
 
 // psFor is the shards.ps index-bin value for (pool, status).
-func psFor(pool string, status store.ShardStatus) string {
-	return pool + "|" + strconv.Itoa(int(status))
+func (s *Store) psFor(pool string, status store.ShardStatus) string {
+	return s.tenant + pool + "|" + strconv.Itoa(int(status))
+}
+
+// withTenant adds the tn bin to bins when this store has a KeyPrefix.
+func (s *Store) withTenant(bins as.BinMap) as.BinMap {
+	if s.keyPrefix != "" {
+		bins[binTN] = s.keyPrefix
+	}
+	return bins
+}
+
+// tenantExpr matches exactly this store's records: tn == KeyPrefix, or no
+// tn bin at all when KeyPrefix is empty. Range queries (on rx/qx, whose
+// NUMERIC values cannot carry a prefix) add it to their filter expression.
+func (s *Store) tenantExpr() *as.Expression {
+	if s.keyPrefix == "" {
+		return as.ExpNot(as.ExpBinExists(binTN))
+	}
+	return as.ExpEq(as.ExpStringBin(binTN), as.ExpStringVal(s.keyPrefix))
+}
+
+// packVouts encodes vouts as packed big-endian uint32s (the shard vo bin).
+func packVouts(rows []store.Row) []byte {
+	b := make([]byte, 0, 4*len(rows))
+	for i := range rows {
+		b = binary.BigEndian.AppendUint32(b, rows[i].Vout)
+	}
+	return b
+}
+
+// shardOutpoints decodes a shard record's vo bin into its rows' outpoints.
+// A record without vo (none exist under schema version 2) falls back to
+// vouts 0..size-1, the layout every minted shard uses.
+func shardOutpoints(txid chainhash.Hash, vo []byte, size int) []store.Outpoint {
+	if len(vo) == 0 {
+		out := make([]store.Outpoint, size)
+		for i := range out {
+			out[i] = store.Outpoint{TxID: txid, Vout: uint32(i)} //nolint:gosec // size <= maxBatch
+		}
+		return out
+	}
+	out := make([]store.Outpoint, 0, len(vo)/4)
+	for i := 0; i+4 <= len(vo); i += 4 {
+		out = append(out, store.Outpoint{TxID: txid, Vout: binary.BigEndian.Uint32(vo[i:])})
+	}
+	return out
 }
 
 // rowBins builds the bin map PutShard inserts for a fresh, available row.
-func rowBins(r store.Row) as.BinMap {
-	return as.BinMap{
+func (s *Store) rowBins(r store.Row) as.BinMap {
+	return s.withTenant(as.BinMap{
 		binPool:  r.Pool,
 		binTxID:  append([]byte(nil), r.TxID[:]...),
 		binVout:  int64(r.Vout),
@@ -194,9 +255,9 @@ func rowBins(r store.Row) as.BinMap {
 		binUnl:   r.UnlockingScript,
 		binState: int64(store.StateAvailable),
 		binUA:    us(r.UpdatedAt),
-		binAK:    akFor(r.Pool, r.TxID),
-		binPST:   pstFor(r.Pool, store.StateAvailable),
-	}
+		binAK:    s.akFor(r.Pool, r.TxID),
+		binPST:   s.pstFor(r.Pool, store.StateAvailable),
+	})
 }
 
 // outpointFromBins decodes the outpoint carried by every row record's own
@@ -261,8 +322,8 @@ func stringBin(bins as.BinMap, name string) string {
 }
 
 // shardBins builds the bin map PutShard inserts for a fresh shard record.
-func shardBins(sh *store.Shard) as.BinMap {
-	return as.BinMap{
+func (s *Store) shardBins(sh *store.Shard, rows []store.Row) as.BinMap {
+	return s.withTenant(as.BinMap{
 		binPool:   sh.Pool,
 		binTxID:   append([]byte(nil), sh.TxID[:]...),
 		binSize:   int64(sh.Size),         //nolint:gosec // ValidatePutShard: 0 < size == len(rows) <= maxBatch
@@ -275,12 +336,14 @@ func shardBins(sh *store.Shard) as.BinMap {
 		binBEEF:   sh.BEEF,
 		binCA:     us(sh.CreatedAt),
 		binUA:     us(sh.UpdatedAt),
-		binPS:     psFor(sh.Pool, sh.Status),
-	}
+		binPS:     s.psFor(sh.Pool, sh.Status),
+		binVO:     packVouts(rows),
+	})
 }
 
 // shardFromRecord decodes a shards-set record into a store.Shard. BEEF is
-// only populated when withBEEF is true (ListShards omits it).
+// only populated when withBEEF is true (ListShards omits it; its query does
+// not even fetch the bin).
 func shardFromRecord(rec *as.Record, withBEEF bool) (store.Shard, error) {
 	txid, err := chainhash.NewHash(toBytes(rec.Bins[binTxID]))
 	if err != nil {

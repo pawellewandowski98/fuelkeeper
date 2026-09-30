@@ -34,13 +34,13 @@ func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl 
 	}
 	now := s.now().Truncate(time.Microsecond)
 	exp := now.Add(ttl).Truncate(time.Microsecond)
-	bins := as.BinMap{binHolder: holder, binExp: us(exp)}
+	bins := s.withTenant(as.BinMap{binHolder: holder, binExp: us(exp)})
 
 	createErr := s.client.Put(s.createPolicy(ctx), key, bins)
 	if createErr == nil {
 		return exp, nil
 	}
-	if !createErr.Matches(types.KEY_EXISTS_ERROR) {
+	if !isCode(createErr, types.KEY_EXISTS_ERROR) {
 		return time.Time{}, wrap(createErr)
 	}
 
@@ -60,8 +60,10 @@ func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl 
 	}
 }
 
-// ReleaseLease implements store.Leaser: a guarded delete that is a no-op
-// unless holder currently owns the lease.
+// ReleaseLease implements store.Leaser: a guarded update to (holder "",
+// exp 0), a no-op unless holder currently owns the lease. The record is
+// kept rather than deleted, so no delete/expunge semantics are involved on
+// an SC namespace; TryAcquireOrRenew treats exp 0 as free.
 func (s *Store) ReleaseLease(ctx context.Context, name, holder string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -82,7 +84,7 @@ func (s *Store) ReleaseLease(ctx context.Context, name, holder string) error {
 	}
 	wp := s.writePolicy(ctx)
 	wp.FilterExpression = as.ExpEq(as.ExpStringBin(binHolder), as.ExpStringVal(holder))
-	_, aerr := s.client.Delete(wp, key)
+	aerr := s.client.PutBins(wp, key, as.NewBin(binHolder, ""), as.NewBin(binExp, int64(0)))
 	if aerr == nil || isFiltered(aerr) || isKeyNotFound(aerr) {
 		return nil
 	}
