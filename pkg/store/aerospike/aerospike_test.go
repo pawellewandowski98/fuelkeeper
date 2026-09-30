@@ -45,11 +45,11 @@ func randKeyPrefix() string {
 	return "t" + hex.EncodeToString(b[:])
 }
 
-// openTestStore opens a store on the fixed test sets under keyPrefix (in
-// availability mode: the test server is Community Edition). It registers
-// Close but not Truncate.
-func openTestStore(t *testing.T, host, keyPrefix string, now func() time.Time) *Store {
-	t.Helper()
+// openTestStoreTB is openTestStore's testing.TB-based implementation, so
+// benchmarks (*testing.B) can open a test store the same way tests
+// (*testing.T) do.
+func openTestStoreTB(tb testing.TB, host, keyPrefix string, now func() time.Time) *Store {
+	tb.Helper()
 	// PoolSize: 8, not the package default of 128: RunSuite runs 33 subtests
 	// in parallel, each opening its own client against the same single-node
 	// server, so 33 * PoolSize must stay reasonable for one process.
@@ -61,8 +61,28 @@ func openTestStore(t *testing.T, host, keyPrefix string, now func() time.Time) *
 		AllowAvailabilityMode: true,
 		PoolSize:              8,
 	}, WithClock(now), WithLogger(slog.New(slog.DiscardHandler)))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = s.Close() })
+	require.NoError(tb, err)
+	tb.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// openTestStore opens a store on the fixed test sets under keyPrefix (in
+// availability mode: the test server is Community Edition). It registers
+// Close but not Truncate.
+func openTestStore(t *testing.T, host, keyPrefix string, now func() time.Time) *Store {
+	t.Helper()
+	return openTestStoreTB(t, host, keyPrefix, now)
+}
+
+// isolatedStoreTB is isolatedStore's testing.TB-based implementation, so
+// benchmarks (*testing.B) can get their own isolated key prefix the same way
+// tests (*testing.T) do.
+func isolatedStoreTB(tb testing.TB, host string, now func() time.Time) *Store {
+	tb.Helper()
+	s := openTestStoreTB(tb, host, randKeyPrefix(), now)
+	// Registered before RunSuite's own Close cleanup, so it runs after it:
+	// Truncate uses its own connection.
+	tb.Cleanup(func() { assert.NoError(tb, s.Truncate(), "truncate") })
 	return s
 }
 
@@ -71,11 +91,7 @@ func openTestStore(t *testing.T, host, keyPrefix string, now func() time.Time) *
 // failure fails the test.
 func isolatedStore(t *testing.T, host string, now func() time.Time) *Store {
 	t.Helper()
-	s := openTestStore(t, host, randKeyPrefix(), now)
-	// Registered before RunSuite's own Close cleanup, so it runs after it:
-	// Truncate uses its own connection.
-	t.Cleanup(func() { assert.NoError(t, s.Truncate(), "truncate") })
-	return s
+	return isolatedStoreTB(t, host, now)
 }
 
 func TestConformance(t *testing.T) {

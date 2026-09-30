@@ -28,17 +28,18 @@ func testDSN(t *testing.T) string {
 	return dsn
 }
 
-// isolatedStore creates a schema, opens a store scoped to it via search_path,
-// and drops the schema on cleanup.
-func isolatedStore(t *testing.T, admin *pgxpool.Pool, dsn string, now func() time.Time) *postgres.Store {
-	t.Helper()
+// isolatedStoreTB is isolatedStore's testing.TB-based implementation, so
+// benchmarks (*testing.B) can get their own isolated schema the same way
+// tests (*testing.T) do.
+func isolatedStoreTB(tb testing.TB, admin *pgxpool.Pool, dsn string, now func() time.Time) *postgres.Store {
+	tb.Helper()
 	ctx := context.Background()
 	var b [6]byte
 	_, _ = rand.Read(b[:])
 	schema := "fk_" + hex.EncodeToString(b[:])
 	_, err := admin.Exec(ctx, "CREATE SCHEMA "+schema)
-	require.NoError(t, err)
-	t.Cleanup(func() { _, _ = admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE") })
+	require.NoError(tb, err)
+	tb.Cleanup(func() { _, _ = admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE") })
 
 	sep := "?"
 	if strings.Contains(dsn, "?") {
@@ -51,8 +52,15 @@ func isolatedStore(t *testing.T, admin *pgxpool.Pool, dsn string, now func() tim
 	// the Makefile's test-integration target) additionally bounds how many of
 	// those pools are ever open at once, to 8 * MaxConns = 16 connections.
 	s, err := postgres.New(ctx, postgres.Config{DSN: dsn + sep + "search_path=" + schema, MaxConns: 2}, postgres.WithClock(now))
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	return s
+}
+
+// isolatedStore creates a schema, opens a store scoped to it via search_path,
+// and drops the schema on cleanup.
+func isolatedStore(t *testing.T, admin *pgxpool.Pool, dsn string, now func() time.Time) *postgres.Store {
+	t.Helper()
+	return isolatedStoreTB(t, admin, dsn, now)
 }
 
 func TestConformance(t *testing.T) {

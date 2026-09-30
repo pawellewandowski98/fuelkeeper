@@ -60,12 +60,19 @@ func BuildShardWithTxID(pool string, txid chainhash.Hash, n int, status store.Sh
 	return shard, rows
 }
 
+// mintShardTB is MintShard's testing.TB-based implementation, so benchmarks
+// (*testing.B) can mint shards the same way tests (*testing.T) do.
+func mintShardTB(tb testing.TB, s store.Store, pool string, n int, status store.ShardStatus) (store.Shard, []store.Row) {
+	tb.Helper()
+	shard, rows := BuildShard(pool, n, status)
+	require.NoError(tb, s.PutShard(context.Background(), shard, rows))
+	return shard, rows
+}
+
 // MintShard builds a shard of n puzzle rows (denomination 50) and inserts it.
 func MintShard(t *testing.T, s store.Store, pool string, n int, status store.ShardStatus) (store.Shard, []store.Row) {
 	t.Helper()
-	shard, rows := BuildShard(pool, n, status)
-	require.NoError(t, s.PutShard(context.Background(), shard, rows))
-	return shard, rows
+	return mintShardTB(t, s, pool, n, status)
 }
 
 // MintShardWithTxID is MintShard with an explicit txid; see BuildShardWithTxID.

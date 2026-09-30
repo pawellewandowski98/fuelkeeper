@@ -41,10 +41,11 @@ func testURI(t *testing.T) string {
 // which still run fully in parallel).
 var newStoreSem = make(chan struct{}, 4)
 
-// isolatedStore opens a store scoped to a fresh, randomly-named database and
-// drops that database on cleanup.
-func isolatedStore(t *testing.T, uri string, now func() time.Time) *mongodb.Store {
-	t.Helper()
+// isolatedStoreTB is isolatedStore's testing.TB-based implementation, so
+// benchmarks (*testing.B) can get their own isolated database the same way
+// tests (*testing.T) do.
+func isolatedStoreTB(tb testing.TB, uri string, now func() time.Time) *mongodb.Store {
+	tb.Helper()
 	ctx := context.Background()
 
 	var b [6]byte
@@ -53,19 +54,19 @@ func isolatedStore(t *testing.T, uri string, now func() time.Time) *mongodb.Stor
 
 	// Registered before New even runs: if New fails partway through (e.g. it
 	// created some collections/indexes before erroring), the database it
-	// touched must still be dropped, not leaked. t.Cleanup functions run in
+	// touched must still be dropped, not leaked. tb.Cleanup functions run in
 	// LIFO order regardless of how the test that registered them exits.
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		admin, aerr := mgo.Connect(options.Client().ApplyURI(uri))
 		if aerr != nil {
-			t.Logf("isolatedStore cleanup: connect to drop database %s: %v", dbName, aerr)
+			tb.Logf("isolatedStore cleanup: connect to drop database %s: %v", dbName, aerr)
 			return
 		}
 		defer func() { _ = admin.Disconnect(context.Background()) }()
 		if derr := admin.Database(dbName).Drop(dctx); derr != nil {
-			t.Logf("isolatedStore cleanup: drop database %s: %v", dbName, derr)
+			tb.Logf("isolatedStore cleanup: drop database %s: %v", dbName, derr)
 		}
 	})
 
@@ -77,14 +78,21 @@ func isolatedStore(t *testing.T, uri string, now func() time.Time) *mongodb.Stor
 	newStoreSem <- struct{}{}
 	s, err := mongodb.New(ctx, mongodb.Config{URI: uri, Database: dbName, MaxPoolSize: 8}, mongodb.WithClock(now))
 	<-newStoreSem
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		if cerr := s.Close(); cerr != nil {
-			t.Logf("isolatedStore cleanup: close store: %v", cerr)
+			tb.Logf("isolatedStore cleanup: close store: %v", cerr)
 		}
 	})
 	return s
+}
+
+// isolatedStore opens a store scoped to a fresh, randomly-named database and
+// drops that database on cleanup.
+func isolatedStore(t *testing.T, uri string, now func() time.Time) *mongodb.Store {
+	t.Helper()
+	return isolatedStoreTB(t, uri, now)
 }
 
 func TestConformance(t *testing.T) {
