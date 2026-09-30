@@ -224,11 +224,7 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 	c = base()
 	c.Store.Backend = factory.BackendSQLite
 	c.Store.SQLite.Path = ""
-	// factory.Config.Validate's own sqlite message matches sqlite.Open's
-	// wording ("sqlite path is required", no dot) rather than the
-	// "<backend>.<field>" convention the other backends use; config.Validate
-	// only reattaches the "store." prefix, so this reads "store.sqlite path".
-	require.ErrorContains(t, c.Validate(), "store.sqlite path is required")
+	require.ErrorContains(t, c.Validate(), "store.sqlite.path is required")
 
 	c = base()
 	c.Store.Backend = factory.BackendPebble

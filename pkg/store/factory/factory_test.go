@@ -178,19 +178,32 @@ func TestNew_NilClockDefaultsToTimeNow(t *testing.T) {
 	require.NoError(t, s.Close())
 }
 
-// TestNew_SQLiteErrorPassthrough: an invalid SQLite config's error must reach
-// the caller through New unchanged (not swallowed or rewrapped).
+// TestNew_SQLiteErrorPassthrough covers two sqlite error paths through
+// factory.New. An empty Path is now rejected by factory.Config.Validate
+// itself (with its own "sqlite.path is required" message) before sqlite.Open
+// is ever called, so that case is asserted directly against Validate's
+// wording rather than against sqlite.Open's own error. An invalid Sync value
+// is deeper validation that Validate deliberately leaves to the backend (see
+// its doc comment), so that error must still reach the caller through New
+// unchanged (not swallowed or rewrapped).
 func TestNew_SQLiteErrorPassthrough(t *testing.T) {
 	ctx := context.Background()
 
-	// Confirm what sqlite.Open itself returns for an empty Path, so this test
-	// stays honest about what it's asserting through the factory.
-	direct, directErr := sqlite.Open(ctx, sqlite.Config{})
+	// Empty path: caught by Validate before sqlite.Open runs.
+	_, err := factory.New(ctx, factory.Config{Backend: factory.BackendSQLite, SQLite: sqlite.Config{}}, time.Now)
+	require.Error(t, err)
+	require.ErrorIs(t, err, store.ErrInvalidArgument)
+	require.ErrorContains(t, err, "sqlite.path is required")
+
+	// Invalid Sync: not checked by Validate, so this reaches sqlite.Open, and
+	// its error must pass through New unchanged.
+	badCfg := sqlite.Config{Path: filepath.Join(t.TempDir(), "f.sqlite"), Sync: "bogus"}
+	direct, directErr := sqlite.Open(ctx, badCfg)
 	require.Error(t, directErr)
 	require.Nil(t, direct)
 	require.ErrorIs(t, directErr, store.ErrInvalidArgument)
 
-	_, err := factory.New(ctx, factory.Config{Backend: factory.BackendSQLite, SQLite: sqlite.Config{}}, time.Now)
+	_, err = factory.New(ctx, factory.Config{Backend: factory.BackendSQLite, SQLite: badCfg}, time.Now)
 	require.Error(t, err)
 	require.ErrorIs(t, err, store.ErrInvalidArgument)
 	require.Equal(t, directErr.Error(), err.Error(),

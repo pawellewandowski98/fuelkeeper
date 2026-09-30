@@ -162,10 +162,7 @@ func (c Config) Validate() error {
 		return nil
 	case BackendSQLite:
 		if c.SQLite.Path == "" {
-			// Matches sqlite.Open's own message so New's passthrough (New
-			// calling Validate first, then sqlite.Open) is indistinguishable
-			// from sqlite.Open's own error to a caller.
-			return fmt.Errorf("%w: sqlite path is required", store.ErrInvalidArgument)
+			return fmt.Errorf("%w: sqlite.path is required", store.ErrInvalidArgument)
 		}
 		return nil
 	case BackendPostgres:
