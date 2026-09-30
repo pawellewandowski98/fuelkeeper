@@ -1,0 +1,79 @@
+# Three-instance FuelKeeper cluster sharing one Postgres store, for
+# benchmarking (cmd/fuelbench). Isolated from deploy/docker-compose.yaml (the
+# dev Postgres on host port 15432): its own project name, network, and host
+# ports 8081-8083 only; the bench Postgres exposes no host port.
+name: fuelkeeper-bench
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fuelkeeper
+      POSTGRES_PASSWORD: fuelkeeper
+      POSTGRES_DB: fuelkeeper
+    command: ["postgres", "-c", "max_connections=300", "-c", "synchronous_commit=on"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fuelkeeper"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  fk1:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    hostname: fk1
+    volumes:
+      - ../deploy/fuelkeeper-bench.yaml:/etc/fuelkeeper/fuelkeeper.yaml:ro,z
+    environment:
+      SETTINGS_ENV_FILE: /dev/null
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  fk2:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    hostname: fk2
+    volumes:
+      - ../deploy/fuelkeeper-bench.yaml:/etc/fuelkeeper/fuelkeeper.yaml:ro,z
+    environment:
+      SETTINGS_ENV_FILE: /dev/null
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  fk3:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    hostname: fk3
+    volumes:
+      - ../deploy/fuelkeeper-bench.yaml:/etc/fuelkeeper/fuelkeeper.yaml:ro,z
+    environment:
+      SETTINGS_ENV_FILE: /dev/null
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8083:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

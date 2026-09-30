@@ -1,0 +1,17 @@
+# Keep the build context small and avoid busting the build cache for
+# changes that never affect the binaries.
+.git
+.github
+docs
+deploy/*.yaml
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+bin/
+dist/
+fuelkeeper
+coverage.out
+*.log
+.idea/
+.vscode/

@@ -3,7 +3,17 @@ COMPOSE ?= docker compose
 PKG := ./...
 PG_DSN ?= postgres://fuelkeeper:fuelkeeper@localhost:15432/fuelkeeper?sslmode=disable
 
-.PHONY: build test test-integration lint bench docker-up docker-down tidy
+# bench-run defaults: a three-instance cluster (bench-cluster-up), 64
+# workers, one output per reserve, 60s, against the postgres-backed cluster.
+# OUT defaults to /tmp (not docs/benchmarks/, which does not exist in this
+# tree and whose creation is out of scope here).
+WORKERS ?= 64
+COUNT ?= 1
+DURATION ?= 60s
+LABEL ?= cluster
+OUT ?= /tmp/fuelbench-last.json
+
+.PHONY: build test test-integration lint bench docker-up docker-down tidy bench-cluster-up bench-cluster-down bench-run
 
 build:
 	$(GO) build $(PKG)
@@ -28,3 +38,12 @@ docker-down:
 
 tidy:
 	$(GO) mod tidy
+
+bench-cluster-up:
+	$(COMPOSE) -f deploy/docker-compose.bench.yaml up -d --build --wait
+
+bench-cluster-down:
+	$(COMPOSE) -f deploy/docker-compose.bench.yaml down -v
+
+bench-run:
+	$(GO) run ./cmd/fuelbench --url http://localhost:8081,http://localhost:8082,http://localhost:8083 --workers $(WORKERS) --count $(COUNT) --duration $(DURATION) --label "$(LABEL)" --backend postgres --out $(OUT)

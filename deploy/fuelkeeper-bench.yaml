@@ -1,0 +1,50 @@
+# Benchmark cluster configuration: three fuelkeeper instances share this file
+# (bind-mounted read-only) against one Postgres store. Mock oracle/treasury
+# stand in for a real chain so throughput measures the store/pool path, not
+# network or mining latency. See docs/OPERATIONS.md "Benchmark cluster" and
+# Makefile's bench-cluster-up/bench-run targets. Never use in production.
+instance:
+  max_shards: 8
+  low_water_rows: 5000
+  lease_ttl: 30s
+  rescan_interval: 5s
+
+store:
+  backend: postgres
+  postgres:
+    dsn: "postgres://fuelkeeper:fuelkeeper@postgres:5432/fuelkeeper?sslmode=disable"
+    max_conns: 32
+
+pools:
+  - name: main
+    denomination: 50
+    split_size: 1000
+    target_available: 300000
+    low_water: 200000
+    spend_policy: trust
+    min_ttl: 5s
+
+jobs:
+  enabled: true
+  lease_ttl: 60s   # > 2x the longest interval below (minter's 2s)
+  minter:
+    interval: 2s
+    max_per_round: 20
+    max_pending_shards: 100
+  watcher:
+    interval: 1s
+
+oracle:
+  kind: mock
+
+treasury:
+  kind: mock
+  mock:
+    confirm_after: 500ms
+
+api:
+  listen: ":8080"
+  insecure: true   # keyless, non-loopback listen: explicit opt-in required
+
+log:
+  level: warn
