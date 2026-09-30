@@ -5,10 +5,10 @@ that wallets reserve on demand and attach as one extra input to pay transaction
 fees. Fuel is spendable with unlocking data prepared in advance (a hash-puzzle
 preimage by default), so no signing service sits on the hot path.
 
-Status: pool core complete (Plan 2): hash-puzzle fuel, sharded per-instance
-ownership with batched (group-commit) reservations, and background jobs
-(reaper, proof watcher, minter) behind leased runners. HTTP API, Go client and
-`serve` come next (Plan 3). Design:
+Status: Plan 3 complete: HTTP API, Go client and `serve` command. Pool core
+(Plan 2): hash-puzzle fuel, sharded per-instance ownership with batched
+(group-commit) reservations, and background jobs (reaper, proof watcher,
+minter) behind leased runners. Design:
 `docs/superpowers/specs/2026-09-29-fuelkeeper-design.md`.
 
 ## Develop
@@ -28,6 +28,20 @@ ownership with batched (group-commit) reservations, and background jobs
 | pebble, mongodb, aerospike | see spec | Plan 4 | |
 
 Every backend must pass `pkg/store/storetest.RunSuite` with `-race`.
+
+## Run It (Development Mode)
+
+Start the nullnet server (in-memory, mocked oracle and treasury):
+
+    go run ./cmd/fuelkeeper serve --config examples/nullnet.yaml
+
+In another terminal, verify the server is ready and make a test request:
+
+    curl -sf localhost:8080/readyz
+    curl -s -XPOST localhost:8080/v1/pools/main/reserve -H 'Content-Type: application/json' \
+      -d '{"count":2}' | head -c 300
+
+The response includes a reservation token, fuel outputs, and shard references to fetch BEEF from. See `docs/API.md` for the full API guide and `docs/OPERATIONS.md` for configuration, deployment topologies, and troubleshooting.
 
 ## Operations
 
