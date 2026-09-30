@@ -5,7 +5,11 @@ that wallets reserve on demand and attach as one extra input to pay transaction
 fees. Fuel is spendable with unlocking data prepared in advance (a hash-puzzle
 preimage by default), so no signing service sits on the hot path.
 
-Status: store core complete (Plan 1). Design: `docs/superpowers/specs/2026-09-29-fuelkeeper-design.md`.
+Status: pool core complete (Plan 2): hash-puzzle fuel, sharded per-instance
+ownership with batched (group-commit) reservations, and background jobs
+(reaper, proof watcher, minter) behind leased runners. HTTP API, Go client and
+`serve` come next (Plan 3). Design:
+`docs/superpowers/specs/2026-09-29-fuelkeeper-design.md`.
 
 ## Develop
 
@@ -48,3 +52,27 @@ That durability requirement shapes how each backend must be deployed:
 - SQLite and memory are both single-process backends
   (`Capabilities().MultiProcess == false`); only Postgres supports multiple
   processes sharing one store.
+
+Pool behaviour that operators should know:
+
+- **Terminal states.** A row becomes `spent` only when the oracle proves a
+  mined spend (or directly under `spend_policy=trust`). Everything else stays
+  `quarantined` and is visible through `fuelkeeper_quarantine_oldest_age_seconds`.
+  With no oracle configured, expired reservations stay quarantined until an
+  operator acts, so `release_policy=verify` and `spend_policy=verify` need an
+  oracle.
+- **Job leases.** Each background job (reaper, watcher, minter) runs on one
+  instance at a time under a store lease named `jobs/<name>`. The lease TTL
+  must exceed the longest job interval plus its run time, or leadership flaps.
+  Overlapping runs during a hand-over are harmless because every job write is
+  a compare-and-set.
+- **Shard adoption.** An instance adopts one shard at a time while its
+  in-memory rows are below `low_water_rows` and it owns fewer than
+  `max_shards`; background feeding and the reserve-path fallback share one
+  adoption slot, and a reserve waits at most `adopt_timeout` for it. A crashed
+  instance's shards are re-adopted by others once their `lease_ttl` expires.
+  A rising `fuelkeeper_cas_missed_total` means two instances briefly served
+  the same shard; it clears within one rescan.
+- **Test knobs.** `FUELKEEPER_STRESS=N` multiplies the rounds of the
+  invariant and conformance tests; `FUELKEEPER_SEED=S` replays a specific
+  invariant-test run (the seed is logged on every run).
