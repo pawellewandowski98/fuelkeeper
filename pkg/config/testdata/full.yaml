@@ -1,0 +1,48 @@
+instance:
+  instance_id: node-1
+  max_shards: 4
+  low_water_rows: 2000
+  lease_ttl: 20s
+  rescan_interval: 4s
+store:
+  backend: sqlite
+  sqlite:
+    path: ${FK_TEST_SQLITE_PATH}
+pools:
+  - name: main
+    denomination: 50
+    split_size: 200
+    target_available: 10000
+    low_water: 4000
+    serve_policy: any
+    default_ttl: 90s
+    min_ttl: 10s
+    max_ttl: 5m
+    max_count: 50
+    release_policy: verify
+    spend_policy: trust
+    expected_tps: 100
+  - name: big
+    denomination: 500
+    lock_mode: p2pkh
+jobs:
+  enabled: true
+  lease_ttl: 45s
+  reaper:
+    interval: 2s
+    grace: 5s
+  minter:
+    interval: 5s
+    max_per_round: 5
+    max_pending_shards: 10
+oracle:
+  kind: mock
+treasury:
+  kind: mock
+api:
+  listen: "127.0.0.1:9090"
+  api_keys: ["k1", "k2"]
+  max_body_bytes: 65536
+log:
+  level: debug
+  format: json

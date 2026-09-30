@@ -75,6 +75,9 @@ type Config struct {
 	ReleasePolicy ReleasePolicy `yaml:"release_policy"`
 	// SpendPolicy says whether a client Spend is a hint or a fact.
 	SpendPolicy SpendPolicy `yaml:"spend_policy"`
+	// ExpectedTPS is the pool's expected spend rate; optional (0 disables the
+	// check) and, when set, enables the mint-capacity check in pkg/config.
+	ExpectedTPS float64 `yaml:"expected_tps"`
 }
 
 // DefaultPoolConfig returns the spec defaults for a puzzle pool.
@@ -141,6 +144,9 @@ func (c *Config) Validate() error {
 	case SpendVerify, SpendTrust:
 	default:
 		return fmt.Errorf("pool %s: spend_policy must be verify or trust", c.Name)
+	}
+	if c.ExpectedTPS < 0 {
+		return fmt.Errorf("pool %s: expected_tps must be >= 0", c.Name)
 	}
 	return nil
 }

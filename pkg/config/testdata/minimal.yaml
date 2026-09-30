@@ -1,0 +1,5 @@
+store:
+  backend: memory
+pools:
+  - name: main
+    denomination: 50

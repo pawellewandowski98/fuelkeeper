@@ -64,6 +64,9 @@ func TestPoolConfigDefaultsAndValidate(t *testing.T) {
 	bad = c
 	bad.SpendPolicy = "maybe"
 	require.Error(t, bad.Validate())
+	bad = c
+	bad.ExpectedTPS = -1
+	require.Error(t, bad.Validate())
 
 	ic := pool.DefaultInstanceConfig()
 	require.NoError(t, ic.Validate())
