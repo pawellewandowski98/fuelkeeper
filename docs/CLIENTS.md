@@ -26,8 +26,10 @@ the pool's `default_ttl` when omitted, and clamped to the pool's `min_ttl`..
 `max_ttl`). If the client neither spends nor releases before `expires_at`,
 the reaper quarantines the row and asks the chain oracle whether it is
 actually spent, resolving it to `spent` or `available` accordingly; with an
-arcade-only oracle (the default), which cannot answer that question at all,
-an unreported reservation is instead requeued blind after
+arcade-only oracle (the default with the toolbox treasury; otherwise the
+default oracle is `none`, with the same requeue behaviour -- see
+`docs/OPERATIONS.md`'s "Oracle kinds and policies"), which cannot answer
+that question at all, an unreported reservation is instead requeued blind after
 `jobs.reaper.unknown_requeue_age` (10 m default) under a pool's
 `expiry_policy: requeue` -- or held for an operator under
 `expiry_policy: hold`. A client that lets a reservation expire is not
@@ -136,8 +138,12 @@ gateways that do name a competitor synchronously, and for a go-wallet-toolbox-ba
 whose own asynchronous review process (`WERR_REVIEW_ACTIONS`) learns of one
 after the fact but before it calls `Settle`.
 
-**The consequence for `spend_policy: trust` (the default, arcade-only).**
-Because arcade's 202 accepted response is not a guarantee -- the
+**The consequence for `spend_policy: trust`** (the default whenever the
+oracle cannot answer outpoint queries directly -- arcade-only with the
+toolbox treasury, or `oracle.kind: none` otherwise, with the same
+behaviour; the blind spot below applies to any deployment submitting
+through arcade, regardless of which of those two `oracle.kind` is
+configured). Because arcade's 202 accepted response is not a guarantee -- the
 transaction can still be rejected asynchronously (one of *your own*
 transaction's other inputs already spent, `TX_INVALID`, or a transient
 `TX_LOCKED` if you chained off a fuel output whose own split transaction was

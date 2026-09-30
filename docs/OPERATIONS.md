@@ -284,7 +284,13 @@ the row is quarantined as a hint instead of resolved immediately, and the
 reaper polls `GET /tx` for it every `jobs.reaper.tx_recheck_interval` until
 it is mined or rejected (a rejection with the input untouched requeues the
 output; see the reaper lifecycle table) -- the cost is that per-hinted-row
-polling load, not a correctness cost. The default `serve_policy: mined_only`
+polling load, not a correctness cost. A `TX_LOCKED` rejection specifically
+classifies `RejectReasonUnknown` (rule 5, held `rejected_unknown`), not
+`inputs_spent` or `tx_invalid`: it is transient (the parent transaction's
+own commit is still in flight in teranode's store, not a decided spend), so
+the row is held rather than requeued or retired until it resolves itself on
+a later poll, or, failing that, `hint_max_wait` requeues it as a last
+resort. The default `serve_policy: mined_only`
 already rules out `TX_LOCKED` on the fuel output's *own* parent (a served
 row's split transaction is always mined already, so its own UTXO commit has
 settled by the time a client reserves it); `serve_policy: any` removes that
@@ -498,7 +504,7 @@ row as `competitor_pending` when the list already decides it.
 | 3a | Hint rejected `inputs_spent`, gateway named the spent inputs (`SpentInputs` non-nil), and the hint's own known inputs exclude the fuel output | held (checked before rule 2's competitor lookup) | -- | `reaper_held{reason="hint_pending"}` |
 | 3b | Hint rejected `inputs_spent`, gateway named the spent inputs and they *include* the fuel output | spent, resolved in this one tick without a competitor lookup | immediate | `reaper_spent_total{source="inputs_spent"}` |
 | 3b | Hint rejected `inputs_spent`, gateway named the spent inputs and they *exclude* the fuel output (or `SpentInputs` is an empty, non-nil list) | requeued, like an invalid tx, resolved in this one tick | `hint_patience` (10m default); held (`rejected_fresh`) before that | `reaper_requeued_total{reason="rejected"}` |
-| 2 | *(Reached only when the gateway named no spent inputs, or the rejection is not `inputs_spent`.)* Hint has competing transactions; one is mined and spends the outpoint (or its inputs are unknown, trusted) | spent | immediate | `reaper_spent_total{source="competitor"}` |
+| 2 | *(Reached whenever the hint is not an `inputs_spent` rejection with named spent inputs: a hint that is not rejected at all but still carries competing transactions, is rejected for a different reason, or is rejected `inputs_spent` with the gateway naming no spent inputs.)* Hint has competing transactions; one is mined and spends the outpoint (or its inputs are unknown, trusted) | spent | immediate | `reaper_spent_total{source="competitor"}` |
 | 2 | Hint has competing transactions; none is mined yet | held | -- | `reaper_held{reason="competitor_pending"}` |
 | 3a | Hint rejected `inputs_spent`, gateway named no spent inputs (`SpentInputs` nil), and the hint's own known inputs exclude the fuel output | held | -- | `reaper_held{reason="hint_pending"}` |
 | 3c | Hint rejected `inputs_spent`, gateway named no spent inputs, but a mined competitor provably spends only some *other* input | held | -- | `reaper_held{reason="hint_pending"}` |

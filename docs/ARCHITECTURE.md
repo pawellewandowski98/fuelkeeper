@@ -161,8 +161,14 @@ provenance fields.
 ## Guarantees and Where They Are Enforced
 
 - **G1**: No fuel output is ever handed to two live reservations.
-- **G2**: Every output is always in exactly one state, and an unspent output
-  always returns to the pool or ends provably spent or invalid.
+- **G2**: Every output is always in exactly one state, and rows are
+  conserved -- a transition moves a row between states, never creates or
+  destroys one. This is not a guarantee that every output is eventually
+  proven spent, requeued, or otherwise resolved with certainty: see the
+  documented loss/hold cases above (`spend_policy: trust`'s blind spot, the
+  reaper's hinted rule 3 bounded loss, and a pool's `expiry_policy: hold`,
+  which leaves a row quarantined for an operator rather than resolving it
+  automatically).
 
 Both rest on one mechanism, stated in `pkg/store/store.go`'s contract: every
 state transition is a compare-and-set on the row's current state (and, for
@@ -191,9 +197,17 @@ state transition is a compare-and-set on the row's current state (and, for
   that flush -- and fails those requests with a retryable error. A request's
   rows are only ever "unflushed" (safe to `Return` to the allocator's FIFO)
   when they never reached the store at all.
-- **The reaper never guesses** (previous section): only a mined, oracle-
-  proven, input-verified spend is terminal. This is what makes G2's "ends
-  provably spent" hold in the presence of a lying or crashed client.
+- **The reaper never guesses** (previous section): short of hinted rule 3
+  and `spend_policy: trust` -- matching `pkg/jobs/reaper.go`'s own
+  "Terminal-state policy ... with one exception" wording -- only a mined,
+  oracle-proven, input-verified spend is terminal. Under
+  `spend_policy: verify`, this bounds what a lying or crashed client can do:
+  a false or stale hint can at worst retire the client's own row early
+  (rule 3's bounded-loss case); it cannot make the reaper retire a
+  *different* row, or fabricate a mined spend the oracle contradicts. Under
+  `spend_policy: trust`, the client's report is taken at face value with no
+  reaper or oracle involvement at all -- see `docs/OPERATIONS.md`'s "The
+  `spend_policy: trust` blind spot with arcade-only".
 - **Leases are not load-bearing.** Shard leases (`Owner`, `LeaseUntil`) and
   the allocator's in-memory FIFOs are optimizations that make CAS conflicts
   rare, not the correctness mechanism: two instances may race `Reserve` on
