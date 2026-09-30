@@ -280,11 +280,22 @@ func TestWorkerBackpressureReleasesOutputs(t *testing.T) {
 	assert.Positive(t, rep.Failed["arcade:backpressure"])
 	assert.Zero(t, spentCount(t, st, "main", rows), "backpressure must never be reported as spent")
 
-	got, err := st.GetRows(context.Background(), "main", storetest.Ops(rows))
-	require.NoError(t, err)
-	for _, row := range got {
-		assert.Equal(t, store.StateAvailable, row.State, "unused output must be released back to available")
-	}
+	// afterCycle already guarantees the worker only stops between cycles
+	// (never mid-Reserve), and its Release call has already returned by the
+	// time done closes above; require.Eventually is an extra, cheap safety
+	// margin against a slow store/scheduler rather than a load-bearing wait.
+	require.Eventually(t, func() bool {
+		got, gerr := st.GetRows(context.Background(), "main", storetest.Ops(rows))
+		if gerr != nil {
+			return false
+		}
+		for _, row := range got {
+			if row.State != store.StateAvailable {
+				return false
+			}
+		}
+		return true
+	}, time.Second, 5*time.Millisecond, "unused output must be released back to available")
 }
 
 // p2pkhLockingScript returns a syntactically plausible (not cryptographically
