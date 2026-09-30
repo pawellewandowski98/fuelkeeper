@@ -607,3 +607,64 @@ func TestReaperGatewayNamedSpentInputsOutrankMinedCompetitors(t *testing.T) {
 	e.tick(t)
 	assert.Equal(t, store.StateAvailable, statesIn(t, e.st, e.p, rows)[0])
 }
+
+// TestReaperArcadeUTXOSpentShapeResolvesInOneTick feeds the reaper the exact
+// TxStatus arcade.Oracle.Tx returns for a UTXO_SPENT line: Rejected,
+// RejectReasonInputsSpent, SpentInputs naming one outpoint, the named
+// spender appended to CompetingTxs, and Inputs nil (arcade never serves
+// them; no InputsResolver). The gateway's list decides the row (rule 3b)
+// whatever arcade knows about the spender: a spender that is mined must not
+// be trusted as the fuel output's spender when the list excludes it, and an
+// unknown or unmined one must not hold the row as competitor_pending.
+func TestReaperArcadeUTXOSpentShapeResolvesInOneTick(t *testing.T) {
+	spenders := []struct {
+		name string
+		set  func(m *oracle.Mock, spender chainhash.Hash)
+	}{
+		{"spender_mined", func(m *oracle.Mock, s chainhash.Hash) { m.SetTx(s, oracle.TxStatus{Known: true, Mined: true}) }},
+		{"spender_unmined", func(m *oracle.Mock, s chainhash.Hash) { m.SetTx(s, oracle.TxStatus{Known: true}) }},
+		{"spender_unknown", func(*oracle.Mock, chainhash.Hash) {}}, // 404 at arcade
+	}
+	for _, includes := range []bool{true, false} {
+		for _, sp := range spenders {
+			name := "excludes_" + sp.name
+			if includes {
+				name = "includes_" + sp.name
+			}
+			t.Run(name, func(t *testing.T) {
+				e := newHintEnv(t, "hint-arcade-utxo-spent-"+name, jobs.DefaultReaperConfig(), nil)
+				hint, spender := storetest.NewTxID(), storetest.NewTxID()
+				rows := e.hinted(t, 1, hint)
+				named := store.Outpoint{TxID: storetest.NewTxID(), Vout: 3}
+				if includes {
+					named = rows[0].Outpoint
+				}
+				e.orc.SetTx(hint, oracle.TxStatus{
+					Known: true, Rejected: true, RejectReason: oracle.RejectReasonInputsSpent,
+					SpentInputs: []store.Outpoint{named}, CompetingTxs: []string{spender.String()},
+				})
+				sp.set(e.orc, spender)
+				beforeInputsSpent, beforeCompetitor := e.spent("inputs_spent"), e.spent("competitor")
+				beforeRejected := e.requeued("rejected")
+
+				e.clk.Advance(e.cfg.QuarantineMinAge + time.Second)
+				e.tick(t)
+				assert.InDelta(t, beforeCompetitor, e.spent("competitor"), 0, "the named spender is never trusted over the gateway's list")
+				assert.InDelta(t, 0, e.held("competitor_pending"), 0)
+				if includes {
+					assert.Equal(t, []chainhash.Hash{hint}, e.spentBy(t, rows), "retired in one tick; SpentBy is the attempt")
+					assert.InDelta(t, beforeInputsSpent+1, e.spent("inputs_spent"), 0)
+					return
+				}
+				assert.Equal(t, store.StateQuarantined, statesIn(t, e.st, e.p, rows)[0])
+				assert.InDelta(t, 1, e.held("rejected_fresh"), 0)
+
+				e.clk.Advance(e.cfg.HintPatience)
+				e.tick(t)
+				assert.Equal(t, store.StateAvailable, statesIn(t, e.st, e.p, rows)[0], "the conflict was on another input: requeued after hint_patience")
+				assert.InDelta(t, beforeRejected+1, e.requeued("rejected"), 0)
+				assert.InDelta(t, beforeInputsSpent, e.spent("inputs_spent"), 0)
+			})
+		}
+	}
+}

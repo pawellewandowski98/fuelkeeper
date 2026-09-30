@@ -39,7 +39,7 @@ var (
 	}, []string{"pool", "reason"})
 	reaperSpent = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fuelkeeper_reaper_spent_total",
-		Help: "Quarantined rows resolved to spent, by source (oracle: the outpoint oracle's mined SpendingTxID; hint: a client's mined SpentHint; competitor: a mined competitor of the hint; inputs_spent: the hint was rejected for a spent or conflicting input, SpentBy is the hint).",
+		Help: "Quarantined rows resolved to spent, by source (oracle: the outpoint oracle's mined SpendingTxID; hint: a client's mined SpentHint; competitor: a mined competitor of the hint; inputs_spent: the hint was rejected for a spent or conflicting input, named by the gateway as the row's outpoint or unnamed; SpentBy is the hint).",
 	}, []string{"pool", "source"})
 	reaperHeld = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "fuelkeeper_reaper_held",
@@ -258,7 +258,9 @@ func (c ReaperConfig) Validate() error {
 //
 // Hinted rows (a client's spend, under spend_policy verify) whose outpoint
 // verdict is Unknown — every hinted row when arcade is the only chain
-// source — are decided from Tx(hint), in this order (classifyHinted):
+// source — are decided from Tx(hint) (classifyHinted), checked in this
+// order: 1, 3a and 3b (only for an inputs-spent rejection whose gateway
+// named the spent inputs), 2, 3a/3c/3d, 4, 5.
 //
 //  1. Hint Known, Mined, not Rejected: spent by the hint (source "hint"), if
 //     its inputs include the outpoint or are unknown; otherwise held
@@ -272,24 +274,32 @@ func (c ReaperConfig) Validate() error {
 //     held (competitor_pending) as in rule 5. Only non-spending mined
 //     competitors: fall through to rules 3-5.
 //  3. Rejected, RejectReasonInputsSpent: the hint was rejected because one
-//     of its inputs is spent or conflicting. Checked in this order:
-//     a. the hint's own known Inputs exclude the outpoint: held
-//     (hint_pending, as in rule 5; input mismatch counted);
-//     b. the gateway named the spent inputs (TxStatus.SpentInputs non-nil):
-//     including the outpoint, the row is retired as in d; excluding it
-//     (or empty), the transaction died on another input and the fuel
-//     output is unspent, so it is treated as rule 4 (requeue "rejected"
-//     after HintPatience, rejected_fresh before). This positive evidence
-//     takes precedence over c;
-//     c. at least one mined competitor, and every mined competitor's known
-//     inputs exclude the outpoint: held (hint_pending, as in rule 5);
-//     d. otherwise (SpentInputs nil) the fuel output is assumed gone and
-//     the row is retired with SpentBy = the hint (source "inputs_spent"):
-//     the attempt, not the spender — the spender, when named, is in
-//     CompetingTxs and rule 2 resolves it once mined. The assumption is
-//     bounded to the client's own row: an honest wallet whose transaction
-//     failed on another input, with a gateway that does not name it, loses
-//     that fuel output, counted under spent{source="inputs_spent"}.
+//     of its inputs is spent or conflicting.
+//     a. The hint's own known Inputs exclude the outpoint: held
+//     (hint_pending, as in rule 5; input mismatch counted).
+//     b. The gateway named the spent inputs (TxStatus.SpentInputs
+//     non-nil): decided by that list alone, BEFORE rule 2. Including the
+//     outpoint, the row is retired with SpentBy = the hint (source
+//     "inputs_spent"): the attempt, not the spender (arcade appends the
+//     named spender to CompetingTxs, but that list may also hold other
+//     competitors, so the spender is not recorded). Excluding it, or
+//     empty, the transaction died on another input and the fuel output is
+//     unspent: treated as rule 4 (requeue "rejected" after HintPatience,
+//     rejected_fresh before). Running rule 2 first would be wrong for the
+//     shape arcade returns for a UTXO_SPENT line (SpentInputs plus the
+//     spender in CompetingTxs, never Inputs): a mined spender would be
+//     trusted as spending the fuel output even when the list excludes it,
+//     and an unknown or unmined spender would hold the row as
+//     competitor_pending instead of deciding it now.
+//     c. (SpentInputs nil, after rule 2.) At least one mined competitor,
+//     and every mined competitor's known inputs exclude the outpoint: held
+//     (hint_pending, as in rule 5).
+//     d. (SpentInputs nil.) Otherwise the fuel output is assumed gone and
+//     the row is retired with SpentBy = the hint (source "inputs_spent").
+//     The assumption is bounded to the client's own row: an honest wallet
+//     whose transaction failed on another input, with a gateway that does
+//     not name it, loses that fuel output, counted under
+//     spent{source="inputs_spent"}.
 //  4. Rejected, RejectReasonTxInvalid: the fuel output is untouched; the
 //     row is requeued (reason "rejected") once quarantined for HintPatience,
 //     held (rejected_fresh) before that.

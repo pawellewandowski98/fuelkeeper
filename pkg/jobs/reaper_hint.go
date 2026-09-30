@@ -150,6 +150,25 @@ func (r *Reaper) applyHintRules(
 		return r.hintWait(p, t, row, hint, heldHintPending, v), nil
 	}
 
+	// 3a/3b, before rule 2: an inputs-spent rejection whose gateway named the
+	// spent inputs is decided by that list alone. arcade appends the named
+	// spender to CompetingTxs and never reports its Inputs, so rule 2 would
+	// trust any mined spender as spending the fuel output even when the
+	// gateway said the conflict was on another input, and would hold an
+	// unknown spender as competitor_pending where the list already decides.
+	inputsSpent := ts.Rejected && ts.RejectReason == oracle.RejectReasonInputsSpent
+	if inputsSpent && ts.SpentInputs != nil {
+		if !entry.spends(op) {
+			r.inputMismatch(p, hint, inputMismatchSourceHint, entry)
+			return r.hintWait(p, t, row, hint, heldHintPending, v), nil
+		}
+		if slices.Contains(ts.SpentInputs, op) {
+			v.spend(hint, spentSourceInputsSpent, op)
+			return "", nil
+		}
+		return r.untouchedAfterPatience(t, row, v), nil
+	}
+
 	// 2. Competitors (a rejected or double-spend-attempted hint): a mined
 	// competitor that spends the outpoint (or whose inputs are unknown) is
 	// the spender.
@@ -198,30 +217,17 @@ func (r *Reaper) applyHintRules(
 		switch ts.RejectReason {
 		case oracle.RejectReasonInputsSpent:
 			// 3. The hint was rejected because one of its inputs is spent
-			// or conflicting. In order:
+			// or conflicting, and the gateway did not name which (3b, with
+			// SpentInputs, was decided above, before rule 2). In order:
 			//  a. the hint's own known inputs exclude the fuel output: the
 			//     hint says nothing about it, hold (hint_pending);
-			//  b. the gateway named the spent inputs (SpentInputs non-nil):
-			//     if they include the fuel output it is gone (retire, as
-			//     in d); if not, the transaction died on another input and
-			//     the fuel output is unspent (as rule 4). This positive
-			//     evidence takes precedence over c;
 			//  c. mined competitors provably spend only other inputs: hold
 			//     (hint_pending);
 			//  d. otherwise the fuel output is assumed gone: SpentBy is the
-			//     attempt (the hint), not the spender — the spender, when
-			//     named, is in CompetingTxs and rule 2 resolves it once
-			//     mined.
+			//     attempt (the hint), not the spender.
 			if !entry.spends(op) {
 				r.inputMismatch(p, hint, inputMismatchSourceHint, entry)
 				return r.hintWait(p, t, row, hint, heldHintPending, v), nil
-			}
-			if ts.SpentInputs != nil {
-				if slices.Contains(ts.SpentInputs, op) {
-					v.spend(hint, spentSourceInputsSpent, op)
-					return "", nil
-				}
-				return r.untouchedAfterPatience(t, row, v), nil
 			}
 			if otherInputsSpent {
 				return r.hintWait(p, t, row, hint, heldHintPending, v), nil
