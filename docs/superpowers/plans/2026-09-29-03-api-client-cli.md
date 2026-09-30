@@ -47,6 +47,15 @@ Conventions:
 - Every error response is `{"code": "...", "message": "...", "retry_after": <seconds, optional>}` with a stable `code` from `pkg/api/errors.go`.
 - Handlers never sleep or block on background work; 503 responses always carry `Retry-After`.
 
+## Facts carried from Plan 2 execution (2026-09-30)
+
+- The pool config type is `pool.Config` (not `PoolConfig`); `pool.Config.Validate` leaves an explicitly set `LockMode` alone when `LockModeName` is empty; `InstanceConfig.Validate` caps `instance_id` at 119 bytes and rejects negative `flush_window`/`max_batch`.
+- `jobs.NewReaper` and `jobs.NewMinter` return `(*T, error)` after validating their configs (`ReaperConfig.Validate`, `MinterConfig.Validate`); `Runner.Add(job) error` rejects a non-positive interval or empty name. Task 7's wiring must handle these errors.
+- `pool.NewPool` clamps `MaxCount` to the store's `Caps.MaxBatch`; `Reserve` returns `context.Canceled` unchanged when the client went away (map it to a client-abort status, not 503), `ErrUnavailable` for deadline/store failures, `ErrBackpressure`, `ErrExhausted`, `ErrInsufficient`, `ErrBadRequest`.
+- `pool.ShardRef.Version` is 0 when unknown; clients treat 0 as "fetch".
+- `treasury.Treasury` has `MinedBEEF`; the mock has `FailBuild/FailSend/FailMinedBEEF`.
+- The reaper only makes a row terminal on a MINED oracle-proven spend; `spend_policy=verify` therefore needs an oracle that reports mined spends (mock or real).
+
 ### Task 1: Configuration (`pkg/config`)
 
 **Files:**
@@ -54,7 +63,7 @@ Conventions:
 - Modify: `pkg/pool/config.go` (add `ExpectedTPS`)
 - Test: `pkg/config/config_test.go`
 
-- [ ] **Step 1: Add `ExpectedTPS` to `pool.PoolConfig`**
+- [ ] **Step 1: Add `ExpectedTPS` to `pool.Config`**
 
 In `pkg/pool/config.go` add the field after `SpendPolicy`:
 ```go
@@ -272,7 +281,7 @@ import (
 type Config struct {
 	Instance pool.InstanceConfig `yaml:"instance"`
 	Store    factory.Config      `yaml:"store"`
-	Pools    []pool.PoolConfig   `yaml:"pools"`
+	Pools    []pool.Config   `yaml:"pools"`
 	Jobs     JobsConfig          `yaml:"jobs"`
 	Oracle   OracleConfig        `yaml:"oracle"`
 	Treasury TreasuryConfig      `yaml:"treasury"`
@@ -371,7 +380,7 @@ func Parse(data []byte) (*Config, error) {
 }
 
 // applyPoolDefaults fills zero fields of a pool from DefaultPoolConfig.
-func applyPoolDefaults(p *pool.PoolConfig) {
+func applyPoolDefaults(p *pool.Config) {
 	d := pool.DefaultPoolConfig(p.Name, p.Denomination)
 	if p.LockModeName == "" {
 		p.LockModeName = d.LockModeName
@@ -879,7 +888,7 @@ func toStatsDTO(s store.Stats) StatsDTO {
 	return d
 }
 
-func toPoolDTO(c pool.PoolConfig, s store.Stats) PoolDTO {
+func toPoolDTO(c pool.Config, s store.Stats) PoolDTO {
 	return PoolDTO{
 		Name: c.Name, Denomination: c.Denomination, LockMode: c.LockMode.String(), SplitSize: c.SplitSize,
 		ServePolicy: string(c.ServePolicy), ReleasePolicy: string(c.ReleasePolicy), SpendPolicy: string(c.SpendPolicy),
@@ -1045,7 +1054,7 @@ import (
 
 // PoolService is what the handlers need from pool.Pool.
 type PoolService interface {
-	Config() pool.PoolConfig
+	Config() pool.Config
 	Reserve(ctx context.Context, req pool.ReserveRequest) (*pool.Reservation, error)
 	Release(ctx context.Context, token store.Token, ops []store.Outpoint) (int, error)
 	Spend(ctx context.Context, token store.Token, ops []store.Outpoint, txid chainhash.Hash) (int, error)
