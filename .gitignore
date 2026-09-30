@@ -1,5 +1,6 @@
 /bin/
 /dist/
+/fuelkeeper
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm

@@ -1,0 +1,572 @@
+openapi: 3.0.3
+info:
+  title: FuelKeeper API
+  version: "1.0"
+  description: |
+    FuelKeeper keeps a pool of small, fixed-denomination BSV outputs ("fuel") that
+    wallets reserve on demand and attach as one extra input to pay transaction fees.
+
+    **Flow.** `POST /v1/pools/{pool}/reserve` returns a reservation token and a set of
+    outputs, each with its full unlocking script. Fetch each referenced shard's BEEF from
+    `beef_url` (cache it: it is immutable once the shard is mined), build your transaction
+    with the fuel outputs as extra inputs, broadcast it, then call `spend` with the txid.
+    If you decide not to use an output, call `release`. Reservations expire after
+    `ttl_seconds`; expired fuel is quarantined and verified against the chain before it is
+    handed out again.
+
+    **Lock modes.** `puzzle` outputs are unlocked by a 32-byte preimage push and impose no
+    constraints on your transaction. `p2pkh` outputs are presigned with
+    `SIGHASH_NONE|ANYONECANPAY|FORKID`; the `constraints` object tells you the transaction
+    version, lockTime and input sequence you must use.
+
+    **Authentication.** `/v1/` operations require a fuel API key in the `Authorization: Bearer <key>` header.
+    The four admin operations (list/retire shards, list/requeue quarantined rows) and both funding operations
+    (`GET`/`POST /v1/funding`) require an admin key when `api.admin_keys` is configured, otherwise they accept
+    fuel keys. With no keys configured, the API is open.
+
+    **Funding.** `GET /v1/funding` returns the treasury's BRC-29 identity key and a fresh derivation-prefix
+    nonce; derive a payment key from it with your own wallet, pay a P2PKH output to it, then
+    `POST /v1/funding` with the resulting AtomicBEEF for the treasury to internalize. Both operations are
+    admin-tier: funding is an operator action, and gating it prevents anonymous nonce/BEEF spam. `404
+    funding_disabled` means this instance has no funding treasury configured (e.g. nullnet/mock mode).
+
+    **Errors.** Every non-2xx response is `{"code","message","retry_after"?}`. `503` and
+    `409` carry `Retry-After`; clients should back off and retry.
+
+    **HTTP Methods.** All paths support `OPTIONS` to list allowed methods via the `Allow` header.
+    Unsupported methods return 405 `method_not_allowed` with an `Allow` header.
+
+    **Times.** All timestamps are UTC RFC 3339 format.
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+tags:
+  - name: fuel
+  - name: pools
+  - name: admin
+  - name: funding
+  - name: ops
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      security: []
+      summary: Liveness probe
+      operationId: healthz
+      description: Returns 200 when the process is running.
+      responses:
+        "200":
+          description: alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {type: string, example: "ok"}
+  /readyz:
+    get:
+      tags: [ops]
+      security: []
+      summary: Readiness probe
+      operationId: readyz
+      description: Returns 200 when the store is reachable and at least one pool is configured. PoolsReady counts pools with shards or queued rows.
+      responses:
+        "200":
+          description: ready
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Ready"}
+        "503":
+          description: not ready
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Ready"}
+  /metrics:
+    get:
+      tags: [ops]
+      security: []
+      summary: Prometheus metrics
+      operationId: metrics
+      responses:
+        "200":
+          description: metrics in Prometheus text format
+          content:
+            text/plain: {schema: {type: string}}
+  /openapi.yaml:
+    get:
+      tags: [ops]
+      security: []
+      summary: This OpenAPI document
+      operationId: openapi
+      responses:
+        "200":
+          description: OpenAPI YAML
+          content:
+            application/yaml: {schema: {type: string}}
+  /v1/pools:
+    get:
+      tags: [pools]
+      summary: List pools with stats
+      operationId: listPools
+      responses:
+        "200":
+          description: pools
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: "#/components/schemas/Pool"}}
+        "401": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+  /v1/pools/{pool}:
+    get:
+      tags: [pools]
+      summary: Describe one pool
+      operationId: getPool
+      parameters: [{$ref: "#/components/parameters/pool"}]
+      responses:
+        "200":
+          description: pool
+          content: {application/json: {schema: {$ref: "#/components/schemas/Pool"}}}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+  /v1/pools/{pool}/reserve:
+    post:
+      tags: [fuel]
+      summary: Reserve fuel outputs
+      operationId: reserve
+      description: |
+        Returns between `min_count` and `count` outputs under one token. `503 exhausted`
+        means no fuel is available right now; `409 insufficient` means fewer than
+        `min_count` could be reserved (nothing is held). Both carry `Retry-After`.
+      parameters: [{$ref: "#/components/parameters/pool"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ReserveRequest"}
+            example: {count: 5, min_count: 1, ttl_seconds: 120}
+      responses:
+        "200":
+          description: reservation
+          content: {application/json: {schema: {$ref: "#/components/schemas/ReserveResponse"}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/ErrorRetry"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+  /v1/pools/{pool}/release:
+    post:
+      tags: [fuel]
+      summary: Return unused outputs to the pool
+      operationId: release
+      description: Idempotent. Outputs not reserved under this token are skipped; the response reports how many changed.
+      parameters: [{$ref: "#/components/parameters/pool"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ReleaseRequest"}
+      responses:
+        "200":
+          description: released count
+          content: {application/json: {schema: {$ref: "#/components/schemas/CountResponse"}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+  /v1/pools/{pool}/spend:
+    post:
+      tags: [fuel]
+      summary: Report that a transaction spent these outputs
+      operationId: spend
+      description: |
+        Call this after broadcasting. Under `spend_policy=verify` (default) the outputs move to
+        quarantine and are proven spent by the chain oracle; under `trust` they are marked
+        spent immediately. Idempotent; a second call with a different txid is ignored.
+        Only the `accepted` field in the response is meaningful.
+      parameters: [{$ref: "#/components/parameters/pool"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SpendRequest"}
+      responses:
+        "200":
+          description: accepted count
+          content: {application/json: {schema: {$ref: "#/components/schemas/CountResponse"}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+  /v1/pools/{pool}/beef/{txid}:
+    get:
+      tags: [fuel]
+      summary: BEEF for a shard (split transaction)
+      operationId: beefForShard
+      description: |
+        Binary BEEF v2. While the shard is unmined the document contains the split transaction
+        and its ancestry; once mined it contains the split transaction plus its BUMP and is
+        served with `Cache-Control: immutable`. `ETag` is `"v<version>"`; send `If-None-Match`
+        to get `304`. `X-Shard-Status` is `unmined|mined|retired|invalid`.
+      parameters:
+        - {$ref: "#/components/parameters/pool"}
+        - {name: txid, in: path, required: true, schema: {type: string, pattern: "^[0-9a-f]{64}$"}}
+      responses:
+        "200":
+          description: BEEF bytes
+          headers:
+            ETag: {schema: {type: string}, description: '"v<version>"'}
+            Cache-Control: {schema: {type: string}}
+            X-Shard-Status: {schema: {type: string, enum: [unmined, mined, retired, invalid]}}
+          content: {application/octet-stream: {schema: {type: string, format: binary}}}
+        "304":
+          description: not modified
+          headers:
+            ETag: {schema: {type: string}}
+            Cache-Control: {schema: {type: string}}
+            X-Shard-Status: {schema: {type: string, enum: [unmined, mined, retired, invalid]}}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+  /v1/pools/{pool}/shards:
+    get:
+      tags: [admin]
+      summary: List shards
+      operationId: listShards
+      parameters:
+        - {$ref: "#/components/parameters/pool"}
+        - {name: status, in: query, schema: {type: string, enum: [unmined, mined, retired, invalid]}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 0, default: 100, maximum: 1000}, description: "0 = default 100, values above 1000 are clamped"}
+      responses:
+        "200":
+          description: shards
+          content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/ShardInfo"}}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+  /v1/pools/{pool}/shards/{txid}/retire:
+    post:
+      tags: [admin]
+      summary: Retire a shard (operator)
+      operationId: retireShard
+      description: Marks the shard invalid and invalidates every non-terminal row. Use when a split transaction is known to be dead.
+      parameters:
+        - {$ref: "#/components/parameters/pool"}
+        - {name: txid, in: path, required: true, schema: {type: string, pattern: "^[0-9a-f]{64}$"}}
+      responses:
+        "200":
+          description: retired count
+          content: {application/json: {schema: {$ref: "#/components/schemas/CountResponse"}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+  /v1/pools/{pool}/quarantined:
+    get:
+      tags: [admin]
+      summary: List quarantined rows
+      operationId: listQuarantined
+      parameters:
+        - {$ref: "#/components/parameters/pool"}
+        - {name: limit, in: query, schema: {type: integer, minimum: 0, default: 100, maximum: 1000}, description: "0 = default 100, values above 1000 are clamped"}
+      responses:
+        "200":
+          description: rows
+          content: {application/json: {schema: {type: array, items: {$ref: "#/components/schemas/Row"}}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+  /v1/pools/{pool}/quarantined/requeue:
+    post:
+      tags: [admin]
+      summary: Return quarantined rows to the pool (operator)
+      operationId: requeueQuarantined
+      description: Use only when you know the outputs are unspent (for example after the oracle was unavailable).
+      parameters: [{$ref: "#/components/parameters/pool"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/OutpointsRequest"}
+      responses:
+        "200":
+          description: requeued count
+          content: {application/json: {schema: {$ref: "#/components/schemas/CountResponse"}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+  /v1/funding:
+    get:
+      tags: [funding]
+      summary: Get BRC-29 funding instructions (admin)
+      operationId: fundingInfo
+      description: |
+        Admin-tier: funding is an operator action, and gating it prevents anonymous nonce/BEEF spam.
+        Returns the treasury's identity key and a fresh derivation-prefix nonce. Derive a BRC-29 payment
+        key from it with your own wallet (`GetPublicKey` with `protocolID:[2,"3241645161d8"]`,
+        `keyID:"<derivation_prefix> <your suffix>"`, `counterparty: identity_key`), pay a P2PKH output to
+        that key, then `POST` the payment to this same path. `404 funding_disabled` means this instance has
+        no funding treasury configured.
+      responses:
+        "200":
+          description: funding instructions
+          content: {application/json: {schema: {$ref: "#/components/schemas/FundingInfo"}}}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+    post:
+      tags: [funding]
+      summary: Submit a completed BRC-29 payment (admin)
+      operationId: fund
+      description: |
+        Admin-tier (see `GET /v1/funding`). Internalizes a payment previously made to the identity key and
+        derivation prefix returned by `GET /v1/funding`. `400 bad_funding` means the treasury could not
+        verify or accept the payment (for example a wrong derivation, a missing output, or insufficient
+        value); the derivation nonce is HMAC-based and stays valid, so retry with the same
+        `derivation_prefix`/`derivation_suffix` once the payment is fixed. `404 funding_disabled` means this
+        instance has no funding treasury configured.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/FundRequest"}
+      responses:
+        "200":
+          description: internalized payment
+          content: {application/json: {schema: {$ref: "#/components/schemas/FundResult"}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer, description: "FuelKeeper API key"}
+  parameters:
+    pool:
+      name: pool
+      in: path
+      required: true
+      schema: {type: string}
+      description: "pool name"
+  responses:
+    Error:
+      description: error
+      headers:
+        WWW-Authenticate:
+          schema: {type: string}
+          description: "present on 401 responses"
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    ErrorRetry:
+      description: retryable error
+      headers:
+        Retry-After: {schema: {type: integer}, description: "seconds to wait before retrying"}
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [bad_request, unauthorized, not_found, unknown_pool, insufficient, exhausted, backpressure, unavailable, client_closed_request, method_not_allowed, internal, bad_funding, funding_disabled]
+        message: {type: string}
+        retry_after: {type: integer, description: "seconds to wait before retrying"}
+    Ready:
+      type: object
+      required: [status, pools, pools_ready]
+      properties:
+        status: {type: string}
+        pools: {type: integer, description: "total number of pools configured"}
+        pools_ready: {type: integer, description: "number of pools that own a shard or have rows queued"}
+        error: {type: string, description: "error message if not ready"}
+    ReserveRequest:
+      type: object
+      required: [count]
+      properties:
+        count: {type: integer, minimum: 1, description: "outputs requested (max is the pool's max_count)"}
+        min_count: {type: integer, minimum: 0, description: "accept a partial fill of at least this many; 0 means count (default = count)"}
+        ttl_seconds: {type: integer, minimum: 0, description: "reservation lifetime in seconds (pool min_ttl..max_ttl; 0 means the pool default)"}
+    Unlock:
+      type: object
+      required: [mode, script, length]
+      properties:
+        mode: {type: string, enum: [puzzle, p2pkh]}
+        script: {type: string, description: "hex unlocking script (complete; no signing needed)"}
+        length: {type: integer, description: "bytes, for unlockingScriptLength"}
+    Output:
+      type: object
+      required: [txid, vout, outpoint, satoshis, locking_script, unlock]
+      properties:
+        txid: {type: string}
+        vout: {type: integer}
+        outpoint: {type: string, example: "3f…:12"}
+        satoshis: {type: integer}
+        locking_script: {type: string, description: "hex"}
+        unlock: {$ref: "#/components/schemas/Unlock"}
+    Shard:
+      type: object
+      required: [txid, version, beef_url]
+      properties:
+        txid: {type: string}
+        version: {type: integer, description: "bumps when the BEEF changes (e.g. unmined → mined)"}
+        beef_url: {type: string, format: "uri-reference", description: "server-relative path or full URL"}
+    Constraints:
+      type: object
+      required: [tx_version, lock_time, sequence]
+      description: "present for p2pkh pools; the consuming transaction must match these"
+      properties:
+        tx_version: {type: integer, example: 1}
+        lock_time: {type: integer, example: 0}
+        sequence: {type: integer, example: 4294967295}
+    ReserveResponse:
+      type: object
+      required: [token, expires_at, ttl_seconds, lock_mode, outputs, shards]
+      properties:
+        token: {type: string, description: "22-char base64url reservation token"}
+        expires_at: {type: string, format: "date-time", description: "UTC RFC 3339"}
+        ttl_seconds: {type: integer}
+        lock_mode: {type: string, enum: [puzzle, p2pkh]}
+        outputs: {type: array, items: {$ref: "#/components/schemas/Output"}}
+        shards: {type: array, items: {$ref: "#/components/schemas/Shard"}}
+        constraints: {$ref: "#/components/schemas/Constraints"}
+    ReleaseRequest:
+      type: object
+      required: [token, outpoints]
+      properties:
+        token: {type: string}
+        outpoints: {type: array, items: {type: string}}
+    SpendRequest:
+      type: object
+      required: [token, outpoints, txid]
+      properties:
+        token: {type: string}
+        outpoints: {type: array, items: {type: string}}
+        txid: {type: string, pattern: "^[0-9a-f]{64}$", description: "the spending transaction id (lowercase hex)"}
+    OutpointsRequest:
+      type: object
+      required: [outpoints]
+      properties:
+        outpoints: {type: array, items: {type: string}}
+    CountResponse:
+      type: object
+      required: [released, accepted, requeued, retired]
+      description: "All four fields are always present. Only the field named by the endpoint that returned it is meaningful."
+      properties:
+        released: {type: integer, description: "populated by release"}
+        accepted: {type: integer, description: "populated by spend"}
+        requeued: {type: integer, description: "populated by requeue"}
+        retired: {type: integer, description: "populated by retire"}
+    ShardCounts:
+      type: object
+      required: [unmined, mined, retired, invalid]
+      properties:
+        unmined: {type: integer}
+        mined: {type: integer}
+        retired: {type: integer}
+        invalid: {type: integer}
+    Stats:
+      type: object
+      required: [available, reserved, quarantined, spent, invalid, shards]
+      properties:
+        available: {type: integer}
+        reserved: {type: integer}
+        quarantined: {type: integer}
+        spent: {type: integer}
+        invalid: {type: integer}
+        shards: {$ref: "#/components/schemas/ShardCounts"}
+    Pool:
+      type: object
+      required: [name, denomination, lock_mode, split_size, serve_policy, release_policy, spend_policy, max_count, default_ttl_seconds, min_ttl_seconds, max_ttl_seconds, stats]
+      properties:
+        name: {type: string}
+        denomination: {type: integer}
+        lock_mode: {type: string, enum: [puzzle, p2pkh]}
+        split_size: {type: integer}
+        serve_policy: {type: string, enum: [mined_only, any]}
+        release_policy: {type: string, enum: [trust, verify]}
+        spend_policy: {type: string, enum: [verify, trust]}
+        max_count: {type: integer}
+        default_ttl_seconds: {type: integer}
+        min_ttl_seconds: {type: integer}
+        max_ttl_seconds: {type: integer}
+        constraints: {$ref: "#/components/schemas/Constraints"}
+        stats: {$ref: "#/components/schemas/Stats"}
+    ShardInfo:
+      type: object
+      required: [txid, size, status, version, created_at]
+      properties:
+        txid: {type: string}
+        size: {type: integer}
+        status: {type: string, enum: [unmined, mined, retired, invalid]}
+        owner: {type: string}
+        lease_until: {type: string, format: "date-time"}
+        version: {type: integer}
+        created_at: {type: string, format: "date-time", description: "UTC RFC 3339"}
+    Row:
+      type: object
+      required: [outpoint, state]
+      properties:
+        outpoint: {type: string}
+        state: {type: string, enum: [available, reserved, quarantined, spent, invalid]}
+        reserved_by: {type: string}
+        expires_at: {type: string, format: "date-time"}
+        quarantined_at: {type: string, format: "date-time"}
+        spent_hint: {type: string}
+        spent_by: {type: string}
+    FundingInfo:
+      type: object
+      required: [identity_key, derivation_prefix, network, protocol, instructions]
+      description: "How to pay the treasury a BRC-29 wallet payment; see GET /v1/funding."
+      properties:
+        identity_key: {type: string, description: "treasury identity key, DER hex"}
+        derivation_prefix: {type: string, description: "base64 nonce; use once per payment"}
+        network: {type: string, description: "main | test | ttn | tstn"}
+        protocol: {type: string, example: "3241645161d8", description: "BRC-29 protocol ID, security level 2"}
+        instructions: {type: string}
+    FundRequest:
+      type: object
+      required: [atomic_beef, derivation_prefix, derivation_suffix, sender_identity_key]
+      description: "A completed BRC-29 payment; see POST /v1/funding."
+      properties:
+        atomic_beef: {type: string, description: "base64 AtomicBEEF (BRC-95) of the payment transaction and its ancestry"}
+        output_index: {type: integer, nullable: true, description: "the payment output's index; omit or null to auto-detect"}
+        derivation_prefix: {type: string, description: "base64, from GET /v1/funding's response"}
+        derivation_suffix: {type: string, description: "base64, chosen by the payer"}
+        sender_identity_key: {type: string, pattern: "^[0-9a-fA-F]{66}$", description: "the payer's identity public key, DER hex"}
+    FundResult:
+      type: object
+      required: [txid, satoshis]
+      description: "What was internalized by POST /v1/funding."
+      properties:
+        txid: {type: string}
+        satoshis: {type: integer}

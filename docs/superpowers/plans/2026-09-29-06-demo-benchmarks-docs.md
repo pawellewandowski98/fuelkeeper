@@ -1037,3 +1037,9 @@ Commit: `docs: clients guide, architecture, changelog and README for 0.1.0`.
 - **Spec coverage:** benchmark suite with published per-backend and multi-instance numbers; store microbenchmarks; demo on go-wallet-toolbox (toolbox mode) plus the raw mode that shows FuelKeeper's own ceiling; documented performance expectations and the double-hand-out audit; client and architecture docs.
 - **Type consistency:** `fuelbench` uses only `pkg/client`; `fueldemo` uses `pkg/client`, `pkg/arcadeclient` (`PostTx`, `RejectError`, `BackpressureError`), `wire.Output/Constraints`; `client.CreateActionInputs` and `client.InputBEEF` from Plan 3.
 - **Placeholders:** none; Task 6 lists the exact commands and files; numbers are produced by running them.
+
+## Facts carried from the Plan 3 final review (2026-10-01)
+
+- Metrics the spec lists but Plan 2 did not add: `coalescer_batch_size`, `coalescer_flush_latency_seconds`, `coalescer_inflight_ops`, `shard_adoptions_total{result}`, `shard_drops_total{reason}`, `lease_renew_failures_total`, `cas_unknown_total`, `compensating_release_total`, `store_op_latency_seconds{op}`, `clock_skew_seconds`; `fuelbench` needs at least the coalescer ones.
+- The client has `WithObserver` (per-call timing hook), `ReserveWithRetry`, and a tuned transport; a load generator should still pass its own `http.Client` (`WithHTTPClient`) with a large `MaxIdleConnsPerHost`.
+- There is no batch spend endpoint; the demo batches `spend` calls per token. Consider a `POST /v1/pools/{pool}/spend` body with several tokens only if profiling shows it matters.

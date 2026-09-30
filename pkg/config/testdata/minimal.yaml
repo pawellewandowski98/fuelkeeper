@@ -1,0 +1,7 @@
+store:
+  backend: memory
+pools:
+  - name: main
+    denomination: 50
+api:
+  insecure: true # default api.listen (":8080") is not loopback-only and no api_keys are set here

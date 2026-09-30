@@ -26,7 +26,7 @@ func mintViaTreasury(ctx context.Context, t *testing.T, st store.Store, tr *mock
 	b, err := tr.Build(ctx, treasury.MintRequest{Pool: poolName, Denomination: 50, Count: n, LockMode: store.LockPuzzle})
 	require.NoError(t, err)
 	require.NoError(t, st.PutShard(ctx, b.Shard, b.Rows))
-	require.NoError(t, tr.Send(ctx, b.Shard.TxID))
+	require.NoError(t, tr.Send(ctx, b.Shard.TxID, b.Shard.BEEF))
 	return b
 }
 
@@ -125,6 +125,7 @@ func TestWatcherMinesRetiresAndResends(t *testing.T) {
 	clk.Advance(cfg.RebroadcastAfter + time.Second)
 	require.NoError(t, w.RunOnce(ctx))
 	assert.Equal(t, 2, tr.Sends(lost.Shard.TxID), "re-sent after RebroadcastAfter")
+	assert.Equal(t, lost.Shard.BEEF, tr.LastSendBEEF(lost.Shard.TxID), "the rebroadcast carries the shard's stored BEEF (ListShards omits it)")
 	require.NoError(t, w.RunOnce(ctx))
 	assert.Equal(t, 2, tr.Sends(lost.Shard.TxID), "not re-sent again within the same interval")
 	clk.Advance(cfg.RebroadcastAfter + time.Second)

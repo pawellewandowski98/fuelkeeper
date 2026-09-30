@@ -429,6 +429,10 @@ func TestShardManagerRunDropsStolenShardOnCASMissBeforeRenewTick(t *testing.T) {
 	cfg := testInstanceConfig()
 	cfg.LeaseTTL = time.Hour
 	cfg.RescanInterval = time.Hour
+	// One shard only: with MaxShards 2 and a 2-row shard the manager stays
+	// hungry after adopting and could re-adopt the shard the test releases
+	// before "other/1" takes it (seen under heavy CPU load).
+	cfg.MaxShards = 1
 	m, alloc := newMgr(t, st, clk, cfg, pc)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

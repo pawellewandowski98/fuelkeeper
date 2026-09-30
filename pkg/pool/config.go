@@ -5,10 +5,19 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"regexp"
 	"time"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 )
+
+// poolNamePattern restricts a pool name to what can be safely routed in a URL
+// path segment (e.g. GET /v1/pools/{pool}/...): it must start with a letter
+// or digit and contain only letters, digits, '_', '.' and '-', up to 64
+// bytes total (matching store.ValidatePool's length limit). Because the
+// first character must be alphanumeric, this also rejects the reserved path
+// segments "." and ".." outright, which cannot be routed.
+var poolNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 
 // ServePolicy says which shard statuses an instance may serve from.
 type ServePolicy string
@@ -75,9 +84,15 @@ type Config struct {
 	ReleasePolicy ReleasePolicy `yaml:"release_policy"`
 	// SpendPolicy says whether a client Spend is a hint or a fact.
 	SpendPolicy SpendPolicy `yaml:"spend_policy"`
+	// ExpectedTPS is the pool's expected spend rate; optional (0 disables the
+	// check) and, when set, enables the mint-capacity check in pkg/config.
+	ExpectedTPS float64 `yaml:"expected_tps"`
 }
 
-// DefaultPoolConfig returns the spec defaults for a puzzle pool.
+// DefaultPoolConfig returns the spec defaults for a puzzle pool. Its
+// SpendPolicy (SpendVerify) assumes an oracle is configured; a caller with no
+// oracle should resolve it via config.ApplyPoolDefaults, which picks
+// SpendTrust instead.
 func DefaultPoolConfig(name string, denomination uint64) Config {
 	return Config{
 		Name:            name,
@@ -101,6 +116,9 @@ func DefaultPoolConfig(name string, denomination uint64) Config {
 func (c *Config) Validate() error {
 	if err := store.ValidatePool(c.Name); err != nil {
 		return err
+	}
+	if !poolNamePattern.MatchString(c.Name) {
+		return fmt.Errorf("pool %s: name must match %s (and not be \".\" or \"..\", which cannot be routed)", c.Name, poolNamePattern.String())
 	}
 	if c.Denomination == 0 {
 		return fmt.Errorf("pool %s: denomination must be > 0", c.Name)
@@ -141,6 +159,9 @@ func (c *Config) Validate() error {
 	case SpendVerify, SpendTrust:
 	default:
 		return fmt.Errorf("pool %s: spend_policy must be verify or trust", c.Name)
+	}
+	if c.ExpectedTPS < 0 {
+		return fmt.Errorf("pool %s: expected_tps must be >= 0", c.Name)
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package oracle
 
 import (
 	"context"
+	"slices"
 	"sync"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -11,11 +12,12 @@ import (
 
 // Mock is a controllable oracle for tests.
 type Mock struct {
-	mu    sync.Mutex
-	ops   map[store.Outpoint]Result
-	txs   map[chainhash.Hash]TxStatus
-	down  bool
-	calls int
+	mu            sync.Mutex
+	ops           map[store.Outpoint]Result
+	txs           map[chainhash.Hash]TxStatus
+	down          bool
+	calls         int
+	assumeUnspent bool
 }
 
 var _ Oracle = (*Mock)(nil)
@@ -61,6 +63,15 @@ func (m *Mock) SetTx(txid chainhash.Hash, st TxStatus) {
 	m.txs[txid] = copyTxStatus(st)
 }
 
+// SetAssumeUnspent makes Outpoints answer Unspent instead of Unknown for
+// outpoints with no verdict. Development/benchmark ("nullnet") mode only: a
+// real oracle never guesses.
+func (m *Mock) SetAssumeUnspent(v bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.assumeUnspent = v
+}
+
 // SetDown makes every call fail with ErrUnavailable.
 func (m *Mock) SetDown(down bool) {
 	m.mu.Lock()
@@ -92,7 +103,11 @@ func (m *Mock) Outpoints(_ context.Context, ops []store.Outpoint) ([]Result, err
 			}
 			out[i] = r
 		} else {
-			out[i] = Result{Outpoint: op, Status: StatusUnknown}
+			status := StatusUnknown
+			if m.assumeUnspent {
+				status = StatusUnspent
+			}
+			out[i] = Result{Outpoint: op, Status: status}
 		}
 	}
 	return out, nil
@@ -111,12 +126,18 @@ func (m *Mock) Tx(_ context.Context, txid chainhash.Hash) (TxStatus, error) {
 
 // copyTxStatus returns a copy of st whose slice fields do not alias st's,
 // so a caller mutating a returned/stored slice cannot change later answers.
+// Inputs is cloned with slices.Clone rather than append-to-nil because an
+// empty non-nil Inputs ("verified: spends nothing") must not become nil
+// ("unknown, trust the txid"): see TxStatus.Inputs.
 func copyTxStatus(st TxStatus) TxStatus {
 	if st.MerklePath != nil {
 		st.MerklePath = append([]byte(nil), st.MerklePath...)
 	}
 	if st.CompetingTxs != nil {
 		st.CompetingTxs = append([]string(nil), st.CompetingTxs...)
+	}
+	if st.Inputs != nil {
+		st.Inputs = slices.Clone(st.Inputs)
 	}
 	return st
 }

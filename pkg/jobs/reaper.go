@@ -29,6 +29,19 @@ var (
 	oracleRequests = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fuelkeeper_oracle_requests_total", Help: "Oracle calls by outcome.",
 	}, []string{"kind", "result"})
+	reaperInputMismatch = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fuelkeeper_reaper_input_mismatch_total",
+		Help: "Mined spender txids whose Inputs did not include the outpoint being resolved, by source (oracle's own SpendingTxID vs a client's SpentHint).",
+	}, []string{"pool", "source"})
+)
+
+// Input-mismatch sources for reaperInputMismatch and the mismatch log lines:
+// "oracle" is the outpoint oracle's own SpendingTxID, "hint" is a client's
+// SpentHint (used either as a fallback when the outpoint oracle names no
+// spender, or directly when the outpoint oracle's verdict is Unknown).
+const (
+	inputMismatchSourceOracle = "oracle"
+	inputMismatchSourceHint   = "hint"
 )
 
 // ReaperConfig tunes the expiry/quarantine/oracle flow (spec "Background jobs").
@@ -109,18 +122,43 @@ func (c ReaperConfig) Validate() error {
 // lose a double-spend race before being mined. An unconfirmed, merely-known,
 // or rejected txid leaves the row quarantined for a later tick to resolve.
 //
-// Known gap (see TestReaperHintPathDoesNotVerifyInputs): TxStatus carries no
-// input list, so neither this Tx confirmation nor the outpoint oracle's own
-// verdict is cross-checked against it — the reaper trusts that a Spent
-// verdict or a client's hint names a txid that actually spends the outpoint
-// in question, once that txid is mined. This makes the outpoint oracle the
-// deployment's real safety boundary: it must answer Spent/Unspent correctly
-// for on-chain-confirmed spends. The Tx(hint) fallback (used when the
-// outpoint oracle answers Unknown or reports Spent without naming a txid) is
-// only safe when the outpoint oracle is authoritative for mempool-only
-// spends too; otherwise a hostile client under spend_policy=verify could name
-// any mined, unrelated txid as its hint and have the row incorrectly
-// resolved to spent.
+// Input verification: when TxStatus.Inputs is non-nil, every candidate
+// spending txid — the outpoint oracle's own SpendingTxID and a client's
+// SpentHint alike — is also required to actually spend the row's outpoint,
+// i.e. the outpoint must be a member of Inputs, before the row is resolved to
+// spent (see TestReaperHintPathRejectsSpenderThatDoesNotSpendTheOutpoint,
+// TestReaperHintPathAcceptsSpenderWhoseInputsIncludeTheOutpoint and
+// TestReaperOutpointOracleSpenderMustSpendTheOutpoint). This closes what was
+// formerly a gap: without it, a hostile client under spend_policy=verify
+// could name any mined, unrelated txid as its hint and have the row
+// incorrectly resolved to spent.
+//
+// When a mined verdict's Inputs is nil and the oracle implements
+// oracle.InputsResolver (a composite of arcade and teranode), the reaper asks
+// it for the inputs, once per txid per tick (fillInputs); the watcher never
+// pays for that lookup.
+//
+// When TxStatus.Inputs is still nil — an oracle that cannot serve the raw
+// transaction (e.g. a gateway that only tracks broadcast status) reports
+// unknown inputs, never "no inputs" — this check cannot be performed and the
+// previous trust model applies: a Spent verdict or a client's hint is trusted
+// to name a txid that actually spends the outpoint in question, once that
+// txid is mined (see TestReaperSpenderWithNilInputsIsTrustedWhenMined). In
+// that configuration the outpoint oracle remains the deployment's real safety
+// boundary: it must answer Spent/Unspent correctly for on-chain-confirmed
+// spends, and the Tx(hint) fallback (used when the outpoint oracle answers
+// Unknown or reports Spent without naming a txid) is only as safe as the
+// outpoint oracle is authoritative for mempool-only spends too.
+//
+// A mismatch on the outpoint oracle's own SpendingTxID does NOT fall back to
+// checking a client's SpentHint instead: the oracle contradicted itself, so
+// the row simply stays quarantined for a later tick, the same safe direction
+// as the outpoint oracle overriding a hint when both are present (see
+// TestReaperOutpointOracleOverridesHint). This is logged at Error (source
+// "oracle") rather than Warn (source "hint"), since the outpoint oracle is
+// the deployment's trusted safety boundary and this indicates it misbehaved;
+// see TestReaperOutpointOracleSpenderMustSpendTheOutpoint and
+// reaperInputMismatch.
 type Reaper struct {
 	st    store.Store
 	orc   oracle.Oracle
@@ -270,7 +308,7 @@ func (r *Reaper) pageQuarantined(ctx context.Context, p string, before time.Time
 // non-nil only for context cancellation.
 func (r *Reaper) classify(ctx context.Context, p string, now time.Time, rows []store.Row) (toSpent map[chainhash.Hash][]store.Outpoint, toAvailable []store.Outpoint, err error) {
 	toSpent = map[chainhash.Hash][]store.Outpoint{}
-	txCache := map[chainhash.Hash]*oracle.TxStatus{}
+	txCache := map[chainhash.Hash]*txCacheEntry{}
 	txDown := false
 
 	for start := 0; start < len(rows); start += r.cfg.OracleBatch {
@@ -325,13 +363,15 @@ func sameOutpoints(batch []store.Row, results []oracle.Result) bool {
 func (r *Reaper) classifyOne(
 	ctx context.Context, p string, now time.Time, row store.Row, res oracle.Result,
 	toSpent map[chainhash.Hash][]store.Outpoint, toAvailable *[]store.Outpoint,
-	txCache map[chainhash.Hash]*oracle.TxStatus, txDown *bool,
+	txCache map[chainhash.Hash]*txCacheEntry, txDown *bool,
 ) error {
 	switch res.Status {
 	case oracle.StatusSpent:
 		spender := res.SpendingTxID
+		source := inputMismatchSourceOracle
 		if spender == nil && hasHint(row) {
 			spender = row.SpentHint
+			source = inputMismatchSourceHint
 		}
 		if spender == nil {
 			// Proven spent, but neither the oracle nor the client tells us by
@@ -344,7 +384,7 @@ func (r *Reaper) classifyOne(
 		// Even the outpoint oracle's own SpendingTxID is only mempool
 		// evidence until Tx confirms it is mined: see the terminal-state
 		// policy in the Reaper doc comment.
-		return r.resolveViaTx(ctx, p, row.Outpoint, *spender, toSpent, txCache, txDown)
+		return r.resolveViaTx(ctx, p, row.Outpoint, *spender, source, toSpent, txCache, txDown)
 	case oracle.StatusUnspent:
 		wait := r.cfg.MinUnspentAge
 		if hasHint(row) {
@@ -355,7 +395,7 @@ func (r *Reaper) classifyOne(
 		}
 	case oracle.StatusUnknown:
 		if hasHint(row) {
-			return r.resolveViaTx(ctx, p, row.Outpoint, *row.SpentHint, toSpent, txCache, txDown)
+			return r.resolveViaTx(ctx, p, row.Outpoint, *row.SpentHint, inputMismatchSourceHint, toSpent, txCache, txDown)
 		}
 	case oracle.StatusConflicting:
 		// Leave quarantined; an operator decides.
@@ -363,18 +403,42 @@ func (r *Reaper) classifyOne(
 	return nil
 }
 
+// txCacheEntry caches one tick's Tx(txid) verdict alongside a membership set
+// built once from its Inputs, so resolveViaTx's per-row input check is O(1)
+// instead of an O(len(Inputs)) scan per row sharing the txid. inputs is nil
+// exactly when TxStatus.Inputs is nil (unknown inputs, trust the mined
+// verdict as-is); it is a non-nil, possibly-empty set otherwise. warnedOracle
+// and warnedHint record whether the input-mismatch log line has already been
+// emitted for this txid this tick, one flag per source since the two log at
+// different levels (see resolveViaTx), so 1000 rows sharing one bogus hint
+// produce at most one log line, not 1000. reaperInputMismatch, unlike the
+// log, is incremented once per mismatched row: it is cheap and an operator
+// may want the true count of affected rows, not just that it happened.
+type txCacheEntry struct {
+	ts           *oracle.TxStatus
+	inputs       map[store.Outpoint]struct{}
+	warnedOracle bool
+	warnedHint   bool
+}
+
 // resolveViaTx looks up a claimed spending txid — the outpoint oracle's own
-// SpendingTxID, or a client's SpentHint — through the tick's cache, and
-// counts it as proven only once it is mined (see the Reaper doc comment's
-// terminal-state policy). On an oracle failure it sets *txDown and logs once,
-// so 1000 rows sharing one txid cost at most one failed Tx call and one
-// warning per tick, not one per row. The returned error is non-nil only for
-// context cancellation.
+// SpendingTxID, or a client's SpentHint, named by source — through the tick's
+// cache, and counts it as proven only once it is mined (see the Reaper doc
+// comment's terminal-state policy). On an oracle failure it sets *txDown and
+// logs once, so 1000 rows sharing one txid cost at most one failed Tx call
+// and one warning per tick, not one per row. When the verdict's Inputs is
+// non-nil, outpoint must also be a member of it (see the Reaper doc comment's
+// input verification paragraph); a mismatch is logged at most once per txid
+// per source per tick (Error for source "oracle", since the outpoint oracle
+// contradicting itself is the deployment's trusted safety boundary
+// misbehaving; Warn for source "hint", an unproven client claim) and counted
+// in reaperInputMismatch every time, not just on the row that triggers the
+// log line. The returned error is non-nil only for context cancellation.
 func (r *Reaper) resolveViaTx(
-	ctx context.Context, p string, outpoint store.Outpoint, txid chainhash.Hash,
-	toSpent map[chainhash.Hash][]store.Outpoint, txCache map[chainhash.Hash]*oracle.TxStatus, txDown *bool,
+	ctx context.Context, p string, outpoint store.Outpoint, txid chainhash.Hash, source string,
+	toSpent map[chainhash.Hash][]store.Outpoint, txCache map[chainhash.Hash]*txCacheEntry, txDown *bool,
 ) error {
-	ts, cached := txCache[txid]
+	entry, cached := txCache[txid]
 	if !cached {
 		if *txDown {
 			return nil
@@ -390,13 +454,65 @@ func (r *Reaper) resolveViaTx(
 			return nil
 		}
 		oracleRequests.WithLabelValues("tx", "ok").Inc()
-		ts = &got
-		txCache[txid] = ts
+		r.fillInputs(ctx, p, txid, &got)
+		entry = &txCacheEntry{ts: &got}
+		if got.Inputs != nil {
+			entry.inputs = make(map[store.Outpoint]struct{}, len(got.Inputs))
+			for _, in := range got.Inputs {
+				entry.inputs[in] = struct{}{}
+			}
+		}
+		txCache[txid] = entry
 	}
-	if ts.Known && ts.Mined && !ts.Rejected {
-		toSpent[txid] = append(toSpent[txid], outpoint)
+	ts := entry.ts
+	if !ts.Known || !ts.Mined || ts.Rejected {
+		return nil
 	}
+	if entry.inputs != nil {
+		if _, spendsOutpoint := entry.inputs[outpoint]; !spendsOutpoint {
+			reaperInputMismatch.WithLabelValues(p, source).Inc()
+			switch source {
+			case inputMismatchSourceOracle:
+				if !entry.warnedOracle {
+					r.log.Error("outpoint oracle's own spending txid does not spend this outpoint; leaving quarantined, not falling back to a client hint",
+						"pool", p, "txid", txid, "source", source)
+					entry.warnedOracle = true
+				}
+			default: // inputMismatchSourceHint
+				if !entry.warnedHint {
+					r.log.Warn("mined spender's inputs do not include this outpoint; leaving quarantined",
+						"pool", p, "txid", txid, "source", source)
+					entry.warnedHint = true
+				}
+			}
+			return nil
+		}
+	}
+	toSpent[txid] = append(toSpent[txid], outpoint)
 	return nil
+}
+
+// fillInputs asks an oracle.InputsResolver for the inputs of a mined spender
+// whose verdict carries none (a tx-only gateway such as arcade, behind a
+// composite oracle with teranode). It runs once per txid per tick (the
+// result is cached with the verdict). A failure leaves Inputs nil, i.e.
+// unknown: the mined verdict is then trusted as documented on Reaper.
+func (r *Reaper) fillInputs(ctx context.Context, p string, txid chainhash.Hash, ts *oracle.TxStatus) {
+	if ts.Inputs != nil || !ts.Known || !ts.Mined || ts.Rejected {
+		return
+	}
+	ir, ok := r.orc.(oracle.InputsResolver)
+	if !ok {
+		return
+	}
+	ins, err := ir.TxInputs(ctx, txid)
+	if err != nil {
+		oracleRequests.WithLabelValues("tx_inputs", "error").Inc()
+		r.log.Warn("oracle TxInputs unavailable; trusting the mined spender without an input check", "pool", p, "txid", txid, "err", err)
+		return
+	}
+	oracleRequests.WithLabelValues("tx_inputs", "ok").Inc()
+	ts.Inputs = ins
 }
 
 // resolve applies the classified outcomes, chunking to the store's MaxBatch.

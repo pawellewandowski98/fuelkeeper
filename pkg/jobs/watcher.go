@@ -332,7 +332,16 @@ func (w *Watcher) maybeRebroadcast(ctx context.Context, p string, now time.Time,
 		return
 	}
 	w.lastTx[sh.TxID] = now
-	if err := w.tr.Send(ctx, sh.TxID); err != nil {
+	// ListShards omits BEEF, so fetch the stored split for the treasury's
+	// rebroadcast path. Without it Send still asks its wallet to send; only a
+	// direct re-post of the BEEF is skipped.
+	var beef []byte
+	if full, err := w.st.GetShard(ctx, p, sh.TxID); err != nil {
+		w.log.Warn("rebroadcast: load shard beef", "pool", p, "txid", sh.TxID.String(), "err", err)
+	} else {
+		beef = full.BEEF
+	}
+	if err := w.tr.Send(ctx, sh.TxID, beef); err != nil {
 		if errors.Is(err, treasury.ErrRejected) {
 			if rerr := w.retire(ctx, p, sh, "rebroadcast_rejected", "", nil); rerr != nil {
 				w.log.Error("retire after rejected rebroadcast", "pool", p, "txid", sh.TxID.String(), "err", rerr)

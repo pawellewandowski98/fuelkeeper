@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -36,12 +37,16 @@ func TestMockBuildAndSend(t *testing.T) {
 	require.NoError(t, store.ValidatePutShard(built.Shard, built.Rows))
 
 	assert.False(t, m.Sent(built.Shard.TxID))
-	require.NoError(t, m.Send(ctx, built.Shard.TxID))
+	require.NoError(t, m.Send(ctx, built.Shard.TxID, built.Shard.BEEF))
 	assert.True(t, m.Sent(built.Shard.TxID))
-	require.NoError(t, m.Send(ctx, built.Shard.TxID), "send is idempotent")
+	assert.Equal(t, built.Shard.BEEF, m.LastSendBEEF(built.Shard.TxID))
+	require.NoError(t, m.Send(ctx, built.Shard.TxID, nil), "send is idempotent; beef is optional")
 	assert.Equal(t, 2, m.Sends(built.Shard.TxID))
-	require.NoError(t, m.Send(ctx, built.Rows[0].TxID), "rows and shard agree on the txid")
-	require.ErrorIs(t, m.Send(ctx, store.Outpoint{}.TxID), treasury.ErrUnknownTx)
+	assert.Nil(t, m.LastSendBEEF(built.Shard.TxID))
+	require.NoError(t, m.Send(ctx, built.Rows[0].TxID, nil), "rows and shard agree on the txid")
+	require.Error(t, m.Send(ctx, built.Shard.TxID, []byte("junk")), "a malformed beef is refused")
+	assert.Equal(t, 3, m.Sends(built.Shard.TxID), "a refused send is not counted")
+	require.ErrorIs(t, m.Send(ctx, store.Outpoint{}.TxID, nil), treasury.ErrUnknownTx)
 
 	_, err = m.Build(ctx, treasury.MintRequest{Pool: "main", Denomination: 50, Count: 0})
 	require.ErrorIs(t, err, treasury.ErrInvalidRequest)
@@ -58,7 +63,7 @@ func TestMockBuildAndSend(t *testing.T) {
 	built2, err := m.Build(ctx, treasury.MintRequest{Pool: "main", Denomination: 50, Count: 1})
 	require.NoError(t, err)
 	m.FailSend(treasury.ErrRejected)
-	require.ErrorIs(t, m.Send(ctx, built2.Shard.TxID), treasury.ErrRejected)
+	require.ErrorIs(t, m.Send(ctx, built2.Shard.TxID, built2.Shard.BEEF), treasury.ErrRejected)
 	assert.False(t, m.Sent(built2.Shard.TxID), "a failed send is not counted")
 	m.FailSend(nil)
 	assert.Equal(t, 2, m.Built(), "two successful builds")
@@ -79,4 +84,30 @@ func TestMockCrossShardIndependence(t *testing.T) {
 
 	assert.False(t, fuel.VerifyPuzzle(a.Rows[0].LockingScript, b.Rows[0].UnlockingScript),
 		"b's unlocking script must not satisfy a's locking script")
+}
+
+// TestMockBEEFIsRealSplit checks that the mock's shard BEEF is a real,
+// parseable BEEF whose transaction is the split and carries the rows' outputs,
+// so client.InputBEEF and fuel.RawTxFromBEEF work without a real wallet.
+func TestMockBEEFIsRealSplit(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+	built, err := m.Build(ctx, treasury.MintRequest{Pool: "main", Denomination: 50, Count: 3})
+	require.NoError(t, err)
+
+	raw, err := fuel.RawTxFromBEEF(built.Shard.BEEF, built.Shard.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, built.RawTx, raw)
+	tx, err := transaction.NewTransactionFromBytes(raw)
+	require.NoError(t, err)
+	assert.Equal(t, built.Shard.TxID, *tx.TxID())
+	require.Len(t, tx.Outputs, len(built.Rows), "no change output")
+	for i, r := range built.Rows {
+		assert.Equal(t, r.Satoshis, tx.Outputs[i].Satoshis)
+		assert.Equal(t, r.LockingScript, []byte(*tx.Outputs[i].LockingScript))
+	}
+
+	merged := transaction.NewBeefV2()
+	require.NoError(t, merged.MergeBeefBytes(built.Shard.BEEF), "the BEEF merges the way client.InputBEEF merges it")
+	assert.NotNil(t, merged.FindTransaction(built.Shard.TxID.String()))
 }

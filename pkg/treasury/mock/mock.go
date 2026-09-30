@@ -1,14 +1,17 @@
-// Package mock is an in-memory Treasury that mints synthetic split transactions
-// with real hash-puzzle rows. Used by tests, benchmarks and the "nullnet" mode.
+// Package mock is an in-memory Treasury that mints real (unsigned, unfunded)
+// split transactions with real hash-puzzle rows, in parseable BEEF. Used by tests, benchmarks and the "nullnet" mode.
 package mock
 
 import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"fmt"
 	"sync"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/script"
+	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/fuel"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
@@ -22,18 +25,34 @@ type Treasury struct {
 	mu             sync.Mutex
 	built          map[chainhash.Hash]*treasury.BuiltShard
 	sent           map[chainhash.Hash]int // send count per txid
+	sendBEEF       map[chainhash.Hash][]byte
 	failBuild      error
 	failSend       error
 	failMinedBEEF  error
 	nBuilt         int
 	nBuildAttempts int
+	onSend         func(txid chainhash.Hash)
 }
 
 var _ treasury.Treasury = (*Treasury)(nil)
 
+// Option configures a Treasury built by New.
+type Option func(*Treasury)
+
+// WithOnSend registers a callback invoked after every successful Send, with
+// the mutex released (see Send). Used by "nullnet" mode to simulate mining a
+// split some time after it is sent.
+func WithOnSend(fn func(txid chainhash.Hash)) Option {
+	return func(t *Treasury) { t.onSend = fn }
+}
+
 // New returns an empty mock treasury.
-func New() *Treasury {
-	return &Treasury{built: map[chainhash.Hash]*treasury.BuiltShard{}, sent: map[chainhash.Hash]int{}}
+func New(opts ...Option) *Treasury {
+	t := &Treasury{built: map[chainhash.Hash]*treasury.BuiltShard{}, sent: map[chainhash.Hash]int{}, sendBEEF: map[chainhash.Hash][]byte{}}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
 }
 
 // Sends returns how many times txid was sent.
@@ -88,7 +107,9 @@ func (t *Treasury) BuildAttempts() int {
 	return t.nBuildAttempts
 }
 
-// Build mints a synthetic unmined shard with real puzzle rows.
+// Build mints an unmined shard with real puzzle rows: Shard.BEEF is a BEEF v2
+// holding the split transaction (one dummy input, one puzzle output per row,
+// no change), so fuel.RawTxFromBEEF and BEEF merging work on it.
 func (t *Treasury) Build(_ context.Context, req treasury.MintRequest) (*treasury.BuiltShard, error) {
 	t.mu.Lock()
 	t.nBuildAttempts++
@@ -107,40 +128,43 @@ func (t *Treasury) Build(_ context.Context, req treasury.MintRequest) (*treasury
 	if t.failBuild != nil {
 		return nil, t.failBuild
 	}
-	var rnd [32]byte
-	if _, err := rand.Read(rnd[:]); err != nil {
-		panic("mock: crypto/rand failed: " + err.Error())
-	}
-	sum := sha256.Sum256(rnd[:])
-	txid, _ := chainhash.NewHash(sum[:])
 	seed := fuel.NewSeed()
+	tx, pres := splitTx(seed, req)
+	txid := *tx.TxID()
 	rows := make([]store.Row, req.Count)
 	for i := range rows {
-		pre := fuel.Preimage(seed, uint32(i)) //nolint:gosec // count is small
 		rows[i] = store.Row{
-			Outpoint:        store.Outpoint{TxID: *txid, Vout: uint32(i)}, //nolint:gosec // count is small
+			Outpoint:        store.Outpoint{TxID: txid, Vout: uint32(i)}, //nolint:gosec // count is small
 			Pool:            req.Pool,
 			Satoshis:        req.Denomination,
-			LockingScript:   fuel.PuzzleLock(fuel.PuzzleHash(pre)),
-			UnlockingScript: fuel.PuzzleUnlock(pre),
+			LockingScript:   []byte(*tx.Outputs[i].LockingScript),
+			UnlockingScript: fuel.PuzzleUnlock(pres[i]),
 			State:           store.StateAvailable,
 		}
 	}
-	raw := append([]byte("mock-rawtx-"), txid[:]...)
+	raw := tx.Bytes()
+	beef := transaction.NewBeefV2()
+	if _, err := beef.MergeRawTx(raw, nil); err != nil {
+		return nil, fmt.Errorf("mock: merge split: %w", err)
+	}
+	beefBytes, err := beef.Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("mock: serialise split beef: %w", err)
+	}
 	b := &treasury.BuiltShard{
 		Shard: store.Shard{
 			Pool:         req.Pool,
-			TxID:         *txid,
+			TxID:         txid,
 			Size:         req.Count,
 			Denomination: req.Denomination,
 			LockMode:     store.LockPuzzle,
 			Status:       store.ShardUnmined,
-			BEEF:         append([]byte("mock-beef-"), txid[:]...),
+			BEEF:         beefBytes,
 		},
 		Rows:  rows,
 		RawTx: raw,
 	}
-	t.built[*txid] = b
+	t.built[txid] = b
 	t.nBuilt++
 	return cloneBuilt(b), nil
 }
@@ -174,18 +198,43 @@ func cloneBytes(b []byte) []byte {
 	return out
 }
 
-// Send records a broadcast of a previously built split.
-func (t *Treasury) Send(_ context.Context, txid chainhash.Hash) error {
+// Send records a broadcast of a previously built split. beef, when non-nil,
+// must be a BEEF holding txid (the shard's stored BEEF); a malformed one is
+// an error and is not counted. On success, the WithOnSend callback (if any)
+// is invoked after the mutex is released, so it may safely call back into
+// the mock (e.g. from a timer) without deadlocking.
+func (t *Treasury) Send(_ context.Context, txid chainhash.Hash, beef []byte) error {
+	if beef != nil {
+		if _, err := fuel.RawTxFromBEEF(beef, txid); err != nil {
+			return fmt.Errorf("mock: send beef: %w", err)
+		}
+	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if _, ok := t.built[txid]; !ok {
+		t.mu.Unlock()
 		return treasury.ErrUnknownTx
 	}
 	if t.failSend != nil {
-		return t.failSend
+		err := t.failSend
+		t.mu.Unlock()
+		return err
 	}
 	t.sent[txid]++
+	t.sendBEEF[txid] = cloneBytes(beef)
+	fn := t.onSend
+	t.mu.Unlock()
+	if fn != nil {
+		fn(txid)
+	}
 	return nil
+}
+
+// LastSendBEEF returns the beef passed to the last successful Send of txid
+// (nil if none, or if that Send passed nil).
+func (t *Treasury) LastSendBEEF(txid chainhash.Hash) []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return cloneBytes(t.sendBEEF[txid])
 }
 
 // MinedBEEF returns a synthetic mined BEEF: a marker, the txid, the stored
@@ -201,4 +250,31 @@ func (t *Treasury) MinedBEEF(_ context.Context, txid chainhash.Hash, unminedBEEF
 	out := append([]byte("mock-mined-beef-"), txid[:]...)
 	out = append(out, unminedBEEF...)
 	return append(out, merklePath...), nil
+}
+
+// splitTx builds a real (unsigned, unfunded) split transaction: one dummy
+// input spending a random outpoint, then one puzzle output per row and no
+// change. It returns the preimages so Build can derive the unlocking scripts.
+func splitTx(seed fuel.Seed, req treasury.MintRequest) (*transaction.Transaction, [][fuel.PreimageSize]byte) {
+	var rnd [32]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		panic("mock: crypto/rand failed: " + err.Error())
+	}
+	src := chainhash.Hash(sha256.Sum256(rnd[:]))
+	tx := transaction.NewTransaction()
+	tx.AddInput(&transaction.TransactionInput{
+		SourceTXID:       &src,
+		SourceTxOutIndex: 0,
+		SequenceNumber:   0xffffffff,
+		UnlockingScript:  script.NewFromBytes([]byte{0x51}), // OP_TRUE placeholder
+	})
+	pres := make([][fuel.PreimageSize]byte, req.Count)
+	for i := range pres {
+		pres[i] = fuel.Preimage(seed, uint32(i)) //nolint:gosec // count is small
+		tx.AddOutput(&transaction.TransactionOutput{
+			Satoshis:      req.Denomination,
+			LockingScript: script.NewFromBytes(fuel.PuzzleLock(fuel.PuzzleHash(pres[i]))),
+		})
+	}
+	return tx, pres
 }

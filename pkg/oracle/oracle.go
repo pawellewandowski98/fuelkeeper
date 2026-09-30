@@ -74,9 +74,28 @@ type TxStatus struct {
 	MerklePath []byte
 	// CompetingTxs lists txids competing for the same inputs, when known.
 	CompetingTxs []string
+	// Inputs lists the outpoints the transaction spends, when the oracle can
+	// supply them (a node that serves the raw transaction can; a gateway that
+	// only tracks broadcast status cannot). nil means unknown, never "no
+	// inputs". Callers that resolve a fuel row to spent because a txid is
+	// mined must, when Inputs is non-nil, also check that the row's outpoint
+	// is among them; otherwise any mined txid could be passed off as the
+	// spender of an unrelated outpoint.
+	Inputs []store.Outpoint
 }
 
-// Oracle is implemented by teranode/arcade/woc clients (Plan 5), Mock and None.
+// InputsResolver is implemented by oracles that can list the outpoints a
+// transaction spends (a node that serves raw transactions). It is optional:
+// the reaper asks it only when it is about to resolve a row to spent by a
+// mined txid whose TxStatus.Inputs is nil, so the watcher's frequent Tx
+// checks never pay for a raw-transaction fetch. It returns nil (unknown)
+// with a nil error when the transaction is not known, and a non-nil,
+// possibly empty slice otherwise; an error means it could not check.
+type InputsResolver interface {
+	TxInputs(ctx context.Context, txid chainhash.Hash) ([]store.Outpoint, error)
+}
+
+// Oracle is implemented by teranode/arcade/composite clients, Mock and None.
 type Oracle interface {
 	// Outpoints returns one Result per input outpoint, in input order.
 	Outpoints(ctx context.Context, ops []store.Outpoint) ([]Result, error)

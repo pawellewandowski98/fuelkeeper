@@ -64,6 +64,9 @@ func TestPoolConfigDefaultsAndValidate(t *testing.T) {
 	bad = c
 	bad.SpendPolicy = "maybe"
 	require.Error(t, bad.Validate())
+	bad = c
+	bad.ExpectedTPS = -1
+	require.Error(t, bad.Validate())
 
 	ic := pool.DefaultInstanceConfig()
 	require.NoError(t, ic.Validate())
@@ -101,4 +104,25 @@ func TestPoolConfigDefaultsAndValidate(t *testing.T) {
 	var fc pool.Clock = pool.ClockFunc(func() time.Time { return time.Unix(42, 0) })
 	assert.Equal(t, time.Unix(42, 0), fc.Now())
 	assert.WithinDuration(t, time.Now(), pool.RealClock{}.Now(), time.Second)
+}
+
+// TestPoolConfigNameCharset checks the routable-path-segment charset enforced
+// on pool.Config.Name: it must start with a letter or digit, contain only
+// letters, digits, '_', '.', '-', be at most 64 bytes, and never be exactly
+// "." or ".." (reserved path segments that cannot be routed).
+func TestPoolConfigNameCharset(t *testing.T) {
+	valid := []string{"main", "Main-1", "a", "pool_1.default", strings.Repeat("a", 64)}
+	for _, name := range valid {
+		c := pool.DefaultPoolConfig(name, 50)
+		require.NoError(t, c.Validate(), "expected %q to be a valid pool name", name)
+	}
+
+	invalid := []string{
+		"", ".", "..", "-leading-dash", "_leading-underscore", ".leading-dot",
+		"has space", "has/slash", "has?query", strings.Repeat("a", 65),
+	}
+	for _, name := range invalid {
+		c := pool.DefaultPoolConfig(name, 50)
+		require.Error(t, c.Validate(), "expected %q to be rejected as a pool name", name)
+	}
 }

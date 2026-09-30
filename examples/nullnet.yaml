@@ -1,0 +1,47 @@
+# Nullnet configuration: FuelKeeper in development mode with in-memory storage and mocked oracle/treasury.
+# Use this for testing and local development. Never use in production.
+
+instance:
+  rescan_interval: 1s
+
+store:
+  backend: memory
+
+pools:
+  - name: main
+    denomination: 50
+    split_size: 100
+    target_available: 1000
+    low_water: 500
+    spend_policy: trust
+
+jobs:
+  enabled: true
+  lease_ttl: 10s
+  reaper:
+    interval: 1s
+    grace: 2s
+    quarantine_min_age: 2s
+    min_unspent_age: 2s
+  watcher:
+    interval: 1s
+  minter:
+    interval: 2s
+    max_per_round: 5
+    max_pending_shards: 20
+
+oracle:
+  kind: mock
+  mock:
+    assume_unspent: true
+
+treasury:
+  kind: mock
+  mock:
+    confirm_after: 500ms
+
+api:
+  listen: "127.0.0.1:8080"
+
+log:
+  level: info

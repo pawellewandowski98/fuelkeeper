@@ -1916,3 +1916,9 @@ git commit -m "feat(store): factory entries for pebble, mongodb and aerospike; C
 
 5. `2026-09-29-05-treasury.md`
 6. `2026-09-29-06-demo-benchmarks-docs.md`
+
+## Facts carried from the Plan 3 final review (2026-10-01)
+
+- Add `factory.Config.Validate()` (backend known; sqlite path / postgres dsn / pebble path / mongodb uri+database / aerospike hosts+namespace required) and make `config.Validate` call it, so the backend switch and its error text live in one place; the Plan 4 factory entries must also update `pkg/config` (the YAML `store:` section), `docs/OPERATIONS.md` (topologies, durability notes) and the README backend matrix.
+- `sqlite.Config`/`postgres.Config` gained yaml tags (`path`, `sync`, `dsn`, `max_conns`); new backends must ship yaml tags from the start.
+- Names (pool, holder, lease) must be valid UTF-8 without NUL (shared validators); pre-epoch times are rejected; the conformance suite pins both.
