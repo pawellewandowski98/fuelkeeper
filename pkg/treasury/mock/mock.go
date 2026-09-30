@@ -86,7 +86,9 @@ func (t *Treasury) Build(_ context.Context, req treasury.MintRequest) (*treasury
 		return nil, t.failBuild
 	}
 	var rnd [32]byte
-	_, _ = rand.Read(rnd[:])
+	if _, err := rand.Read(rnd[:]); err != nil {
+		panic("mock: crypto/rand failed: " + err.Error())
+	}
 	sum := sha256.Sum256(rnd[:])
 	txid, _ := chainhash.NewHash(sum[:])
 	seed := fuel.NewSeed()
@@ -121,15 +123,33 @@ func (t *Treasury) Build(_ context.Context, req treasury.MintRequest) (*treasury
 	return cloneBuilt(b), nil
 }
 
-// cloneBuilt returns a copy of b whose Rows slice is independent of b's, so a
-// caller that appends to or reorders the returned Rows cannot corrupt the
-// mock's internal record.
+// cloneBuilt returns a deep copy of b: the Rows slice, Shard.BEEF, RawTx and
+// each row's LockingScript/UnlockingScript are all freshly allocated, so the
+// returned BuiltShard shares no memory with the mock's internal record. A
+// caller that mutates the returned value in any way — reordering or
+// appending to Rows, writing into a script or into BEEF/RawTx — cannot
+// corrupt what the mock has on file for this txid.
 func cloneBuilt(b *treasury.BuiltShard) *treasury.BuiltShard {
-	rows := make([]store.Row, len(b.Rows))
-	copy(rows, b.Rows)
 	clone := *b
-	clone.Rows = rows
+	clone.Shard.BEEF = cloneBytes(b.Shard.BEEF)
+	clone.RawTx = cloneBytes(b.RawTx)
+	clone.Rows = make([]store.Row, len(b.Rows))
+	for i, r := range b.Rows {
+		r.LockingScript = cloneBytes(r.LockingScript)
+		r.UnlockingScript = cloneBytes(r.UnlockingScript)
+		clone.Rows[i] = r
+	}
 	return &clone
+}
+
+// cloneBytes returns an independent copy of b, or nil for a nil/empty b.
+func cloneBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
 }
 
 // Send records a broadcast of a previously built split.

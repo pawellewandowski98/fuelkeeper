@@ -64,3 +64,19 @@ func TestMockBuildAndSend(t *testing.T) {
 	assert.Equal(t, 2, m.Built(), "two successful builds")
 	assert.NotEqual(t, built.Shard.TxID, built2.Shard.TxID)
 }
+
+// TestMockCrossShardIndependence checks that two builds use independent seeds:
+// an unlocking script minted for one shard must not satisfy a locking script
+// minted for a different shard.
+func TestMockCrossShardIndependence(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+
+	a, err := m.Build(ctx, treasury.MintRequest{Pool: "main", Denomination: 50, Count: 1})
+	require.NoError(t, err)
+	b, err := m.Build(ctx, treasury.MintRequest{Pool: "main", Denomination: 50, Count: 1})
+	require.NoError(t, err)
+
+	assert.False(t, fuel.VerifyPuzzle(a.Rows[0].LockingScript, b.Rows[0].UnlockingScript),
+		"b's unlocking script must not satisfy a's locking script")
+}
