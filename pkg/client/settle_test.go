@@ -174,6 +174,46 @@ func TestSettleTrustDoubleSpendFallsBackToTxID(t *testing.T) {
 	assert.Equal(t, own, row.SpentBy.String())
 }
 
+// TestSettleTrustDoubleSpendSkipsMalformedCandidates checks that a
+// malformed entry earlier in CompetingTxIDs does not make Settle give up
+// with ErrSettleTxIDRequired: it falls through to the first well-formed
+// candidate -- another CompetingTxIDs entry first, then TxID -- rather than
+// only ever looking at CompetingTxIDs[0].
+func TestSettleTrustDoubleSpendSkipsMalformedCandidates(t *testing.T) {
+	srv, st := startSettleAPI(t)
+	var reqs atomic.Int32
+	fk := countingClient(t, srv, &reqs)
+	valid := storetest.NewTxID().String()
+
+	t.Run("later competitor entry", func(t *testing.T) {
+		token, outpoint := reserveOne(t, fk, "trust")
+		n, err := fk.Settle(context.Background(), "trust", token, []string{outpoint}, client.Settlement{
+			Outcome:        client.OutcomeDoubleSpend,
+			TxID:           storetest.NewTxID().String(),
+			CompetingTxIDs: []string{"not-hex", valid},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+		row := getRow(t, st, "trust", outpoint)
+		require.NotNil(t, row.SpentBy)
+		assert.Equal(t, valid, row.SpentBy.String())
+	})
+
+	t.Run("falls back to TxID", func(t *testing.T) {
+		token, outpoint := reserveOne(t, fk, "trust")
+		n, err := fk.Settle(context.Background(), "trust", token, []string{outpoint}, client.Settlement{
+			Outcome:        client.OutcomeDoubleSpend,
+			TxID:           valid,
+			CompetingTxIDs: []string{"not-hex", "also-not-hex"},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+		row := getRow(t, st, "trust", outpoint)
+		require.NotNil(t, row.SpentBy)
+		assert.Equal(t, valid, row.SpentBy.String())
+	})
+}
+
 // TestSettleTrustNotBroadcastReleases checks that OutcomeNotBroadcast
 // releases the row back to available.
 func TestSettleTrustNotBroadcastReleases(t *testing.T) {

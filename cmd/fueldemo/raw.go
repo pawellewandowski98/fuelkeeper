@@ -192,32 +192,53 @@ func (r *rawRunner) reportSettle(ctx context.Context, token, outpoint string, s 
 // worker runs one raw-mode round-trip loop until ctx is done: reserve a
 // batch of fuel, spend every output into its own OP_RETURN transaction
 // submitted to arcade in extended format, and report the outcome to fk via
-// Settle. Outputs that could not be spent at all (rate limiting cut short by
-// ctx, a transport failure, arcade backpressure, or a rejection that names
-// no competing transaction) are released back to the pool at the end of the
-// batch; a rejection identifying a double-spend is reported spent by the
-// competitor instead -- never released, since a spent output released back
-// to the pool would be handed to every later consumer, each failing the
-// same way in turn (see the RejectError and 2xx-with-a-verdict cases below).
+// Settle.
 //
-// Against arcade specifically, neither of those double-spend cases fires
+// After a failed PostTx, whether to release an output or merely hold it
+// (OutcomeUnknown -- left reserved, for the reservation's own expiry to
+// resolve) turns on whether the transaction provably never reached arcade:
+//
+//   - *arcadeclient.BackpressureError (arcade's broker shed the request
+//     before accepting it) and a *arcadeclient.RejectError naming no
+//     competitor (a well-formed rejection: arcade parsed the request and
+//     said no before ever accepting it) both mean the transaction never
+//     entered the network -- safe to release, along with a build/EF
+//     failure (never even attempted).
+//   - everything else -- a transport failure that may have happened after
+//     the request body was already sent, ctx ending mid-POST, an
+//     unexpected HTTP status, or a 2xx response this client failed to
+//     decode -- leaves whether arcade ever received (and accepted) the
+//     transaction unknown: it may already be on the network. Releasing it
+//     regardless would hand an already-broadcast output to a later
+//     consumer, whose own attempt to spend it then fails as a double-spend.
+//     So these hold instead (tallied "arcade:unknown") and the reservation
+//     is left to expire; the reaper's requeue rule settles it once its fate
+//     is no longer in doubt.
+//
+// A rejection (or 2xx verdict) identifying a double-spend is reported spent
+// by the competitor instead -- never released, for the same reason (see the
+// RejectError and 2xx-with-a-verdict cases below).
+//
+// Against arcade specifically, none of those double-spend cases fire
 // synchronously today: POST /tx's 4xx body is {error, txid, reason, status,
 // title, detail, type} with no competingTxs, its 202 body is only {txid,
-// status, txStatus}, and a conflict is assigned purely asynchronously (ARC
-// 466, visible later via GET /tx as REJECTED with status 466 and
-// competingTxs) -- arcade has no synchronous DOUBLE_SPEND_ATTEMPTED
-// producer. A synchronous rejection from arcade is therefore always
-// classified invalid (released) here; the correct handling of an
-// arcade-originated double-spend is that Settle(OutcomeBroadcast) already
-// ran at submission time (so the row is spent, or -- under spend_policy:
-// verify -- quarantined pending the oracle), and it is the reaper/oracle
-// that later resolves the 466 conflict, not this worker. The
-// RejectError/SubmitResponse DoubleSpend() branches below exist for
-// forward/other-gateway compatibility (an ARC-compatible gateway other than
-// arcade, or a future arcade version, that does assign a conflict
-// synchronously) and are exercised by TestWorkerRejectDoubleSpendReportsSpend
-// and TestWorkerDoubleSpendReportsSpend against a fake arcade, not live
-// arcade behaviour.
+// status, txStatus}, and arcade has no synchronous DOUBLE_SPEND_ATTEMPTED
+// producer. A conflict is assigned purely asynchronously (ARC error 466),
+// and even then arcade never populates competingTxs or a
+// DOUBLE_SPEND_ATTEMPTED status: what a later GET /tx shows is a REJECTED
+// verdict with status 466 and the teranode rejection reason as a line of
+// free text in ExtraInfo, not a named competitor. A synchronous rejection
+// from arcade is therefore always classified invalid (released) here; the
+// correct handling of an arcade-originated double-spend is that
+// Settle(OutcomeBroadcast) already ran at submission time (so the row is
+// spent, or -- under spend_policy: verify -- quarantined pending the
+// oracle), and it is the reaper/oracle that later resolves the 466 verdict,
+// not this worker. The RejectError/SubmitResponse DoubleSpend() branches
+// below exist for forward/other-gateway compatibility (an ARC-compatible
+// gateway other than arcade, or a future arcade version, that does assign a
+// conflict synchronously) and are exercised by
+// TestWorkerRejectDoubleSpendReportsSpend and TestWorkerDoubleSpendReportsSpend
+// against a fake arcade, not live arcade behaviour.
 func (r *rawRunner) worker(ctx context.Context, id int) {
 	// A small per-worker jitter on the reserve retry pause keeps many
 	// workers that hit the same transient failure from retrying in lockstep.
@@ -268,12 +289,14 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 
 			resp, perr := r.arc.PostTx(ctx, ef)
 			if perr != nil {
-				r.rep.fail("arcade:" + apiCode(perr))
-
 				var backpressure *arcadeclient.BackpressureError
 				var reject *arcadeclient.RejectError
 				switch {
 				case errors.As(perr, &backpressure):
+					// Never queued: arcade's broker shed the request before
+					// accepting it, so it provably never reached the
+					// network. Safe to release.
+					r.rep.fail("arcade:" + apiCode(perr))
 					unused = append(unused, o.Outpoint)
 					sleepBounded(ctx, time.Duration(backpressure.RetryAfter)*time.Second)
 				case errors.As(perr, &reject) && reject.DoubleSpend():
@@ -283,13 +306,28 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 					// but another ARC-compatible gateway might name a
 					// competitor synchronously. Report it spent by the
 					// competitor, never released.
+					r.rep.fail("arcade:" + apiCode(perr))
 					r.reportSettle(ctx, res.Token, o.Outpoint, client.Settlement{
 						Outcome: client.OutcomeDoubleSpend, TxID: tx.TxID().String(), CompetingTxIDs: reject.CompetingTxs,
 					})
-				default:
-					// Rejected as invalid with no competing transaction (or
-					// any other submission failure): safe to release.
+				case errors.As(perr, &reject):
+					// A well-formed rejection: arcade parsed the request
+					// and said no before ever accepting it, naming no
+					// competitor, so it provably never reached the
+					// network. Safe to release.
+					r.rep.fail("arcade:" + apiCode(perr))
 					unused = append(unused, o.Outpoint)
+				default:
+					// Everything else: a transport failure that may have
+					// happened after the request body was already sent,
+					// ctx ending mid-POST, an unexpected HTTP status (e.g.
+					// a 5xx), or a 2xx response this client failed to
+					// decode. Whether arcade ever received (and accepted)
+					// the transaction is unknown -- it may already be on
+					// the network -- so hold rather than release it (see
+					// worker's doc comment): the reservation is left to
+					// expire and the reaper's requeue rule settles it.
+					r.rep.fail("arcade:unknown")
 				}
 				continue
 			}

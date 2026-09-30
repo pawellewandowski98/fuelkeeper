@@ -385,6 +385,46 @@ func TestWorkerRejectedIn2xxReleases(t *testing.T) {
 	}, time.Second, 5*time.Millisecond)
 }
 
+// TestWorkerHoldsOnUncertainSubmission checks that a PostTx failure whose
+// cause leaves the transaction's fate genuinely unknown -- a transport
+// failure that may have happened after the request body was already sent,
+// or the per-call context ending mid-POST -- neither releases nor reports
+// spent its outputs: it is the mutation guard for worker's default case in
+// the PostTx-error switch. Releasing on this default would risk handing an
+// already-broadcast output to a later consumer (who would then fail as a
+// double-spend); reporting it spent would risk burning a row that in fact
+// never reached the network. Rows tried exactly once (the pool then holds
+// no more available rows to retry with) stay StateReserved.
+func TestWorkerHoldsOnUncertainSubmission(t *testing.T) {
+	cases := map[string]error{
+		"connection reset":  errors.New("fake: read tcp 127.0.0.1:1->127.0.0.1:2: connection reset by peer"),
+		"deadline exceeded": fmt.Errorf("fake: post /tx: %w", context.DeadlineExceeded),
+	}
+	for name, postErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv, st, rows := newRawTestEnv(t, 1, 5)
+			fk, err := client.New(srv.URL)
+			require.NoError(t, err)
+			fake := &fakeSubmitter{err: postErr}
+			rep := newReport("raw", "test", 1)
+			r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			r.worker(ctx, 0)
+
+			assert.Zero(t, rep.Sent)
+			assert.Equal(t, int64(5), rep.Failed["arcade:unknown"], "every output tried exactly once: %v", rep.Failed)
+			assert.Zero(t, spentCount(t, st, "main", rows), "an uncertain submission must never be reported spent")
+			got, gerr := st.GetRows(context.Background(), "main", storetest.Ops(rows))
+			require.NoError(t, gerr)
+			for _, row := range got {
+				assert.Equal(t, store.StateReserved, row.State, "an uncertain submission must stay reserved, not released")
+			}
+		})
+	}
+}
+
 // TestWorkerBackpressureReleasesOutputs checks that arcade backpressure is
 // tallied and that the affected outputs are released back to the pool
 // rather than left reserved or reported spent.

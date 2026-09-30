@@ -125,10 +125,21 @@ func TestRunToolboxModeRequiresArcade(t *testing.T) {
 // TestToolboxClassifiesCreateErrors pins classifyCreateError's mapping.
 func TestToolboxClassifiesCreateErrors(t *testing.T) {
 	someTxID := "ab" + strings.Repeat("0", 62)
+	// competitorHigh/competitorLow are valid 64-hex txids (Settle rejects
+	// anything else) given to reviewErr out of order, to prove
+	// classifyCreateError sorts them rather than reporting whichever one
+	// go-wallet-toolbox's storage layer happened to hand back first: its
+	// ReviewActionResult.CompetingTxs is built from a Go map's keys (TB
+	// pkg/storage/internal/actions/process.go's singleTxBroadcastResult,
+	// via pkg/wdk/services_aggregated_postebeef_result.go), so its order is
+	// unspecified.
+	competitorHigh := "dd" + strings.Repeat("0", 62)
+	competitorLow := "cc" + strings.Repeat("0", 62)
 
 	// reviewErr builds a *pkgerrors.ProcessActionError carrying someTxID and
 	// one ReviewActionResult for it, as go-wallet-toolbox's storage layer
-	// would after arcade reviewed a posted transaction.
+	// would after aggregating every enabled broadcaster's verdict for a
+	// posted transaction (see classifyCreateError's doc comment).
 	reviewErr := func(status wdk.ReviewActionResultStatus, competing []string) error {
 		return pkgerrors.NewProcessActionError(nil, []wdk.ReviewActionResult{
 			{TxID: primitives.TXIDHexString(someTxID), Status: status, CompetingTxs: competing},
@@ -141,9 +152,9 @@ func TestToolboxClassifiesCreateErrors(t *testing.T) {
 		want client.Settlement
 	}{
 		"reject with txid, double spend review": {
-			fmt.Errorf("create action failed: %w", reviewErr(wdk.ReviewActionResultStatusDoubleSpend, []string{"cc1", "cc2"})),
+			fmt.Errorf("create action failed: %w", reviewErr(wdk.ReviewActionResultStatusDoubleSpend, []string{competitorHigh, competitorLow})),
 			"reject:double_spend",
-			client.Settlement{Outcome: client.OutcomeDoubleSpend, TxID: someTxID, CompetingTxIDs: []string{"cc1", "cc2"}},
+			client.Settlement{Outcome: client.OutcomeDoubleSpend, TxID: someTxID, CompetingTxIDs: []string{competitorLow, competitorHigh}},
 		},
 		"reject with txid, invalid tx review": {
 			reviewErr(wdk.ReviewActionResultStatusInvalidTx, nil),
@@ -333,6 +344,75 @@ func TestToolboxHoldsOutputsOfUnknownFate(t *testing.T) {
 				assert.Equal(t, store.StateReserved, r.State, "an output of unknown fate must stay reserved")
 			}
 		})
+	}
+}
+
+// TestToolboxSpendBatchInvalidTxReleases checks spendBatch directly (one
+// reservation, one call, no reserve/release loop to race): an invalidTx
+// review result is released back to the pool, not held and not spent. It is
+// the mutation guard for the classifier mapping invalidTx anywhere but
+// OutcomeNotBroadcast: get that wrong and every row stays StateReserved or
+// StateSpent instead of StateAvailable below.
+func TestToolboxSpendBatchInvalidTxReleases(t *testing.T) {
+	someTxID := "ab" + strings.Repeat("0", 62)
+	rejErr := pkgerrors.NewProcessActionError(nil, []wdk.ReviewActionResult{
+		{TxID: primitives.TXIDHexString(someTxID), Status: wdk.ReviewActionResultStatusInvalidTx},
+	}).WithTx(someTxID, nil)
+
+	srv, st, rows, _ := newToolboxFKEnv(t, 3)
+	fk, err := client.New(srv.URL)
+	require.NoError(t, err)
+	rep := newReport("toolbox", "test", 1)
+	tr := &toolboxRunner{fk: fk, w: &fakeCreator{err: rejErr}, pool: "main", batch: 3, rep: rep, memo: []byte{0x00, 0x6a}}
+
+	ctx := context.Background()
+	res, err := fk.Reserve(ctx, "main", client.ReserveRequest{Count: 3, MinCount: 1, TTL: 30 * time.Second})
+	require.NoError(t, err)
+
+	ok := tr.spendBatch(ctx, res)
+
+	assert.Zero(t, ok)
+	assert.Equal(t, int64(3), rep.Failed["reject:invalid"])
+	got, err := st.GetRows(ctx, "main", storetest.Ops(rows))
+	require.NoError(t, err)
+	for _, r := range got {
+		assert.Equal(t, store.StateAvailable, r.State, "an invalidTx review must release its output")
+	}
+}
+
+// TestToolboxSpendBatchDoubleSpendSpendsByCompetitor checks spendBatch
+// directly: a doubleSpend review result is spent by the competitor it
+// named, under trust, never released. This is the mutation guard for the
+// "never release a double-spent output" rule in spendBatch's own switch:
+// mutating its client.OutcomeDoubleSpend case to append to unused (release)
+// instead of calling reportSettle must turn this test red.
+func TestToolboxSpendBatchDoubleSpendSpendsByCompetitor(t *testing.T) {
+	someTxID := "ab" + strings.Repeat("0", 62)
+	competitor := "cd" + strings.Repeat("0", 62)
+	rejErr := pkgerrors.NewProcessActionError(nil, []wdk.ReviewActionResult{
+		{TxID: primitives.TXIDHexString(someTxID), Status: wdk.ReviewActionResultStatusDoubleSpend, CompetingTxs: []string{competitor}},
+	}).WithTx(someTxID, nil)
+
+	srv, st, rows, _ := newToolboxFKEnv(t, 3)
+	fk, err := client.New(srv.URL)
+	require.NoError(t, err)
+	rep := newReport("toolbox", "test", 1)
+	tr := &toolboxRunner{fk: fk, w: &fakeCreator{err: rejErr}, pool: "main", batch: 3, rep: rep, memo: []byte{0x00, 0x6a}}
+
+	ctx := context.Background()
+	res, err := fk.Reserve(ctx, "main", client.ReserveRequest{Count: 3, MinCount: 1, TTL: 30 * time.Second})
+	require.NoError(t, err)
+
+	ok := tr.spendBatch(ctx, res)
+
+	assert.Zero(t, ok)
+	assert.Equal(t, int64(3), rep.Failed["reject:double_spend"])
+	got, err := st.GetRows(ctx, "main", storetest.Ops(rows))
+	require.NoError(t, err)
+	for _, r := range got {
+		assert.Equal(t, store.StateSpent, r.State, "a doubleSpend review must spend, never release, its output")
+		require.NotNil(t, r.SpentBy)
+		assert.Equal(t, competitor, r.SpentBy.String())
 	}
 }
 

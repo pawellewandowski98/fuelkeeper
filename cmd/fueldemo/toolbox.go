@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -292,19 +293,39 @@ func (t *toolboxRunner) Close() {
 //   - a *pkgerrors.ProcessActionError carrying a TxID -- the wallet built,
 //     signed and posted the transaction -- is classified from its
 //     ReviewResults entry for that TxID, when the wallet returned one:
-//     "reject:double_spend" (client.OutcomeDoubleSpend, hinting every
-//     competitor the review named) for status doubleSpend; "reject:invalid"
-//     (client.OutcomeNotBroadcast -- no competing transaction exists, so
-//     it's safe to release) for status invalidTx; "reject:service"
-//     (client.OutcomeUnknown -- arcade's own review service failed, the
-//     toolbox may still post the transaction later) for status
-//     serviceError. Unlike arcade's own synchronous POST /tx response
-//     (which never names a competitor -- see Client.Settle's "When a
-//     double-spend is actually knowable"), go-wallet-toolbox's storage
-//     layer reviews a posted transaction's fate asynchronously (polling for
-//     arcade's later ARC-466 conflict verdict, or via another configured
-//     gateway) before handing back this ProcessActionError, so a doubleSpend
-//     review result here is real and can be trusted immediately.
+//     "reject:double_spend" (client.OutcomeDoubleSpend, hinting the
+//     competitor that sorts first -- see below) for status doubleSpend;
+//     "reject:invalid" (client.OutcomeNotBroadcast -- no competing
+//     transaction exists, so it's safe to release) for status invalidTx;
+//     "reject:service" (client.OutcomeUnknown -- every enabled broadcaster
+//     failed to answer, the toolbox may still post the transaction later)
+//     for status serviceError.
+//
+//     This verdict is set synchronously, at post time, not by polling
+//     arcade later: go-wallet-toolbox's storage layer aggregates every
+//     enabled broadcaster's result for the txid (TB
+//     pkg/storage/internal/actions/process.go's singleTxBroadcastResult)
+//     and, when at least one reported a double-spend, re-verifies it (TB
+//     pkg/storage/internal/actions/process_confirm_double_spends.go's
+//     confirmDoubleSpends -- a single broadcaster can report a false
+//     positive, e.g. WhatsOnChain answering "missing inputs" for a
+//     freshly-chained tx whose parent hasn't propagated yet) before letting
+//     it stay terminal, so a doubleSpend review result here can be trusted
+//     immediately, unlike a bare RejectError/SubmitResponse straight off
+//     arcade's own synchronous HTTP response (see raw.go's worker doc
+//     comment). That said, against the toolbox's own configuration
+//     (servicesConfig enables only arcade), this path realistically never
+//     fires against real arcade: the aggregation only records a
+//     double-spend when a broadcaster's result says so, and arcade's own
+//     synchronous POST /tx response never names a competing transaction, at
+//     submission or otherwise (see Client.Settle's "When a double-spend is
+//     actually knowable"). It stays wired up for other configured gateways
+//     and for arcade's own future evolution. The review's CompetingTxs is
+//     collected from a Go map's keys (unspecified order), so this function
+//     reports a sorted copy: Settle only ever hints the first entry, and
+//     sorting first makes that choice deterministic rather than dependent
+//     on map iteration order.
+//
 //   - a TxID with no matching review result -- e.g. storage failing to
 //     record a transaction it has already broadcast (TB
 //     pkg/storage/internal/actions/process.go:771-775) -- is
@@ -312,13 +333,16 @@ func (t *toolboxRunner) Close() {
 //     regardless of review, as toolbox mode once did, would burn the row
 //     under spend_policy: trust on a mere bookkeeping failure, so its fate
 //     is instead left to the reservation's own expiry.
+//
 //   - "timeout" (client.OutcomeUnknown): the action's own deadline
 //     (actionTimeout) expired; the transaction may or may not have been
 //     posted.
+//
 //   - "underfunded" (client.OutcomeNotBroadcast): wdk.ErrNotEnoughFunds --
 //     the fuel output alone cannot pay the OP_RETURN output plus the fee at
 //     the wallet's fee model (raise the pool denomination or lower
 //     --fee-kb).
+//
 //   - "create" (client.OutcomeNotBroadcast): anything else (input BEEF
 //     verification, a malformed input, storage), all before any broadcast.
 func classifyCreateError(err error) (code string, s client.Settlement) {
@@ -328,8 +352,10 @@ func classifyCreateError(err error) (code string, s client.Settlement) {
 			if rr, ok := reviewResultFor(perr.ReviewResults, perr.TxID); ok {
 				switch rr.Status {
 				case wdk.ReviewActionResultStatusDoubleSpend:
+					competitors := slices.Clone(rr.CompetingTxs)
+					slices.Sort(competitors) // CompetingTxs comes from a Go map's keys; sort for a deterministic hint
 					return "reject:double_spend", client.Settlement{
-						Outcome: client.OutcomeDoubleSpend, TxID: perr.TxID, CompetingTxIDs: rr.CompetingTxs,
+						Outcome: client.OutcomeDoubleSpend, TxID: perr.TxID, CompetingTxIDs: competitors,
 					}
 				case wdk.ReviewActionResultStatusInvalidTx:
 					return "reject:invalid", client.Settlement{Outcome: client.OutcomeNotBroadcast, TxID: perr.TxID}
@@ -495,13 +521,15 @@ func (t *toolboxRunner) spendBatch(ctx context.Context, res *wire.ReserveRespons
 			switch s.Outcome {
 			case client.OutcomeNotBroadcast:
 				unused = append(unused, o.Outpoint) // batched into one Settle call at the end; see release
-			case client.OutcomeUnknown:
+			case client.OutcomeDoubleSpend:
+				// Never released: see classifyCreateError and Settle's doc
+				// comments. Reported immediately, spent by the competitor.
+				t.reportSettle(ctx, res.Token, o.Outpoint, s)
+			default: // client.OutcomeUnknown (and, defensively, anything else)
 				// Left reserved: see classifyCreateError's "timeout",
 				// "reject:unknown" and "reject:service" cases. The
 				// reservation expires and the reaper's quarantine + oracle
 				// path settles it.
-			default: // client.OutcomeDoubleSpend
-				t.reportSettle(ctx, res.Token, o.Outpoint, s)
 			}
 			continue
 		}

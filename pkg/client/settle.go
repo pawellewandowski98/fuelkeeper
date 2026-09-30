@@ -15,16 +15,24 @@ type Outcome int
 // Outcome values. See Settle for the call each one resolves to, and why.
 const (
 	// OutcomeBroadcast means the gateway accepted the transaction:
-	// Settle(TxID).
+	// Settle calls Spend(TxID).
 	OutcomeBroadcast Outcome = iota
-	// OutcomeNotBroadcast means the transaction never reached a gateway, or
-	// was rejected as invalid with no competing transaction: Settle
-	// releases the outpoints.
+	// OutcomeNotBroadcast means the transaction provably never reached a
+	// gateway (it was never sent, or a gateway said so definitively -- a
+	// well-formed rejection with no competing transaction named, or the
+	// gateway's own backpressure/shedding response before it ever accepted
+	// the request), so it is safe to release: Settle releases the
+	// outpoints. If instead the request may have reached the gateway and
+	// simply left its fate unclear -- a transport error after the request
+	// was already sent, a timeout, or a 5xx -- use OutcomeUnknown, not this
+	// one: releasing an output that was in fact already broadcast would
+	// hand it to the next consumer to reserve, whose own attempt to spend
+	// it then fails as a double-spend.
 	OutcomeNotBroadcast
 	// OutcomeDoubleSpend means the broadcast was rejected because an input
 	// was already spent, or because a competing transaction exists: Settle
-	// reports the outpoints spent, hinting the first known competitor (or,
-	// absent one, the consumer's own TxID).
+	// reports the outpoints spent, hinting the first well-formed competitor
+	// (or, absent one, the consumer's own TxID).
 	OutcomeDoubleSpend
 	// OutcomeUnknown means the broadcast was attempted but its fate is not
 	// known (a timeout, or a gateway service error): Settle makes no call.
@@ -58,8 +66,8 @@ type Settlement struct {
 	TxID string
 	// CompetingTxIDs lists transactions known to double-spend TxID, most
 	// preferred first (e.g. the one a gateway itself named). Only consulted
-	// for OutcomeDoubleSpend, where CompetingTxIDs[0] is reported instead of
-	// TxID when present.
+	// for OutcomeDoubleSpend, where the first well-formed entry is reported
+	// instead of TxID.
 	CompetingTxIDs []string
 }
 
@@ -101,7 +109,16 @@ func isHexTxID(s string) bool {
 //   - never Release on a double-spend (OutcomeDoubleSpend): a spent output
 //     released back to the pool would be reserved by the next consumer,
 //     whose own broadcast then fails the exact same way -- and the one
-//     after that, and the one after that.
+//     after that, and the one after that. This holds even when outpoints
+//     spans several fuel inputs of one transaction and only one of them was
+//     the actual conflict: under spend_policy: trust, Settle's one Spend
+//     call still ends every outpoint in the call terminally (spent),
+//     including fuel whose own input was never itself double-spent --
+//     burning it rather than returning it to the pool for reuse. That is
+//     still the right call: the transaction failed to confirm regardless of
+//     which input caused it, so every one of its fuel inputs is gone from
+//     circulation either way, and this Settlement carries no way to tell,
+//     among several outpoints, which input was the innocent one.
 //   - never Spend on a rejection that names no competing transaction
 //     (OutcomeNotBroadcast): under spend_policy: trust a Spend is terminal
 //     the moment the server accepts it -- no oracle ever re-examines it --
@@ -125,17 +142,19 @@ func isHexTxID(s string) bool {
 // Against arcade as it stands, it is not: POST /tx's synchronous responses
 // (both the 4xx rejection body and the 202 accepted body) never carry a
 // competing txid, and a conflict is assigned purely asynchronously (ARC
-// error 466), surfaced later only via a follow-up GET /tx. A consumer
-// submitting through arcade therefore reports OutcomeBroadcast (Spend) the
-// moment arcade accepts the transaction, exactly as it would for any other
-// accepted submission; if a competing transaction turns out to exist, that
-// is discovered afterwards by whoever polls the transaction's fate next
-// (e.g. FuelKeeper's own reaper/oracle, under spend_policy: verify), not by
-// the original consumer calling Settle a second time. OutcomeDoubleSpend
-// exists for gateways (or gateway versions) that do name a competitor
-// synchronously, and for callers -- like a go-wallet-toolbox-backed
-// consumer -- whose own review process learns of one after the fact but
-// before it reports back through Settle.
+// error 466). Even then, arcade never names the competitor: a later GET /tx
+// shows a REJECTED verdict with status 466 and the teranode rejection
+// reason as a line of free text in ExtraInfo, not a populated competingTxs.
+// A consumer submitting through arcade therefore reports OutcomeBroadcast
+// (Spend) the moment arcade accepts the transaction, exactly as it would
+// for any other accepted submission; if a competing transaction turns out
+// to exist, that is discovered afterwards by whoever polls the
+// transaction's fate next (e.g. FuelKeeper's own reaper/oracle, under
+// spend_policy: verify), not by the original consumer calling Settle a
+// second time. OutcomeDoubleSpend exists for gateways (or gateway versions)
+// that do name a competitor synchronously, and for callers -- like a
+// go-wallet-toolbox-backed consumer -- whose own review process learns of
+// one after the fact but before it reports back through Settle.
 func (c *Client) Settle(ctx context.Context, pool, token string, outpoints []string, s Settlement) (int, error) {
 	switch s.Outcome {
 	case OutcomeBroadcast:
@@ -144,11 +163,8 @@ func (c *Client) Settle(ctx context.Context, pool, token string, outpoints []str
 		}
 		return c.Spend(ctx, pool, token, outpoints, s.TxID)
 	case OutcomeDoubleSpend:
-		hint := s.TxID
-		if len(s.CompetingTxIDs) > 0 {
-			hint = s.CompetingTxIDs[0]
-		}
-		if !isHexTxID(hint) {
+		hint, ok := firstValidHint(s.CompetingTxIDs, s.TxID)
+		if !ok {
 			return 0, ErrSettleTxIDRequired
 		}
 		return c.Spend(ctx, pool, token, outpoints, hint)
@@ -159,4 +175,20 @@ func (c *Client) Settle(ctx context.Context, pool, token string, outpoints []str
 	default:
 		return 0, fmt.Errorf("client: invalid settlement outcome %v", s.Outcome)
 	}
+}
+
+// firstValidHint returns the first well-formed txid among candidates, in
+// order, falling back to fallback when none of candidates is. A malformed
+// entry earlier in candidates therefore never masks a well-formed one later
+// in the list, or in fallback.
+func firstValidHint(candidates []string, fallback string) (string, bool) {
+	for _, c := range candidates {
+		if isHexTxID(c) {
+			return c, true
+		}
+	}
+	if isHexTxID(fallback) {
+		return fallback, true
+	}
+	return "", false
 }
