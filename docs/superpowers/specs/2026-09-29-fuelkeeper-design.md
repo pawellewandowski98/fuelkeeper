@@ -350,13 +350,22 @@ type Store interface {
 Per-backend essentials (full sketches from the design review are the
 reference for implementation):
 
-- **Postgres** (pgx): `Reserve` is one `UPDATE … FROM unnest($txids, $vouts,
-  $tokens, $exps) … WHERE (state=0 OR (state=1 AND reserved_by=k.token))
-  RETURNING`; `AcquireShard` is a CTE with `FOR UPDATE SKIP LOCKED`;
-  `Quarantine` likewise. Partial indexes: `(pool, txid, vout) WHERE state=0`,
-  `(pool, expires_at) WHERE state=1`, `(pool, quarantined_at) WHERE state=2`;
-  `fuel_shards (pool, status, created_at)`. EXPLAIN tests pin index use.
-  `synchronous_commit=on` documented as required.
+- **Postgres** (pgx): multi-row operations (`Reserve`, `Release`, `Spend`,
+  `Resolve`, the `RetireShard` cascade) are per-row primary-key updates
+  pipelined in one `pgx.Batch` inside one transaction, processed in sorted
+  `(txid, vout)` order so lock acquisition order is global and deadlock-free
+  (a single `UPDATE … FROM unnest(...)` statement deadlocked under
+  contention because the planner does not honour array order); each per-row
+  statement re-asserts the CAS predicate (`state=0 OR (state=1 AND
+  reserved_by=$tok)`), written as `(state = 1) IS TRUE` where it would
+  otherwise match a partial index and be planned onto it. `AcquireShard` and
+  `Quarantine` use `FOR UPDATE SKIP LOCKED` CTEs. Partial indexes:
+  `(pool, txid, vout) WHERE state=0`, `(pool, expires_at, txid, vout) WHERE
+  state=1`, `(pool, quarantined_at, txid, vout) WHERE state=2`; `fuel_shards
+  (pool, status, created_at, txid)` plus a unique index on `txid`. Schema is
+  versioned and applied under a transaction-scoped advisory lock. EXPLAIN
+  tests pin generic plans of the shipped statements. `synchronous_commit=on`
+  documented as required. All stored times have microsecond precision.
 - **SQLite** (modernc): DSN exactly
   `file:<path>?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)`;
   writer handle `SetMaxOpenConns(1)`, separate reader pool; boot-time pragma

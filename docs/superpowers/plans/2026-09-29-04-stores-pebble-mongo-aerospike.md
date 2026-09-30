@@ -33,6 +33,15 @@ Makefile, .github/workflows/ci.yml (integration matrix)
 
 Shared conventions (same as Plan 1): tx ids stored as raw 32 bytes; times as unix microseconds where the backend has no native timestamp; state/status/lock-mode codes identical; `Caps` as listed per backend.
 
+Lessons from the Postgres and SQLite reviews that every backend here must apply (the finished `pkg/store/postgres` and `pkg/store/sqlite` are the reference, and the conformance suite pins most of them):
+- **Microsecond precision**: truncate every stored time to the microsecond on write (`TimePrecisionMicros` subtest).
+- **Transient error classification**: each backend's `wrap` must map its own driver's retryable failures (timeouts, connection loss, hot-key/transaction conflicts, `context.DeadlineExceeded`, `io.EOF`) to `store.ErrUnavailable`, with a unit test per class; callers retry `ErrUnavailable` and treat everything else as permanent.
+- **Safe Close**: `sync.Once`; never nil the client; calls after Close return the driver's closed error.
+- **Versioned schema/indexes**: keep a version record (Mongo: a `fuel_meta` document; Aerospike: a `fuel_meta` record; Pebble: a `meta/version` key) and apply numbered steps, so index definitions can change later.
+- **Keyset paging for `ListQuarantined`**: order `(quarantined_at, txid bytes, vout)` and make the cursor bound the scan (Pebble: seek to the cursor key; Mongo: `$or` on `qa`/`_id` with a `{p, st, qa, _id}` partial index; Aerospike: range on `qa` from the cursor time plus client-side tuple filter).
+- **Deterministic per-row order** in multi-row operations (`(txid bytes, vout)`), even where the backend has no lock ordering concern, so behaviour and `applied` sets are reproducible.
+- **Plan/index pins** in a backend-specific test where the backend can explain its queries (Mongo `explain()`; Pebble/Aerospike: assert the code paths hit the intended index by construction and cover them with a stress run).
+
 ### Task 1: Pebble backend (`pkg/store/pebble`)
 
 Single process, one write mutex, one batch per mutation. Index keys and per-pool counters are written in the same batch as the row, so they are always consistent with it.
