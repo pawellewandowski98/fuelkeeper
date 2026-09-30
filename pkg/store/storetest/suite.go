@@ -44,7 +44,10 @@ func subtests() []subtest {
 		{"ResolveGuard", testResolveGuard},
 		{"ListAvailablePagination", testListAvailablePagination},
 		{"StatsCounts", testStatsCounts},
-		// Task 6 appends concurrency subtests.
+		{"ReserveExclusivityConcurrent", testReserveExclusivityConcurrent},
+		{"ReserveReleaseCycleConcurrent", testReserveReleaseCycleConcurrent},
+		{"AcquireShardExclusiveConcurrent", testAcquireShardExclusiveConcurrent},
+		{"ReserveVsQuarantineRace", testReserveVsQuarantineRace},
 	}
 }
 
