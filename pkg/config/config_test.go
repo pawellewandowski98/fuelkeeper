@@ -543,7 +543,6 @@ func TestSpendPolicyDefaultFollowsOutpointOracle(t *testing.T) {
 		{"  kind: arcade\n  arcade_url: http://arcade", pool.SpendTrust},
 		{"  kind: composite\n  arcade_url: http://arcade", pool.SpendTrust},
 		{"  kind: composite\n  arcade_url: http://arcade\n  teranode_url: http://teranode", pool.SpendVerify},
-		{"  kind: teranode\n  teranode_url: http://teranode", pool.SpendVerify},
 	}
 	for _, tc := range cases {
 		c, err := config.Parse(oracleYAML(tc.oracle, ""))
@@ -569,7 +568,6 @@ func TestReleaseVerifyNeedsOutpointOracle(t *testing.T) {
 	}
 	for _, o := range []string{
 		"  kind: composite\n  arcade_url: http://arcade\n  teranode_url: http://teranode",
-		"  kind: teranode\n  teranode_url: http://teranode",
 		"  kind: mock",
 	} {
 		_, err := config.Parse(oracleYAML(o, "    release_policy: verify"))
@@ -577,4 +575,18 @@ func TestReleaseVerifyNeedsOutpointOracle(t *testing.T) {
 	}
 	_, err := config.Parse(oracleYAML("  kind: none", "    release_policy: verify"))
 	require.ErrorContains(t, err, "release_policy=verify requires an oracle")
+}
+
+func TestTeranodeOnlyOracleRejectedWhenJobsRun(t *testing.T) {
+	c, err := config.Parse(oracleYAML("  kind: teranode\n  teranode_url: http://teranode", ""))
+	require.ErrorContains(t, err, "oracle.kind teranode cannot report transactions as mined")
+	require.ErrorContains(t, err, "use kind: composite with arcade_url and teranode_url")
+	assert.Nil(t, c)
+
+	// Without jobs nothing waits for a mined verdict: teranode may answer
+	// outpoint queries on its own.
+	c, err = config.Parse(append(oracleYAML("  kind: teranode\n  teranode_url: http://teranode", "    release_policy: verify"),
+		[]byte("jobs: {enabled: false}\n")...))
+	require.NoError(t, err)
+	assert.Equal(t, pool.SpendVerify, c.Pools[0].SpendPolicy)
 }

@@ -342,6 +342,11 @@ func (c *Config) Validate() error {
 	if err := c.Oracle.Validate(); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
+	if c.Oracle.Kind == ofactory.KindTeranode && c.Jobs.Enabled {
+		// The watcher and reaper need a mined verdict, which teranode's
+		// GET /tx never gives.
+		return errors.New("config: oracle.kind teranode cannot report transactions as mined (shards would stay unmined and mined spends would never resolve); use kind: composite with arcade_url and teranode_url")
+	}
 	if c.Treasury.Kind == tfactory.KindToolbox && c.Treasury.Toolbox.ReconcileGrace <= c.Jobs.Minter.BuildTimeout+jobs.ReconcileBudget {
 		// Reconcile's grace only protects a split whose Build and PutShard
 		// finish within it; the minter bounds that window by build_timeout,

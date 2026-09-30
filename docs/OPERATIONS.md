@@ -181,7 +181,7 @@ spend?* (`Tx`, plus the inputs lookup). Not every oracle answers both:
 | `arcade` | never (Unknown) | yes | no |
 | `composite` without `teranode_url` | never (Unknown) | yes (arcade) | no |
 | `composite` with `teranode_url` | yes (teranode) | yes (arcade) | yes (teranode raw tx, fetched only by the reaper) |
-| `teranode` | yes | **never** | yes |
+| `teranode` | yes | **never** | yes; **rejected by config when jobs are enabled** |
 
 What that means for rows (and shards):
 
@@ -192,7 +192,7 @@ What that means for rows (and shards):
 | Release, `release_policy: verify` | an Unspent outpoint verdict | **rejected by config** | requeued after `min_unspent_age` | requeued |
 | Spend, `spend_policy: trust` | nothing | spent at once | spent at once | spent at once |
 | Spend, `spend_policy: verify` | the hinted txid mined, or a Spent verdict | resolved once the hinted txid is mined, **with no input check**: a client hint naming *any* mined txid is trusted; a false hint leaves the row quarantined (none: always quarantined; config rejects verify with none) | resolved once mined, and only if the mined spender's inputs include the outpoint | stays quarantined: teranode never reports Mined |
-| Split shards (watcher) | Mined status | never mined with `none` (use the mock treasury); mined via arcade | mined via arcade | **never mined**: do not use teranode alone |
+| Split shards (watcher) | Mined status | never mined with `none` (use the mock treasury); mined via arcade | mined via arcade | **never mined**, so config rejects `oracle.kind: teranode` whenever jobs are enabled: "oracle.kind teranode cannot report transactions as mined ...; use kind: composite with arcade_url and teranode_url" |
 
 So: use `composite` with `teranode_url` for production. An arcade-only
 oracle (`arcade`, or `composite` without `teranode_url`) is only suitable
