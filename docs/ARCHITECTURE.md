@@ -104,11 +104,19 @@ never leaks either way.
 oracle-proven, **mined** spend retires a row, with one exception: a hinted
 row (`spend_policy=verify`) whose own transaction is rejected because one of
 its inputs is already spent is retired too, `SpentBy` the hint itself (not
-the unknown spender) -- the reaper assumes the client's own reserved fuel
-output was the input that was spent, unless the evidence says otherwise (a
-mined competitor, or the hint's own known inputs, that provably spend some
-*other* input instead, which holds the row for a later tick rather than
-retiring it). Short of that one exception, a candidate spending txid --
+the unknown spender), decided in this order: (a) the hint's own known inputs
+exclude the fuel output -- holds the row (it says nothing about this
+output); (b) the gateway named the spent inputs
+(`oracle.TxStatus.SpentInputs`, parsed from arcade's `UTXO_SPENT` line) --
+includes the fuel output: retire it (confirmed); excludes it: requeue it
+like an invalid transaction after `hint_patience` (confirmed untouched, this
+outranks (c)); (c) no named spent inputs, but a mined competitor provably
+spends only some *other* input -- holds the row; (d) otherwise (the gateway
+named no spent input at all) the fuel output is assumed gone and the row is
+retired -- the bounded-loss case: an honest wallet whose transaction died on
+an unrelated input, against a gateway that does not name which input, still
+loses this one fuel output. Short of that one exception, a candidate
+spending txid --
 whether it is the outpoint oracle's own `SpendingTxID` or a client's
 `SpentHint` used as a fallback -- is confirmed via `Oracle.Tx` and must be
 `Known && Mined && !Rejected`; a mempool-only spend is never enough on its
@@ -412,13 +420,24 @@ teranode connection is never assumed, only an optional, opt-in accelerator.
 Arcade answers `Tx` only (mined/rejected/competing lifecycle, and the
 watcher's proof source); its `Outpoints` always answers Unknown, since it
 keeps no UTXO index. Rejections are classified into an `oracle.RejectReason`
-from arcade's numeric ARC error code: `inputs_spent` (code 466, a
-double-spend: the fuel output is assumed gone) or `tx_invalid` (most other
-codes: a format/fee/policy failure, inputs untouched) -- arcade never
-reports a competing transaction synchronously, only later, via a follow-up
-GET /tx (see `pkg/oracle/arcade/arcade.go`'s `rejectReasonForCode` table and
-`docs/CLIENTS.md#when-your-broadcast-fails`). Used alone, arcade therefore
-never directly confirms an outpoint spent or unspent; the reaper instead
+from arcade's numeric ARC error code plus, for code 466, the underlying
+teranode rejection line verbatim in `extraInfo` (arcade reuses 466 for four
+distinct teranode verdicts, so the code alone is not enough): `UTXO_SPENT`,
+`TX_CONFLICTING` and `TX_INVALID_DOUBLE_SPEND` classify `inputs_spent` (an
+already-decided ownership of the input); `TX_LOCKED` (the parent
+transaction's own commit still in flight, not a decided spend), 467
+(ambiguous between a real invalid tx and arcade's own internal fault), 476
+(not final) and an unparsable `extraInfo` all classify `unknown`; every
+other classifiable code classifies `tx_invalid` (a format/fee/policy
+failure, inputs untouched). When a `UTXO_SPENT` line names the spender, the
+oracle also fills `oracle.TxStatus.SpentInputs` with the specific
+outpoint(s) reported spent and appends the spender to `CompetingTxs` --
+arcade never populates `competingTxs` or a `DOUBLE_SPEND_ATTEMPTED` status
+on its own, synchronously or otherwise; what actually carries a double-spend
+verdict is this REJECTED/466/`extraInfo` shape on a later GET /tx (see
+`pkg/oracle/arcade/arcade.go`'s `rejectReasonForCode`/`rejectReasonFor466`
+tables and `docs/CLIENTS.md#when-your-broadcast-fails`). Used alone, arcade
+therefore never directly confirms an outpoint spent or unspent; the reaper instead
 resolves what it can from `Tx(hint)` (hinted rows) and requeues what it
 cannot after `unknown_requeue_age`/`hint_max_wait` (unhinted and
 exhausted-hinted rows respectively) -- quarantine does not grow without

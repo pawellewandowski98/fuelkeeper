@@ -79,26 +79,38 @@ server for the same error.
 |---|---|---|---|
 | Gateway accepted the transaction | `Outcome: OutcomeBroadcast, TxID: txid` | `createAction` returned normally (no `WERR_REVIEW_ACTIONS`), or a review result with status `success` | `Spend(token, outpoints, txid)`: reserved -> quarantined (hint), or straight to `spent` under `spend_policy: trust` |
 | The transaction provably never reached a gateway: it was never sent, or a gateway said so definitively -- a well-formed rejection naming no competing transaction (bad format/script/fee/policy; the output itself is untouched), or backpressure/shedding before the request was ever accepted | `Outcome: OutcomeNotBroadcast` | `WERR_REVIEW_ACTIONS` review result status `invalidTx` | `Release(token, outpoints)`: reserved -> available (or, under `release_policy: verify`, quarantined and requeued once the oracle/reaper confirms it -- see `docs/OPERATIONS.md`'s oracle x policy table) |
-| Rejected because an input was already spent, or a competing transaction is known | `Outcome: OutcomeDoubleSpend, TxID: txid, CompetingTxIDs: [...]` (the first well-formed competitor is reported; falls back to `TxID` when none of `CompetingTxIDs` is well-formed) | `WERR_REVIEW_ACTIONS` review result status `doubleSpend` (`CompetingTxIDs` from its `competingTxs`) | `Spend(token, outpoints, hint)`: reserved -> quarantined (hint); the reaper resolves it to `spent` once it can prove the fuel output is gone (a mined competitor, or the hint itself rejected with inputs spent) |
-| Fate not known: the request may have already reached the gateway and its outcome is simply unclear -- a transport error or timeout *after* sending, a `5xx`, or the gateway's own review service failed | `Outcome: OutcomeUnknown` | `WERR_REVIEW_ACTIONS` review result status `serviceError`, or the action's own deadline expired | No call. The reservation is left in place; if it is never settled, it expires and resolves through the reaper's usual quarantine/requeue path (see below) |
+| Rejected because an input was already spent, or a competing transaction is known | `Outcome: OutcomeDoubleSpend, TxID: txid, CompetingTxIDs: [...]` (the first well-formed competitor is reported; falls back to `TxID` when none of `CompetingTxIDs` is well-formed) | `WERR_REVIEW_ACTIONS` review result status `doubleSpend` (`CompetingTxIDs` from its `competingTxs`) | `Spend(token, outpoints, hint)`: reserved -> quarantined (hint); the reaper resolves it to `spent` once it can prove the fuel output is gone -- a mined competitor, a gateway that names the spent inputs and this outpoint is among them, or (failing either) the bounded-loss assumption that the client's own rejected input was this one (see `docs/OPERATIONS.md`'s reaper lifecycle table, rule 3) |
+| Fate not known: the request may have already reached the gateway and its outcome is simply unclear -- a transport error *after* the request was already sent, `ctx` ending mid-request, an unexpected HTTP status such as a `5xx`, or a 2xx response your own client failed to decode | `Outcome: OutcomeUnknown` | `WERR_REVIEW_ACTIONS` review result status `serviceError`, or the action's own deadline expired | No call. The reservation is left in place; if it is never settled, it expires and resolves through the reaper's usual quarantine/requeue path (see below) |
 
-**Do not treat an ambiguous failure as "not broadcast."** If the request
-might have reached the gateway before failing, report `OutcomeUnknown`, not
+**Do not treat an ambiguous failure as "not broadcast."** Release only once
+you know the transaction definitely never reached a gateway (`docs/API.md`
+uses this same wording); if you're not sure -- a timeout, a `5xx` -- make no
+call and let the reservation expire instead. If the request might have
+reached the gateway before failing, report `OutcomeUnknown`, not
 `OutcomeNotBroadcast`: releasing an output that was in fact already
 broadcast hands it to the next consumer, whose own attempt to spend it then
 fails as a double-spend. `OutcomeNotBroadcast` is only for a gateway's
-definitive "no" (or a request that never went out at all).
+definitive "no" (or a request that never went out at all). `cmd/fueldemo`'s
+raw-mode worker (`pkg/client`'s own reference consumer) draws this same
+line: a `*arcadeclient.BackpressureError`, or a well-formed rejection naming
+no competitor, is `OutcomeNotBroadcast`; a transport failure, `ctx` ending
+mid-POST, an unexpected status, or an undecodable 2xx body is
+`OutcomeUnknown`.
 
 **Against arcade specifically**, a double-spend is not knowable at
 submission time: POST /tx's synchronous responses never carry a competing
 txid, so a consumer submitting straight through arcade reports
 `OutcomeBroadcast` the moment arcade accepts the transaction, exactly like
-any other accepted submission. If a competing transaction turns out to
-exist, that surfaces later, via GET /tx answering REJECTED (ARC code 466) --
-discovered by whoever next polls the transaction's fate (FuelKeeper's own
-reaper, under `spend_policy: verify`), not by the original consumer calling
-`Settle` a second time. `OutcomeDoubleSpend` exists for gateways that do name
-a competitor synchronously, and for a go-wallet-toolbox-backed consumer
+any other accepted submission. Arcade never populates `competingTxs` or a
+`DOUBLE_SPEND_ATTEMPTED` status at all, synchronously or otherwise; what a
+later GET /tx actually shows is a REJECTED verdict with ARC code 466 and the
+underlying teranode rejection line verbatim in `extraInfo` (e.g.
+`UTXO_SPENT (70): <txid>:<vout> utxo already spent by tx <spender>[<vin>]`),
+which FuelKeeper's own oracle parses for the spent outpoint and, when named,
+the spender -- discovered by whoever next polls the transaction's fate
+(FuelKeeper's own reaper, under `spend_policy: verify`), not by the original
+consumer calling `Settle` a second time. `OutcomeDoubleSpend` exists for
+gateways that do name a competitor synchronously, and for a go-wallet-toolbox-backed consumer
 whose own asynchronous review process (`WERR_REVIEW_ACTIONS`) learns of one
 after the fact but before it calls `Settle`.
 

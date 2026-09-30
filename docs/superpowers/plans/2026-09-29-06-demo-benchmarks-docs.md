@@ -1125,12 +1125,43 @@ Commit: `docs: clients guide, architecture, changelog and README for 0.1.0`.
   `unknown_requeue_age`). Verify policies are still rejected outright for
   `oracle.kind: none`; a teranode-only oracle is rejected whenever
   `jobs.enabled` is true.
-- Arcade never reports a competing tx synchronously: a double-spend appears
-  later via GET /tx as REJECTED, ARC code 466. `rejectReasonForCode` maps
-  466 -> `RejectReasonInputsSpent`; 462 (coinbase/input-script policy),
-  465/467/471-474 etc -> `RejectReasonTxInvalid`; 476 (not final) and any
-  unmapped code -> `RejectReasonUnknown`. `RejectReasonTxInvalid` is
-  evidence about one submission to one gateway, not a global verdict.
+- Arcade never reports a competing tx synchronously, and never populates
+  `competingTxs` or `DOUBLE_SPEND_ATTEMPTED` at all, even asynchronously: a
+  double-spend appears later via GET /tx as REJECTED, ARC code 466, with
+  the underlying teranode rejection line verbatim in `extraInfo` (e.g.
+  `UTXO_SPENT (70): <txid>:<vout> utxo already spent by tx
+  <spender>[<vin>]`). 466 alone is not enough to classify (arcade reuses it
+  for four distinct teranode verdicts): `rejectReasonFor466` parses
+  `extraInfo`'s leading name -- `UTXO_SPENT`, `TX_CONFLICTING`,
+  `TX_INVALID_DOUBLE_SPEND` -> `RejectReasonInputsSpent`; `TX_LOCKED`
+  (transient: the parent tx's own commit is still in flight) and an
+  unparsable/empty `extraInfo` -> `RejectReasonUnknown`. `rejectReasonForCode`
+  maps 462 (coinbase/input-script policy), 465/468/469/471-475 etc ->
+  `RejectReasonTxInvalid`; 467 (ambiguous: a real invalid tx, or arcade's
+  own internal processing fault) and 476 (not final) ->
+  `RejectReasonUnknown`. `RejectReasonTxInvalid` is evidence about one
+  submission to one gateway, not a global verdict. When a `UTXO_SPENT` line
+  names the spender, `oracle.TxStatus.SpentInputs` carries the specific
+  spent outpoint(s) and the spender is appended to `CompetingTxs`.
+- Reaper rule 3 (hinted row rejected `RejectReasonInputsSpent`) is ordered
+  a-d: (a) the hint's own known inputs exclude the fuel output -> hold
+  `hint_pending`; (b) `SpentInputs` non-nil: includes the fuel output ->
+  retired `inputs_spent` (`SpentBy` = the attempt); excludes it or empty ->
+  treated like an invalid tx, `rejected_fresh` then requeued `rejected`
+  after `hint_patience` (this outranks (c)); (c) no named spent inputs but
+  a mined competitor provably spends only other inputs -> hold
+  `hint_pending`; (d) otherwise (no named spent inputs, no excluding
+  competitor) -> retired `inputs_spent`, the bounded-loss case: an honest
+  wallet whose tx died on another input, against a gateway that does not
+  name it, still loses that one fuel output.
+- `cmd/fueldemo` raw mode now holds (no `Settle` call; `OutcomeUnknown`)
+  rather than releasing on anything that might mean the transaction already
+  reached arcade: a transport error after the request was sent, `ctx`
+  ending mid-POST, an unexpected HTTP status (e.g. a `5xx`), or an
+  undecodable 2xx body. Only a `*arcadeclient.BackpressureError` or a
+  well-formed rejection naming no competitor (both provably "never
+  reached/accepted") release. `docs/API.md` and `docs/CLIENTS.md` were
+  updated to state this same rule for wallet authors.
 - New metrics: `fuelkeeper_reaper_requeued_total{pool,reason}` (`unspent`,
   `unknown_aged`, `rejected`, `hint_expired`); `fuelkeeper_reaper_spent_total
   {pool,source}` (`oracle`, `hint`, `competitor`, `inputs_spent`); gauge

@@ -209,16 +209,34 @@ spend?* (`Tx`, plus the inputs lookup). Not every oracle answers both:
 | `composite` with `teranode_url` | yes (teranode) | yes (arcade) | yes (teranode raw tx, fetched only by the reaper) |
 | `teranode` | yes | **never** | yes; **rejected by config when jobs are enabled** |
 
-Arcade never reports a competing transaction synchronously: POST /tx's 4xx
-and 202 bodies never carry one, so a double-spend only appears later, via a
-follow-up GET /tx answering REJECTED with ARC code 466 (mapped to
-`RejectReasonInputsSpent`; every other classifiable code maps to
-`RejectReasonTxInvalid`, except 476 "not final", which maps to
-`RejectReasonUnknown` because the transaction may still become valid once
-its locktime passes). A consumer submitting through arcade therefore reports
-its broadcast as accepted the moment arcade accepts it; a later double-spend
-is discovered by whoever next polls the transaction's fate (FuelKeeper's own
-reaper, or the consumer's own review process) -- see
+Arcade never reports a competing transaction synchronously, and never
+populates `competingTxs` or a `DOUBLE_SPEND_ATTEMPTED` status at all, even
+asynchronously: POST /tx's 4xx and 202 bodies never carry a competitor, so a
+double-spend only appears later, via a follow-up GET /tx answering REJECTED
+with ARC code 466 and the underlying teranode rejection line verbatim in
+`extraInfo` (e.g. `UTXO_SPENT (70): <txid>:<vout> utxo already spent by tx
+<spender>[<vin>]`). 466 alone is not enough to classify: arcade reuses it
+for four distinct teranode verdicts, so the oracle parses `extraInfo`'s
+leading name to tell them apart -- `UTXO_SPENT`, `TX_CONFLICTING` and
+`TX_INVALID_DOUBLE_SPEND` map to `RejectReasonInputsSpent` (an
+already-decided ownership of the input); `TX_LOCKED` maps to
+`RejectReasonUnknown` (transient: the parent transaction's own commit is
+still in flight in teranode's store, not a decided spend) -- as does an
+empty or unparsable `extraInfo`. Every other classifiable code maps to
+`RejectReasonTxInvalid`, except 467 (generic: ambiguous between a real
+`TX_INVALID` and arcade's own internal processing fault, so it maps to
+`RejectReasonUnknown` too) and 476 "not final" (also `RejectReasonUnknown`,
+because the transaction may still become valid once its locktime passes).
+When a `UTXO_SPENT` line names the spender, the oracle also fills
+`oracle.TxStatus.SpentInputs` (the specific outpoint(s) reported spent) and
+appends the spender to `CompetingTxs`; `TX_CONFLICTING`/
+`TX_INVALID_DOUBLE_SPEND` lines classify `InputsSpent` but are not parsed
+for detail, so `SpentInputs` stays nil for those. See
+`pkg/oracle/arcade/arcade.go`'s `rejectReasonForCode`/`rejectReasonFor466`
+for the full code table. A consumer submitting through arcade therefore
+reports its broadcast as accepted the moment arcade accepts it; a later
+double-spend is discovered by whoever next polls the transaction's fate
+(FuelKeeper's own reaper, or the consumer's own review process) -- see
 [CLIENTS.md](CLIENTS.md#when-your-broadcast-fails).
 
 **What each policy does, per oracle, and after what delay:**
@@ -323,8 +341,11 @@ rows" doc comment):
 | 1 | Hint mined, but its inputs exclude the outpoint (mismatch) | held | -- | `reaper_held{reason="hint_pending"}` |
 | 2 | Hint has competing transactions; one is mined and spends the outpoint (or its inputs are unknown, trusted) | spent | immediate | `reaper_spent_total{source="competitor"}` |
 | 2 | Hint has competing transactions; none is mined yet | held | -- | `reaper_held{reason="competitor_pending"}` |
-| 3 | Hint rejected `inputs_spent` (ARC 466), nothing shows the fuel output itself is untouched | spent (the fuel output is assumed gone) | immediate | `reaper_spent_total{source="inputs_spent"}` |
-| 3 | Hint rejected `inputs_spent`, but a mined competitor or the hint's own inputs show the fuel output is *not* the one spent | held | -- | `reaper_held{reason="hint_pending"}` |
+| 3a | Hint rejected `inputs_spent`, and the hint's own known inputs exclude the fuel output | held (the hint says nothing about this output) | -- | `reaper_held{reason="hint_pending"}` |
+| 3b | Hint rejected `inputs_spent`, gateway named the spent inputs (`SpentInputs` non-nil) and they *include* the fuel output | spent (the fuel output is confirmed gone) | immediate | `reaper_spent_total{source="inputs_spent"}` |
+| 3b | Hint rejected `inputs_spent`, gateway named the spent inputs and they *exclude* the fuel output (or `SpentInputs` is an empty, non-nil list) | requeued, like an invalid tx (this evidence outranks 3c) | `hint_patience` (10m default); held (`rejected_fresh`) before that | `reaper_requeued_total{reason="rejected"}` |
+| 3c | Hint rejected `inputs_spent`, gateway named no spent inputs (`SpentInputs` nil), but a mined competitor provably spends only some *other* input | held | -- | `reaper_held{reason="hint_pending"}` |
+| 3d | Hint rejected `inputs_spent`, gateway named no spent inputs and no mined competitor excludes the fuel output | spent (bounded-loss case: the fuel output is assumed gone; `SpentBy` is the hint itself, not the unnamed spender) | immediate | `reaper_spent_total{source="inputs_spent"}` |
 | 4 | Hint rejected `tx_invalid` (fee/format/policy; inputs untouched) | requeued | `hint_patience` (10m default) since quarantined; held (`rejected_fresh`) before that | `reaper_requeued_total{reason="rejected"}` |
 | 5 | Hint rejected, unclassified reason | held | -- | `reaper_held{reason="rejected_unknown"}` |
 | 5 | Hint known, not yet mined or rejected | held | -- | `reaper_held{reason="hint_pending"}` |
@@ -341,8 +362,8 @@ successful tick.
 
 | Metric | Labels | Meaning | Operator action |
 |---|---|---|---|
-| `fuelkeeper_reaper_requeued_total` | `pool`, `reason` (`unspent`, `unknown_aged`, `rejected`, `hint_expired`) | Quarantined rows returned to `available` | `unspent`/`rejected`: normal, oracle- or patience-driven. `unknown_aged`: normal under an arcade-only oracle -- a blind requeue with no proof either way; pool capacity never leaks, but watch `reaper_spent_total{source="inputs_spent"}`/`{source="competitor"}` for a rise right after, which would mean requeued rows are coming back stale. That delay is the safety/latency trade-off of arcade-only; configuring `oracle.teranode_url` resolves these rows immediately instead, if the stale-requeue rate matters for your deployment. `hint_expired`: a hinted transaction was never mined or classified within `hint_max_wait`; a sustained nonzero rate suggests stuck or abandoned client transactions, or an arcade outage swallowing GET /tx answers -- worth investigating |
-| `fuelkeeper_reaper_spent_total` | `pool`, `source` (`oracle`, `hint`, `competitor`, `inputs_spent`) | Quarantined rows resolved to the terminal `spent` state | `oracle`/`hint`: normal terminal resolution, no action. `competitor`: a double-spend was detected and resolved -- a sustained nonzero rate points at a client population racing itself or reusing reservations; investigate the client, not FuelKeeper. `inputs_spent`: the client's own hinted transaction was rejected because one of its inputs (assumed to be this fuel output) was already spent -- a sustained nonzero rate can mean clients are reusing fuel past expiry or racing each other; check client behaviour |
+| `fuelkeeper_reaper_requeued_total` | `pool`, `reason` (`unspent`, `unknown_aged`, `rejected`, `hint_expired`) | Quarantined rows returned to `available` | `unspent`/`rejected`: normal, oracle- or patience-driven (`rejected` now also covers a hint rejected `inputs_spent` where the gateway named the actual spent input and it was not this row's -- the fuel output is confirmed untouched, not merely assumed). `unknown_aged`: normal under an arcade-only oracle -- a blind requeue with no proof either way; pool capacity never leaks, but watch `reaper_spent_total{source="inputs_spent"}`/`{source="competitor"}` for a rise right after, which would mean requeued rows are coming back stale. That delay is the safety/latency trade-off of arcade-only; configuring `oracle.teranode_url` resolves these rows immediately instead, if the stale-requeue rate matters for your deployment. `hint_expired`: a hinted transaction was never mined or classified within `hint_max_wait`; a sustained nonzero rate suggests stuck or abandoned client transactions, or an arcade outage swallowing GET /tx answers -- worth investigating |
+| `fuelkeeper_reaper_spent_total` | `pool`, `source` (`oracle`, `hint`, `competitor`, `inputs_spent`) | Quarantined rows resolved to the terminal `spent` state | `oracle`/`hint`: normal terminal resolution, no action. `competitor`: a double-spend was detected and resolved -- a sustained nonzero rate points at a client population racing itself or reusing reservations; investigate the client, not FuelKeeper. `inputs_spent`: the client's own hinted transaction was rejected because an input was already spent -- either confirmed (the gateway named the spent inputs and this row's outpoint is among them) or assumed (the gateway did not name which input, the bounded-loss case: an honest wallet whose transaction died on an unrelated input still loses this one fuel output) -- a sustained nonzero rate can mean clients are reusing fuel past expiry or racing each other; check client behaviour |
 | `fuelkeeper_reaper_held` (gauge) | `pool`, `reason` (13 values: `oracle_down`, `unknown_fresh`, `expiry_hold`, `unspent_fresh`, `spent_no_txid`, `spender_pending`, `hint_pending`, `hint_unseen`, `competitor_pending`, `rejected_fresh`, `rejected_unknown`, `conflicting`, `tx_down`) | Rows the reaper examined this tick and left quarantined, by why | `unknown_fresh`/`unspent_fresh`/`rejected_fresh`: normal, still waiting out a delay, no action. `expiry_hold`: deliberate under `expiry_policy: hold` -- verify on-chain and requeue by hand via `fuelkeeper quarantine requeue`, or leave it for an operator decision. `spent_no_txid`/`conflicting`/`rejected_unknown`: the oracle could not give the reaper enough to resolve automatically -- inspect on-chain (or arcade's GET /tx for the classification code) and requeue or retire by hand. `spender_pending`/`hint_pending`/`hint_unseen`/`tx_down`: normal, transient, waiting on a transaction to propagate or mine -- watch only if it grows without bound. `competitor_pending`: a double-spend race is in progress -- **never hand-requeue these**; wait for a competitor to be mined (the row then resolves to spent under `source="competitor"`), or it clears once no competitor exists any more. `oracle_down`: the oracle call itself failed or was malformed this tick -- check oracle/arcade connectivity if sustained |
 
 ### Watcher
@@ -521,7 +542,7 @@ its own (`spent_no_txid`, `conflicting`, `rejected_unknown`, or
 - If truly unspent and the row has already aged past what the automatic rules would need (i.e. this is an operator-held reason, not one that is still waiting out a delay), requeue with `fuelkeeper quarantine requeue --url ... --pool main --outpoints a:0,b:1 --key <key>`
 - If spent (expected), no action needed; unhinted rows age out to `spent` once the oracle proves it, hinted rows once `Tx(hint)` (or a competitor) is mined
 - **Never hand-requeue a row held as `competitor_pending`**: a double-spend race is in progress and the row will resolve to `spent{source="competitor"}` once a competitor is mined; requeuing it early can hand an about-to-be-spent output back to the pool (a poison pill for whoever reserves it next)
-- **Never try to "undo" a row retired as `spent{source="inputs_spent"}`**: it is already in the terminal `spent` state, not quarantined -- the reaper assumed the fuel output was the input that was reported already-spent on the client's own rejected transaction; trust that classification rather than trying to recover the row
+- **Never try to "undo" a row retired as `spent{source="inputs_spent"}`**: it is already in the terminal `spent` state, not quarantined. The reaper checks, in order, whether the gateway named which input was spent (`oracle.TxStatus.SpentInputs`, parsed from arcade's `UTXO_SPENT` line): if it names this row's outpoint, the retirement is confirmed; if `SpentInputs` excludes it, the reaper requeues the row automatically instead (reason `rejected`) -- no operator action needed either way. Only when the gateway names no spent input at all (`SpentInputs` nil, and no mined competitor excludes this outpoint) does the reaper fall back to the bounded-loss assumption and retire the row without confirmation; trust that classification rather than trying to recover the row
 - Verify on-chain before requeuing; do not requeue spent rows
 
 ### Dead Split (Known-Unminable Shard)
