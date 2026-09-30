@@ -19,13 +19,14 @@ import (
 // splits, for tests, benchmarks and the "nullnet" mode. It is safe for
 // concurrent use.
 type Treasury struct {
-	mu            sync.Mutex
-	built         map[chainhash.Hash]*treasury.BuiltShard
-	sent          map[chainhash.Hash]int // send count per txid
-	failBuild     error
-	failSend      error
-	failMinedBEEF error
-	nBuilt        int
+	mu             sync.Mutex
+	built          map[chainhash.Hash]*treasury.BuiltShard
+	sent           map[chainhash.Hash]int // send count per txid
+	failBuild      error
+	failSend       error
+	failMinedBEEF  error
+	nBuilt         int
+	nBuildAttempts int
 }
 
 var _ treasury.Treasury = (*Treasury)(nil)
@@ -77,8 +78,21 @@ func (t *Treasury) Built() int {
 	return t.nBuilt
 }
 
+// BuildAttempts returns the total number of Build calls, including ones that
+// failed (an invalid request, an unsupported lock mode, or a configured
+// FailBuild error). Callers use it to check that a minter or other caller
+// stopped after a single attempt instead of retrying in a loop.
+func (t *Treasury) BuildAttempts() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.nBuildAttempts
+}
+
 // Build mints a synthetic unmined shard with real puzzle rows.
 func (t *Treasury) Build(_ context.Context, req treasury.MintRequest) (*treasury.BuiltShard, error) {
+	t.mu.Lock()
+	t.nBuildAttempts++
+	t.mu.Unlock()
 	if err := req.Validate(); err != nil {
 		return nil, err
 	}

@@ -56,7 +56,7 @@ func TestMinterFillsToTargetAndStops(t *testing.T) {
 	pc := pool.DefaultPoolConfig("main", 50)
 	pc.SplitSize = 10
 	pc.TargetAvailable = 45
-	pc.LowWater = 20
+	pc.LowWater = 35
 	cfg := jobs.DefaultMinterConfig()
 	cfg.MaxPendingShards = 3
 	m := newMinter(t, st, tr, []pool.Config{pc}, cfg, clk)
@@ -79,11 +79,11 @@ func TestMinterFillsToTargetAndStops(t *testing.T) {
 	require.NoError(t, m.RunOnce(ctx))
 	stats, err = st.Stats(ctx, "main")
 	require.NoError(t, err)
-	assert.Equal(t, int64(50), stats.Available, "deficit 15 → two more splits of 10")
+	assert.Equal(t, int64(50), stats.Available, "30 < low_water 35 triggers → deficit 15 → two more splits of 10")
 	assert.Equal(t, 5, tr.Built())
 
 	require.NoError(t, m.RunOnce(ctx))
-	assert.Equal(t, 5, tr.Built(), "at or above target: nothing minted")
+	assert.Equal(t, 5, tr.Built(), "at or above low_water: nothing minted")
 
 	all, err := st.ListShards(ctx, "main", store.ShardFilter{})
 	require.NoError(t, err)
@@ -91,6 +91,35 @@ func TestMinterFillsToTargetAndStops(t *testing.T) {
 	for _, sh := range all {
 		assert.True(t, tr.Sent(sh.TxID), "every recorded shard was sent")
 	}
+}
+
+// TestMinterLowWaterHysteresis checks that LowWater is a hysteresis threshold,
+// not a second target: while available sits anywhere in [LowWater,
+// TargetAvailable) the minter must not split at all, even though a plain
+// available < target check would see a deficit.
+func TestMinterLowWaterHysteresis(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	tr := mock.New()
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.SplitSize = 10
+	pc.TargetAvailable = 45
+	pc.LowWater = 35
+	cfg := jobs.DefaultMinterConfig()
+	m := newMinter(t, st, tr, []pool.Config{pc}, cfg, clk)
+
+	// Seed 40 available rows directly: between LowWater (35) and
+	// TargetAvailable (45), so there is a deficit (5) but no trigger.
+	_, rows := storetest.MintShard(t, st, "main", 40, store.ShardMined)
+	require.Len(t, rows, 40)
+
+	require.NoError(t, m.RunOnce(ctx))
+	stats, err := st.Stats(ctx, "main")
+	require.NoError(t, err)
+	assert.Equal(t, int64(40), stats.Available, "available in [low_water, target): nothing minted")
+	assert.Equal(t, 0, tr.Built())
+	assert.Equal(t, 0, tr.BuildAttempts())
 }
 
 func TestMinterOrderingAndFailures(t *testing.T) {
@@ -167,4 +196,135 @@ func TestMinterConfigValidate(t *testing.T) {
 	require.Error(t, bad.Validate())
 	_, err := jobs.NewMinter(memory.New(), mock.New(), nil, bad, pool.RealClock{}, slog.Default())
 	require.Error(t, err)
+}
+
+// TestMinterInsufficientFundsStopsPoolForTick checks that ErrInsufficientFunds
+// stops the whole pool for this tick after exactly one Build attempt, rather
+// than retrying up to MaxPerRound times within the same RunOnce call.
+func TestMinterInsufficientFundsStopsPoolForTick(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	tr := mock.New()
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.SplitSize = 5
+	pc.TargetAvailable = 1000 // a large deficit: several attempts would occur if the stop leaked
+	cfg := jobs.DefaultMinterConfig()
+	m := newMinter(t, st, tr, []pool.Config{pc}, cfg, clk)
+
+	tr.FailBuild(treasury.ErrInsufficientFunds)
+	require.NoError(t, m.RunOnce(ctx), "insufficient funds is logged, not fatal")
+	assert.Equal(t, 1, tr.BuildAttempts(), "exactly one attempt this tick")
+	assert.Equal(t, 0, tr.Built())
+	tr.FailBuild(nil)
+}
+
+// TestMinterInvalidShardsDoNotCountAsPending checks that a shard retired by a
+// rejected send does not count toward MaxPendingShards on the next tick:
+// pending is stats.ShardsUnmined, which excludes invalid shards.
+func TestMinterInvalidShardsDoNotCountAsPending(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	tr := mock.New()
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.SplitSize = 5
+	pc.TargetAvailable = 10
+	cfg := jobs.DefaultMinterConfig()
+	cfg.MaxPendingShards = 1
+	m := newMinter(t, st, tr, []pool.Config{pc}, cfg, clk)
+
+	tr.FailSend(treasury.ErrRejected)
+	require.NoError(t, m.RunOnce(ctx))
+	stats, err := st.Stats(ctx, "main")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), stats.ShardsInvalid, "the rejected split was recorded then retired")
+	assert.Equal(t, int64(0), stats.ShardsUnmined)
+	tr.FailSend(nil)
+
+	require.NoError(t, m.RunOnce(ctx), "MaxPendingShards=1 must not be exhausted by the invalid shard")
+	stats, err = st.Stats(ctx, "main")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), stats.ShardsUnmined, "a fresh split was minted despite MaxPendingShards=1")
+	assert.Equal(t, int64(5), stats.Available)
+}
+
+// putShardFailStore wraps a store.Store, failing PutShard for a chosen pool
+// (or every pool, when failPool is "") and recording the last shard it was
+// asked to put, so a test can check what would have been sent had recording
+// succeeded.
+type putShardFailStore struct {
+	*memory.Store
+	failPool string
+	err      error
+	last     *store.Shard
+}
+
+func (s *putShardFailStore) PutShard(ctx context.Context, shard store.Shard, rows []store.Row) error {
+	if s.failPool != "" && shard.Pool != s.failPool {
+		return s.Store.PutShard(ctx, shard, rows)
+	}
+	sh := shard
+	s.last = &sh
+	return s.err
+}
+
+// TestMinterPutShardFailurePreventsSend checks the record-before-send
+// ordering from the other side: when PutShard fails, RunOnce returns the
+// error, Build was attempted exactly once, and the built split is never sent
+// (a signed-but-unrecorded split must not reach the network).
+func TestMinterPutShardFailurePreventsSend(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	wantErr := errors.New("put shard boom")
+	st := &putShardFailStore{Store: base, err: wantErr}
+	tr := mock.New()
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.SplitSize = 5
+	pc.TargetAvailable = 5
+	cfg := jobs.DefaultMinterConfig()
+	m := newMinter(t, st, tr, []pool.Config{pc}, cfg, clk)
+
+	err := m.RunOnce(ctx)
+	require.Error(t, err)
+	require.ErrorIs(t, err, wantErr)
+	assert.Equal(t, 1, tr.BuildAttempts(), "Build was attempted exactly once")
+	require.NotNil(t, st.last, "PutShard was called with the built shard")
+	assert.Equal(t, 0, tr.Sends(st.last.TxID), "a split never recorded must never be sent")
+
+	shards, lerr := base.ListShards(ctx, "main", store.ShardFilter{})
+	require.NoError(t, lerr)
+	assert.Empty(t, shards, "no shard was ever recorded")
+}
+
+// TestMinterPutShardFailureIsolatedPerPool checks that one pool's PutShard
+// failure does not stop another pool from minting, and that the joined error
+// names the failing pool.
+func TestMinterPutShardFailureIsolatedPerPool(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	wantErr := errors.New("put shard boom")
+	st := &putShardFailStore{Store: base, failPool: "bad", err: wantErr}
+	tr := mock.New()
+	bad := pool.DefaultPoolConfig("bad", 50)
+	bad.SplitSize, bad.TargetAvailable, bad.LowWater = 5, 5, 0
+	good := pool.DefaultPoolConfig("good", 50)
+	good.SplitSize, good.TargetAvailable, good.LowWater = 5, 5, 0
+	cfg := jobs.DefaultMinterConfig()
+	m := newMinter(t, st, tr, []pool.Config{bad, good}, cfg, clk)
+
+	err := m.RunOnce(ctx)
+	require.Error(t, err)
+	require.ErrorIs(t, err, wantErr)
+	assert.Contains(t, err.Error(), "pool bad:", "the joined error names the failing pool")
+
+	sbad, berr := base.Stats(ctx, "bad")
+	require.NoError(t, berr)
+	assert.Equal(t, int64(0), sbad.Available, "the failing pool minted nothing")
+
+	sgood, gerr := base.Stats(ctx, "good")
+	require.NoError(t, gerr)
+	assert.Equal(t, int64(5), sgood.Available, "the other pool still minted")
 }

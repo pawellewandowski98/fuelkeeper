@@ -66,6 +66,13 @@ func (c MinterConfig) Validate() error {
 // proof watcher to re-send; treasury.ErrInsufficientFunds is logged, not
 // fatal. MaxPendingShards bounds exposure to unmined ("pending") shards, and
 // MaxPerRound bounds work per pool per tick.
+//
+// Refilling is hysteresis, not a live setpoint: a pool is topped up only once
+// its available rows drop below pool.Config.LowWater (LowWater == 0 means
+// "always refill below target"), and once triggered it mints back up to
+// TargetAvailable rather than just past LowWater. While available sits
+// anywhere in [LowWater, TargetAvailable) the minter does nothing, so a pool
+// does not re-split for every single row consumed. See needsRefill.
 type Minter struct {
 	st    store.Store
 	tr    treasury.Treasury
@@ -118,14 +125,31 @@ func publishStats(p string, st store.Stats) {
 	poolShards.WithLabelValues(p, "invalid").Set(float64(st.ShardsInvalid))
 }
 
-// mintPool tops up one pool toward its target, subject to MaxPendingShards
-// and MaxPerRound.
+// needsRefill reports whether pc should be topped up given its currently
+// available rows: LowWater is a hysteresis threshold, not a second target.
+// Once available falls below LowWater the pool refills (mintPool then fills
+// all the way up to TargetAvailable, not just past LowWater); while available
+// sits anywhere in [LowWater, TargetAvailable) it is left alone. LowWater == 0
+// disables hysteresis: the pool refills whenever it is below TargetAvailable
+// at all, matching pool.Config.LowWater's zero value.
+func needsRefill(pc pool.Config, available int64) bool {
+	if pc.LowWater > 0 {
+		return available < pc.LowWater
+	}
+	return available < pc.TargetAvailable
+}
+
+// mintPool tops up one pool toward its target, subject to LowWater hysteresis
+// (see needsRefill), MaxPendingShards and MaxPerRound.
 func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 	stats, err := m.st.Stats(ctx, pc.Name)
 	if err != nil {
 		return err
 	}
 	publishStats(pc.Name, stats)
+	if !needsRefill(pc, stats.Available) {
+		return nil
+	}
 	// Rows in unmined shards are already counted in stats.Available (they are
 	// available rows that mined-only instances cannot serve yet), so the
 	// deficit is simply target - available.
@@ -142,8 +166,11 @@ func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 				m.log.Warn("treasury cannot fund a split", "pool", pc.Name, "deficit", deficit)
 				return nil
 			}
+			// An unexpected build failure is not a known, transient condition
+			// like ErrInsufficientFunds: propagate it so the runner logs a job
+			// failure instead of silently doing nothing this tick.
 			m.log.Error("build split", "pool", pc.Name, "err", err)
-			return nil
+			return err
 		}
 		if err := m.st.PutShard(ctx, b.Shard, b.Rows); err != nil {
 			minterSplits.WithLabelValues(pc.Name, "record_failed").Inc()
@@ -167,6 +194,11 @@ func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 			if errors.Is(err, treasury.ErrRejected) {
 				minterSplits.WithLabelValues(pc.Name, "rejected").Inc()
 				if _, rerr := m.st.RetireShard(ctx, pc.Name, b.Shard.TxID); rerr != nil {
+					// The split was rejected AND we failed to retire it: the
+					// shard is left unmined with rows an operator must find
+					// and reconcile by hand, so log everything needed to do
+					// that before propagating the error.
+					m.log.Error("retire rejected split", "pool", pc.Name, "txid", b.Shard.TxID.String(), "send_err", err, "retire_err", rerr)
 					return rerr
 				}
 				m.log.Error("split rejected on send", "pool", pc.Name, "txid", b.Shard.TxID.String(), "err", err)

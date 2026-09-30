@@ -57,7 +57,9 @@ type Config struct {
 	SplitSize int `yaml:"split_size"`
 	// TargetAvailable is the desired count of available rows.
 	TargetAvailable int64 `yaml:"target_available"`
-	// LowWater triggers a refill split when available rows drop below it.
+	// LowWater triggers a refill split when available rows drop below it: the
+	// minter mints only once available < LowWater, then fills back up to
+	// TargetAvailable (0 means always refill below TargetAvailable).
 	LowWater int64 `yaml:"low_water"`
 	// ServePolicy says which shard statuses may be served from.
 	ServePolicy ServePolicy `yaml:"serve_policy"`
