@@ -1,6 +1,7 @@
 package pool_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +52,13 @@ func TestPoolConfigDefaultsAndValidate(t *testing.T) {
 	bad.LockModeName = "weird"
 	require.Error(t, bad.Validate())
 	bad = c
+	bad.LockModeName = ""
+	bad.LockMode = store.LockP2PKH
+	require.NoError(t, bad.Validate())
+	assert.Equal(t, store.LockP2PKH, bad.LockMode, "an empty LockModeName must not clobber an explicitly set LockMode")
+	require.NoError(t, bad.Validate())
+	assert.Equal(t, store.LockP2PKH, bad.LockMode, "Validate must be idempotent when LockModeName is empty")
+	bad = c
 	bad.ReleasePolicy = "maybe"
 	require.Error(t, bad.Validate())
 	bad = c
@@ -70,6 +78,19 @@ func TestPoolConfigDefaultsAndValidate(t *testing.T) {
 	require.Error(t, bad2.Validate(), "rescan must be shorter than the lease")
 	bad2 = ic
 	bad2.InstanceID = ""
+	require.Error(t, bad2.Validate())
+	bad2 = ic
+	bad2.InstanceID = strings.Repeat("a", 120)
+	require.Error(t, bad2.Validate())
+	ok2 := ic
+	ok2.InstanceID = strings.Repeat("a", 119)
+	require.NoError(t, ok2.Validate())
+	require.NoError(t, store.ValidateHolder(pool.NewHolder(ok2.InstanceID)))
+	bad2 = ic
+	bad2.FlushWindow = -time.Second
+	require.Error(t, bad2.Validate())
+	bad2 = ic
+	bad2.MaxBatch = -1
 	require.Error(t, bad2.Validate())
 
 	h1, h2 := pool.NewHolder("node-a"), pool.NewHolder("node-a")

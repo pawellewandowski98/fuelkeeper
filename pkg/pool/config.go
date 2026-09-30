@@ -104,7 +104,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("pool %s: denomination must be > 0", c.Name)
 	}
 	switch c.LockModeName {
-	case "", "puzzle":
+	case "":
+		// Leave LockMode as already set (its zero value is store.LockPuzzle).
+	case "puzzle":
 		c.LockMode = store.LockPuzzle
 	case "p2pkh":
 		c.LockMode = store.LockP2PKH
@@ -148,6 +150,11 @@ func (c Config) ServeStatuses() []store.ShardStatus {
 	}
 	return []store.ShardStatus{store.ShardMined}
 }
+
+// maxInstanceIDLen bounds InstanceConfig.InstanceID so that NewHolder's output
+// (instance_id + "/" + 8 hex chars, a 9-byte suffix) always fits within
+// store.ValidateHolder's 128-byte limit.
+const maxInstanceIDLen = 119
 
 // InstanceConfig tunes one FuelKeeper process.
 type InstanceConfig struct {
@@ -198,11 +205,20 @@ func (c InstanceConfig) Validate() error {
 	if c.InstanceID == "" {
 		return fmt.Errorf("instance_id is required")
 	}
+	if len(c.InstanceID) > maxInstanceIDLen {
+		return fmt.Errorf("instance_id must be at most %d bytes (holder adds a 9-byte boot nonce)", maxInstanceIDLen)
+	}
 	if c.MaxShards <= 0 || c.LowWaterRows < 0 {
 		return fmt.Errorf("max_shards must be > 0 and low_water_rows >= 0")
 	}
 	if c.LeaseTTL <= 0 || c.RescanInterval <= 0 || c.RescanInterval >= c.LeaseTTL {
 		return fmt.Errorf("need 0 < rescan_interval < lease_ttl")
+	}
+	if c.FlushWindow < 0 {
+		return fmt.Errorf("flush_window must be >= 0")
+	}
+	if c.MaxBatch < 0 {
+		return fmt.Errorf("max_batch must be >= 0 (0 means the documented default)")
 	}
 	if c.ReserveTimeout <= 0 || c.FlushTimeout <= 0 || c.AdoptTimeout <= 0 {
 		return fmt.Errorf("reserve_timeout, flush_timeout and adopt_timeout must be > 0")
@@ -210,7 +226,10 @@ func (c InstanceConfig) Validate() error {
 	return nil
 }
 
-// NewHolder returns "<instance_id>/<boot nonce>", unique per process start.
+// NewHolder returns "<instance_id>/<boot nonce>", unique per process start. The
+// boot nonce adds a fixed 9-byte suffix ("/" + 8 hex chars), so callers should
+// keep instanceID within maxInstanceIDLen (see InstanceConfig.Validate) for the
+// result to satisfy store.ValidateHolder's 128-byte limit.
 func NewHolder(instanceID string) string {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
