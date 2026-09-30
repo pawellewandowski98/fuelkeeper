@@ -224,10 +224,10 @@ func testQuarantineByExpiry(t *testing.T, s store.Store, clk *Clock) {
 	}
 	assert.Equal(t, store.StateAvailable, got[rows[5].Outpoint].State)
 
-	q, err := s.ListQuarantined(ctx, "main", clk.Now().Add(time.Second), 10)
+	q, err := s.ListQuarantined(ctx, "main", clk.Now().Add(time.Second), nil, 10)
 	require.NoError(t, err)
 	require.Len(t, q, 2)
-	q, err = s.ListQuarantined(ctx, "main", clk.Now(), 10)
+	q, err = s.ListQuarantined(ctx, "main", clk.Now(), nil, 10)
 	require.NoError(t, err)
 	assert.Empty(t, q, "before is exclusive")
 
@@ -243,11 +243,11 @@ func testQuarantineByExpiry(t *testing.T, s store.Store, clk *Clock) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, n, "only rows[3]")
 
-	q, err = s.ListQuarantined(ctx, "main", clk.Now().Add(time.Second), 10)
+	q, err = s.ListQuarantined(ctx, "main", clk.Now().Add(time.Second), nil, 10)
 	require.NoError(t, err)
 	require.Len(t, q, 3)
 	assert.Equal(t, rows[3].Outpoint, q[2].Outpoint, "oldest quarantined first")
-	q, err = s.ListQuarantined(ctx, "main", clk.Now().Add(time.Second), 2)
+	q, err = s.ListQuarantined(ctx, "main", clk.Now().Add(time.Second), nil, 2)
 	require.NoError(t, err)
 	require.Len(t, q, 2)
 }

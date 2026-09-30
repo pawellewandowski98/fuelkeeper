@@ -150,6 +150,16 @@ func (m LockMode) String() string {
 }
 
 // Row is one fuel output.
+//
+// # Provenance
+//
+// ReservedBy, ReservedAt and ExpiresAt are set by Reserve; QuarantinedAt is set by
+// Quarantine and by a non-terminal Spend; SpentHint is set by a non-terminal Spend.
+// All five are then KEPT for provenance across every later transition that is not
+// a return to available: both Spend modes, Quarantine, Resolve to spent and
+// RetireShard's cascade all preserve them. Only Release, or Resolve to available,
+// clears all five back to zero/nil. UpdatedAt is stamped by every state change
+// except a same-token Reserve replay, which reports the row unchanged.
 type Row struct {
 	Outpoint
 	Pool            string
@@ -157,13 +167,28 @@ type Row struct {
 	LockingScript   []byte
 	UnlockingScript []byte
 	State           State
-	ReservedBy      Token           // zero unless reserved (kept for provenance after quarantine/spend)
-	ReservedAt      time.Time       // zero unless reserved
-	ExpiresAt       time.Time       // zero unless reserved
-	QuarantinedAt   time.Time       // zero unless quarantined
-	SpentHint       *chainhash.Hash // txid the client claims spent this row; nil if none
+	ReservedBy      Token           // zero unless reserved or kept for provenance; see "Provenance" above
+	ReservedAt      time.Time       // zero unless reserved or kept for provenance; see "Provenance" above
+	ExpiresAt       time.Time       // zero unless reserved or kept for provenance; see "Provenance" above
+	QuarantinedAt   time.Time       // zero unless quarantined or kept for provenance; see "Provenance" above
+	SpentHint       *chainhash.Hash // txid the client claims spent this row; nil if none; see "Provenance" above
 	SpentBy         *chainhash.Hash // oracle-proven spending txid; set only in StateSpent
-	UpdatedAt       time.Time
+	UpdatedAt       time.Time       // stamped by every state change except a same-token Reserve replay
+}
+
+// RowCursor marks a position in the (quarantined_at, txid internal bytes, vout)
+// ascending order ListQuarantined pages over. It lets a reaper resume after the
+// last row it saw instead of always re-reading from before, so a row stuck at the
+// head of the queue cannot starve rows behind it.
+type RowCursor struct {
+	At       time.Time
+	Outpoint Outpoint
+}
+
+// QuarantineCursor returns the cursor position of a quarantined row, for the next
+// ListQuarantined call's after argument.
+func (r Row) QuarantineCursor() RowCursor {
+	return RowCursor{At: r.QuarantinedAt, Outpoint: r.Outpoint}
 }
 
 // Shard is one split transaction and the lease that lets an instance own its rows.

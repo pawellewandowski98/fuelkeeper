@@ -31,8 +31,20 @@ import (
 //
 // Reserve applies to a row when state == available OR (state == reserved AND
 // reserved_by == op.Token). A replay under the same token is therefore reported
-// as applied without changing reserved_at / expires_at. Callers retry Reserve on
-// ErrUnavailable instead of compensating.
+// as applied without changing reserved_at / expires_at / updated_at. Callers
+// retry Reserve on ErrUnavailable instead of compensating. A replay stays
+// applicable after its expiry, right up until the reaper's Quarantine actually
+// moves the row: expiry is Quarantine's job, not Reserve's.
+//
+// # Provenance
+//
+// ReservedBy, ReservedAt and ExpiresAt are set by Reserve; QuarantinedAt is set by
+// Quarantine and by a non-terminal Spend; SpentHint is set by a non-terminal
+// Spend. All five are then kept for provenance across every later transition that
+// is not a return to available: both Spend modes, Quarantine, Resolve to spent
+// and RetireShard's cascade all preserve them. Only Release, or Resolve to
+// available, clears all five. UpdatedAt is stamped by every state change except a
+// same-token Reserve replay (see "Idempotency").
 //
 // # Clocks
 //
@@ -65,8 +77,9 @@ type Store interface {
 	UpdateShard(ctx context.Context, pool string, txid chainhash.Hash, status ShardStatus, beef []byte) error
 	// RetireShard marks the shard invalid, clears its lease, bumps Version, and moves
 	// every non-terminal row (available, reserved, quarantined) to invalid, keeping
-	// provenance fields (ReservedBy, SpentHint). It returns the number of rows changed.
-	// A shard already invalid is a no-op: it returns 0 and leaves Version/UpdatedAt
+	// all provenance fields (ReservedBy, ReservedAt, ExpiresAt, QuarantinedAt,
+	// SpentHint; see "Provenance"). It returns the number of rows changed. A shard
+	// already invalid is a no-op: it returns 0 and leaves Version/UpdatedAt
 	// unchanged. A retired shard may still be retired (retired -> invalid). Missing
 	// shard: ErrNotFound. pool must be non-empty (ErrInvalidArgument).
 	RetireShard(ctx context.Context, pool string, txid chainhash.Hash) (int, error)
@@ -93,31 +106,44 @@ type Store interface {
 	ListShards(ctx context.Context, pool string, f ShardFilter) ([]Shard, error)
 
 	// ListAvailable returns available rows of one shard with vout >= fromVout,
-	// ordered by vout, at most limit.
+	// ordered by vout, at most limit. An unknown txid returns an empty slice, not
+	// ErrNotFound, like GetRows.
 	ListAvailable(ctx context.Context, pool string, txid chainhash.Hash, fromVout uint32, limit int) ([]Row, error)
 	// GetRows returns the rows that exist in pool among ops, in any order. Unknown
 	// outpoints are omitted.
 	GetRows(ctx context.Context, pool string, ops []Outpoint) ([]Row, error)
-	// Reserve performs the reservation CAS for each op and returns the applied ops
-	// (ExpiresAt reflects the stored value, which on a replay is the original). Ops
-	// whose row is missing, in another state, or reserved under another token are
-	// omitted. Batch-level ErrInvalidArgument for duplicates, zero tokens or size.
+	// Reserve performs the reservation CAS for each op and returns the applied ops,
+	// in any order (ExpiresAt reflects the stored value, which on a replay is the
+	// original; see "Idempotency" and "Provenance"). Ops whose row is missing, in
+	// another state, or reserved under another token are omitted. Batch-level
+	// ErrInvalidArgument for duplicates, zero tokens, zero expiry or size.
 	Reserve(ctx context.Context, pool string, ops []ReserveOp) ([]ReserveOp, error)
-	// Release moves rows from reserved(token) back to available, clearing the
-	// reservation fields. Returns the number of rows changed.
+	// Release moves rows from reserved(token) back to available, clearing
+	// ReservedBy, ReservedAt, ExpiresAt, QuarantinedAt and SpentHint (see
+	// "Provenance"). Returns the number of rows changed.
 	Release(ctx context.Context, pool string, token Token, ops []Outpoint) (int, error)
-	// Spend moves rows from reserved(token) to quarantined with SpentHint = txid, or,
-	// when terminal is true (spend_policy=trust), directly to spent with SpentBy = txid.
-	// ReservedBy is kept for provenance. Returns the number of rows changed.
+	// Spend moves rows from reserved(token) to quarantined with QuarantinedAt = now
+	// and SpentHint = txid, or, when terminal is true (spend_policy=trust), directly
+	// to spent with SpentBy = txid. ReservedBy, ReservedAt and ExpiresAt are kept for
+	// provenance either way (see "Provenance"). Returns the number of rows changed.
 	Spend(ctx context.Context, pool string, token Token, ops []Outpoint, txid chainhash.Hash, terminal bool) (int, error)
 	// Quarantine moves up to limit reserved rows whose expires_at < before to
-	// quarantined (oldest expiry first) and returns how many it moved.
+	// quarantined, picked in (expires_at, txid internal bytes, vout) ascending
+	// order, and returns how many it moved. ReservedBy, ReservedAt and ExpiresAt are
+	// kept for provenance (see "Provenance").
 	Quarantine(ctx context.Context, pool string, before time.Time, limit int) (int, error)
-	// ListQuarantined returns quarantined rows with quarantined_at < before, oldest
-	// first, at most limit.
-	ListQuarantined(ctx context.Context, pool string, before time.Time, limit int) ([]Row, error)
-	// Resolve moves quarantined rows to available (clearing reservation fields and
-	// SpentHint) or to spent (setting SpentBy). Returns the number of rows changed.
+	// ListQuarantined returns quarantined rows ordered by (quarantined_at, txid
+	// internal bytes, vout) ascending, at most limit. before is exclusive on
+	// quarantined_at. When after != nil, only rows whose (quarantined_at, txid,
+	// vout) tuple is strictly greater than after's are returned, letting a reaper
+	// resume paging after the last row it saw (Row.QuarantineCursor) instead of
+	// always restarting from before: a row stuck at the head of the queue cannot
+	// starve the rest of it.
+	ListQuarantined(ctx context.Context, pool string, before time.Time, after *RowCursor, limit int) ([]Row, error)
+	// Resolve moves quarantined rows to available, clearing ReservedBy, ReservedAt,
+	// ExpiresAt, QuarantinedAt and SpentHint, or to spent, setting SpentBy and
+	// keeping every other provenance field (see "Provenance"). Returns the number
+	// of rows changed.
 	Resolve(ctx context.Context, pool string, ops []Outpoint, to State, spentBy *chainhash.Hash) (int, error)
 	// Stats counts rows by state and shards by status for one pool.
 	Stats(ctx context.Context, pool string) (Stats, error)

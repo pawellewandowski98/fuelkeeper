@@ -46,7 +46,7 @@ func testArgumentValidation(t *testing.T, s store.Store, clk *Clock) {
 	require.ErrorIs(t, err, store.ErrInvalidArgument)
 	_, err = s.Quarantine(ctx, "", future, 10)
 	require.ErrorIs(t, err, store.ErrInvalidArgument)
-	_, err = s.ListQuarantined(ctx, "", future, 10)
+	_, err = s.ListQuarantined(ctx, "", future, nil, 10)
 	require.ErrorIs(t, err, store.ErrInvalidArgument)
 	_, err = s.Resolve(ctx, "", Ops(rows), store.StateAvailable, nil)
 	require.ErrorIs(t, err, store.ErrInvalidArgument)
