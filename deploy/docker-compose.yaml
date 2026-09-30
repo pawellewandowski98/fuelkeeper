@@ -16,6 +16,7 @@ services:
 
   mongo:
     image: mongo:7
+    profiles: ["mongo"]
     ports:
       - "27017:27017"
     healthcheck:
@@ -26,6 +27,7 @@ services:
 
   aerospike:
     image: aerospike/aerospike-server:8.1.2.4
+    profiles: ["aerospike"]
     ports:
       - "3000:3000"
       - "3001:3001"

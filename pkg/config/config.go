@@ -18,10 +18,18 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/jobs"
 	ofactory "github.com/bsv-blockchain/fuelkeeper/pkg/oracle/factory"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/sqlite"
 	tfactory "github.com/bsv-blockchain/fuelkeeper/pkg/treasury/factory"
 )
+
+// storeBackendList is the human-readable enumeration of every store.Backend
+// factory.Config.Validate accepts, repeated in every store.backend error
+// Validate returns so an operator sees the full menu (memory, sqlite,
+// postgres, pebble, mongodb, aerospike) in one place, not just the three that
+// predate the pebble/mongodb/aerospike backends.
+const storeBackendList = "memory|sqlite|postgres|pebble|mongodb|aerospike"
 
 // Config is the whole file.
 type Config struct {
@@ -294,27 +302,37 @@ func (c *Config) Validate() error {
 	}
 	switch c.Store.Backend {
 	case "":
-		return errors.New("config: store.backend is required (memory|sqlite|postgres)")
-	case factory.BackendMemory:
-	case factory.BackendSQLite:
-		if c.Store.SQLite.Path == "" {
-			return errors.New("config: store.sqlite.path is required")
+		return fmt.Errorf("config: store.backend is required (%s)", storeBackendList)
+	case factory.BackendMemory, factory.BackendSQLite, factory.BackendPostgres,
+		factory.BackendPebble, factory.BackendMongoDB, factory.BackendAerospike:
+		// Delegate presence-of-required-fields checking to the factory (the
+		// same check New runs before opening the backend), so a typo'd or
+		// missing store.<backend>.<field> fails at config load instead of at
+		// store-open time, and pebble/mongodb/aerospike need no separate
+		// copy of this logic here. factory.Config.Validate's own message
+		// already names the field as "<backend>.<field>" (e.g.
+		// "postgres.dsn is required"); strip its sentinel prefix ("store:
+		// invalid argument: ") and reattach "store." so the field reads as
+		// the full YAML path an operator can search for.
+		if err := c.Store.Validate(); err != nil {
+			msg := strings.TrimPrefix(err.Error(), store.ErrInvalidArgument.Error()+": ")
+			return fmt.Errorf("config: store.%s", msg)
 		}
-		switch strings.ToUpper(string(c.Store.SQLite.Sync)) {
-		case "", "FULL", "NORMAL":
-			// Normalize to the canonical uppercase form the sqlite package
-			// compares case-sensitively, so an operator-friendly lowercase
-			// "full"/"normal" in YAML does not fail later at store-open time.
-			c.Store.SQLite.Sync = sqlite.Sync(strings.ToUpper(string(c.Store.SQLite.Sync)))
-		default:
-			return fmt.Errorf("config: store.sqlite.sync %q must be \"\", \"full\" or \"normal\" (case-insensitive)", c.Store.SQLite.Sync)
-		}
-	case factory.BackendPostgres:
-		if c.Store.Postgres.DSN == "" {
-			return errors.New("config: store.postgres.dsn is required")
+		// sqlite.Sync's enum check is deeper backend validation that
+		// factory.Config.Validate deliberately leaves to the backend (see its
+		// doc comment); config.Load is the only strict-loader path, so
+		// normalize and validate it here, before an operator-friendly
+		// lowercase "full"/"normal" would otherwise fail at store-open time.
+		if c.Store.Backend == factory.BackendSQLite {
+			switch strings.ToUpper(string(c.Store.SQLite.Sync)) {
+			case "", "FULL", "NORMAL":
+				c.Store.SQLite.Sync = sqlite.Sync(strings.ToUpper(string(c.Store.SQLite.Sync)))
+			default:
+				return fmt.Errorf("config: store.sqlite.sync %q must be \"\", \"full\" or \"normal\" (case-insensitive)", c.Store.SQLite.Sync)
+			}
 		}
 	default:
-		return fmt.Errorf("config: unknown store backend %q (memory|sqlite|postgres)", c.Store.Backend)
+		return fmt.Errorf("config: unknown store backend %q (%s)", c.Store.Backend, storeBackendList)
 	}
 	if len(c.Pools) == 0 {
 		return errors.New("config: at least one pool is required")

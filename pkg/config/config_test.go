@@ -77,6 +77,85 @@ func TestLoadFullOverridesAndExpandsEnv(t *testing.T) {
 	assert.Equal(t, "json", c.Log.Format)
 }
 
+// TestLoadStoreBackendPebble loads a full store: block for the pebble
+// backend through the strict (KnownFields) loader, covering every field
+// factory.PebbleConfig declares.
+func TestLoadStoreBackendPebble(t *testing.T) {
+	c, err := config.Parse([]byte(`
+store:
+  backend: pebble
+  pebble:
+    path: /var/lib/fuelkeeper/pebble
+    no_sync: false
+    cache_bytes: 268435456
+pools:
+  - name: main
+    denomination: 50
+api: {insecure: true}
+`))
+	require.NoError(t, err)
+	assert.Equal(t, factory.BackendPebble, c.Store.Backend)
+	assert.Equal(t, "/var/lib/fuelkeeper/pebble", c.Store.Pebble.Path)
+	assert.False(t, c.Store.Pebble.NoSync)
+	assert.Equal(t, int64(268435456), c.Store.Pebble.CacheBytes)
+}
+
+// TestLoadStoreBackendMongoDB loads a full store: block for the mongodb
+// backend through the strict (KnownFields) loader, covering every field
+// factory.MongoDBConfig declares.
+func TestLoadStoreBackendMongoDB(t *testing.T) {
+	c, err := config.Parse([]byte(`
+store:
+  backend: mongodb
+  mongodb:
+    uri: mongodb://localhost:27017
+    database: fuelkeeper
+    max_pool_size: 64
+    op_timeout: 5s
+pools:
+  - name: main
+    denomination: 50
+api: {insecure: true}
+`))
+	require.NoError(t, err)
+	assert.Equal(t, factory.BackendMongoDB, c.Store.Backend)
+	assert.Equal(t, "mongodb://localhost:27017", c.Store.MongoDB.URI)
+	assert.Equal(t, "fuelkeeper", c.Store.MongoDB.Database)
+	assert.Equal(t, uint64(64), c.Store.MongoDB.MaxPoolSize)
+	assert.Equal(t, 5*time.Second, c.Store.MongoDB.OpTimeout)
+}
+
+// TestLoadStoreBackendAerospike loads a full store: block for the aerospike
+// backend through the strict (KnownFields) loader, covering every field
+// factory.AerospikeConfig declares.
+func TestLoadStoreBackendAerospike(t *testing.T) {
+	c, err := config.Parse([]byte(`
+store:
+  backend: aerospike
+  aerospike:
+    hosts: ["localhost:3000", "localhost:3010"]
+    namespace: fuelkeeper
+    set_prefix: fk_
+    key_prefix: tenant1
+    allow_availability_mode: true
+    timeout: 3s
+    pool_size: 128
+pools:
+  - name: main
+    denomination: 50
+api: {insecure: true}
+`))
+	require.NoError(t, err)
+	assert.Equal(t, factory.BackendAerospike, c.Store.Backend)
+	assert.Equal(t, []string{"localhost:3000", "localhost:3010"}, c.Store.Aerospike.Hosts)
+	assert.Equal(t, "fuelkeeper", c.Store.Aerospike.Namespace)
+	assert.Equal(t, "fk_", c.Store.Aerospike.SetPrefix)
+	assert.Equal(t, "tenant1", c.Store.Aerospike.KeyPrefix)
+	assert.True(t, c.Store.Aerospike.AllowAvailabilityMode)
+	assert.Equal(t, 3*time.Second, c.Store.Aerospike.Timeout)
+	assert.Equal(t, 128, c.Store.Aerospike.PoolSize)
+}
+
 func TestValidateRejectsBadConfigs(t *testing.T) {
 	base := func() *config.Config {
 		c, err := config.Load("testdata/minimal.yaml")
@@ -145,15 +224,52 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 	c = base()
 	c.Store.Backend = factory.BackendSQLite
 	c.Store.SQLite.Path = ""
-	require.ErrorContains(t, c.Validate(), "store.sqlite.path")
+	// factory.Config.Validate's own sqlite message matches sqlite.Open's
+	// wording ("sqlite path is required", no dot) rather than the
+	// "<backend>.<field>" convention the other backends use; config.Validate
+	// only reattaches the "store." prefix, so this reads "store.sqlite path".
+	require.ErrorContains(t, c.Validate(), "store.sqlite path is required")
+
+	c = base()
+	c.Store.Backend = factory.BackendPebble
+	c.Store.Pebble.Path = ""
+	require.ErrorContains(t, c.Validate(), "store.pebble.path")
+
+	c = base()
+	c.Store.Backend = factory.BackendMongoDB
+	c.Store.MongoDB.URI = ""
+	c.Store.MongoDB.Database = "fk"
+	require.ErrorContains(t, c.Validate(), "store.mongodb.uri")
+
+	c = base()
+	c.Store.Backend = factory.BackendMongoDB
+	c.Store.MongoDB.URI = "mongodb://localhost:27017"
+	c.Store.MongoDB.Database = ""
+	require.ErrorContains(t, c.Validate(), "store.mongodb.database")
+
+	c = base()
+	c.Store.Backend = factory.BackendAerospike
+	c.Store.Aerospike.Hosts = nil
+	c.Store.Aerospike.Namespace = "fk"
+	require.ErrorContains(t, c.Validate(), "store.aerospike.hosts")
+
+	c = base()
+	c.Store.Backend = factory.BackendAerospike
+	c.Store.Aerospike.Hosts = []string{"localhost:3000"}
+	c.Store.Aerospike.Namespace = ""
+	require.ErrorContains(t, c.Validate(), "store.aerospike.namespace")
 
 	c = base()
 	c.Store.Backend = "cassandra"
-	require.ErrorContains(t, c.Validate(), "unknown store backend")
+	err = c.Validate()
+	require.ErrorContains(t, err, "unknown store backend")
+	require.ErrorContains(t, err, "memory|sqlite|postgres|pebble|mongodb|aerospike", "the message lists every known backend")
 
 	c = base()
 	c.Store.Backend = ""
-	require.ErrorContains(t, c.Validate(), "store.backend")
+	err = c.Validate()
+	require.ErrorContains(t, err, "store.backend")
+	require.ErrorContains(t, err, "memory|sqlite|postgres|pebble|mongodb|aerospike", "the message lists every known backend")
 
 	c = base()
 	c.API.Listen = "not-a-valid-listen-address"
@@ -380,6 +496,26 @@ func TestLoadExampleNullnet(t *testing.T) {
 	assert.True(t, c.Oracle.Mock.AssumeUnspent)
 	assert.Equal(t, "mock", c.Treasury.Kind)
 	assert.Equal(t, 500*time.Millisecond, c.Treasury.Mock.ConfirmAfter)
+}
+
+// TestLoadExamplePebble covers examples/pebble.yaml, the nullnet-style,
+// single-process example for the pebble backend (see docs/OPERATIONS.md's
+// "Deployment Topologies").
+func TestLoadExamplePebble(t *testing.T) {
+	c, err := config.Load("../../examples/pebble.yaml")
+	require.NoError(t, err)
+	assert.Equal(t, factory.BackendPebble, c.Store.Backend)
+	assert.Equal(t, "./fuelkeeper-pebble", c.Store.Pebble.Path, "${VAR:-default} falls back when FUELKEEPER_STORE_PATH is unset")
+	assert.False(t, c.Store.Pebble.NoSync)
+	assert.Equal(t, "mock", c.Oracle.Kind)
+	assert.True(t, c.Oracle.Mock.AssumeUnspent)
+	assert.Equal(t, "mock", c.Treasury.Kind)
+	assert.Equal(t, 500*time.Millisecond, c.Treasury.Mock.ConfirmAfter)
+
+	t.Setenv("FUELKEEPER_STORE_PATH", filepath.Join(t.TempDir(), "pebble"))
+	c, err = config.Load("../../examples/pebble.yaml")
+	require.NoError(t, err)
+	assert.NotEqual(t, "./fuelkeeper-pebble", c.Store.Pebble.Path, "${VAR} overrides the default when set")
 }
 
 func setTeratestnetEnv(t *testing.T) {
