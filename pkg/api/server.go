@@ -53,10 +53,11 @@ const defaultReadHeaderTimeout = 5 * time.Second
 //
 // Auth: APIKeys gates every /v1/ endpoint, including the four admin
 // endpoints (list/retire shards, list/requeue quarantined rows) by default.
-// AdminKeys, when non-empty, replaces APIKeys as the gate for just those four
-// admin endpoints: a caller must then present a key from AdminKeys there, and
-// a plain APIKeys key is rejected with 401. With both APIKeys and AdminKeys
-// left empty, the entire API is open (no auth at all).
+// AdminKeys, when non-empty, is a superset: an admin key also authorises the
+// non-admin fuel routes (so an operator's CLI needs only one key), but it
+// replaces APIKeys as the gate for the four admin endpoints specifically — a
+// plain APIKeys key is rejected there with 401. With both APIKeys and
+// AdminKeys left empty, the entire API is open (no auth at all).
 type Deps struct {
 	Pools          []PoolService // ordered as configured
 	Store          store.Store   // admin endpoints and readiness
@@ -193,11 +194,19 @@ func NewHandler(d Deps) http.Handler {
 	}
 	s := &server{pools: d.Pools, byName: byName, store: d.Store, log: log}
 
-	fuelAuth := func(h http.HandlerFunc) http.HandlerFunc { return requireAPIKey(d.APIKeys, h) }
-	adminKeys := d.AdminKeys
-	if len(adminKeys) == 0 {
-		adminKeys = d.APIKeys
+	// AdminKeys is a superset: when configured, an admin key also authorises
+	// the fuel routes (so an operator's CLI needs only one key), but the
+	// admin routes accept only AdminKeys, never a plain fuel-only APIKeys key
+	// (see Deps).
+	fuelKeys := d.APIKeys
+	adminKeys := d.APIKeys
+	if len(d.AdminKeys) > 0 {
+		fuelKeys = make([]string, 0, len(d.APIKeys)+len(d.AdminKeys))
+		fuelKeys = append(fuelKeys, d.APIKeys...)
+		fuelKeys = append(fuelKeys, d.AdminKeys...)
+		adminKeys = d.AdminKeys
 	}
+	fuelAuth := func(h http.HandlerFunc) http.HandlerFunc { return requireAPIKey(fuelKeys, h) }
 	adminAuth := func(h http.HandlerFunc) http.HandlerFunc { return requireAPIKey(adminKeys, h) }
 
 	v1 := http.NewServeMux()

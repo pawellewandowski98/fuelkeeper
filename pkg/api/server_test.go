@@ -554,8 +554,9 @@ func TestPanicRecovery(t *testing.T) {
 }
 
 // TestAdminKeys checks that a separately configured AdminKeys rejects a
-// plain fuel key on an admin route, accepts an admin key there, and does not
-// disturb the fuel-serving routes.
+// plain fuel key on an admin route, accepts an admin key there, is also
+// accepted on the fuel-serving routes (a superset, so an operator's CLI needs
+// only one key), and does not let a fuel-only key onto an admin route.
 func TestAdminKeys(t *testing.T) {
 	clk := storetest.NewClock(storetest.Start)
 	st := memory.New(memory.WithClock(clk.Now))
@@ -593,6 +594,7 @@ func TestAdminKeys(t *testing.T) {
 	}
 
 	assert.Equal(t, http.StatusOK, get("/v1/pools", "fuel-key"))
+	assert.Equal(t, http.StatusOK, get("/v1/pools", "admin-key"), "admin key also authorises fuel routes")
 	assert.Equal(t, http.StatusUnauthorized, get("/v1/pools/main/shards", "fuel-key"), "fuel key rejected on admin route")
 	assert.Equal(t, http.StatusOK, get("/v1/pools/main/shards", "admin-key"))
 	assert.Equal(t, http.StatusUnauthorized, get("/v1/pools/main/shards", ""))
