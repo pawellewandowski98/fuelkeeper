@@ -135,7 +135,9 @@ func adminCmd(ctx context.Context, name string, args []string) error {
 
 	c, err := client.New(*url, client.WithAPIKey(*key))
 	if err != nil {
-		return err
+		// client.New only ever fails on a malformed --url; that is a usage
+		// mistake (exit 2), not a runtime failure.
+		return wrapUsageError(err)
 	}
 	out := json.NewEncoder(os.Stdout)
 	out.SetIndent("", "  ")

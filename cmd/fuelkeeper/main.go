@@ -90,6 +90,6 @@ func usage() {
   fuelkeeper shards     --url URL --pool P [--status S] [--limit N]
   fuelkeeper quarantine --url URL --pool P list|requeue [--outpoints a:0,b:1]|retire --txid T
   fuelkeeper release    --url URL --pool P --token T --outpoints a:0,b:1
-  fuelkeeper fund --sats N [--url http://127.0.0.1:8080] [--key K | FUELKEEPER_API_KEY] [--wallet http://localhost:3321] [--output-index -1]
+  fuelkeeper fund --sats N [--url http://127.0.0.1:8080] [--key K | FUELKEEPER_API_KEY] [--wallet http://localhost:3321] [--output-index 0]
   fuelkeeper version`)
 }

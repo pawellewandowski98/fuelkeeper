@@ -59,7 +59,8 @@ func runFundCmd(ctx context.Context, args []string, stdout io.Writer, newPayer f
 	key := fs.String("key", os.Getenv("FUELKEEPER_API_KEY"),
 		"API key (or $FUELKEEPER_API_KEY); must be an admin key when the server has admin keys configured")
 	walletURL := fs.String("wallet", "http://localhost:3321", "local BRC-100 wallet base URL")
-	outputIndex := fs.Int("output-index", 0, "index of the funding output within the wallet's created transaction")
+	outputIndex := fs.Int("output-index", 0,
+		"index of the funding output within the wallet's created transaction (default 0; -1/auto-detect is not yet supported and is rejected as bad_funding)")
 	if err := fs.Parse(args); err != nil {
 		return wrapUsageError(err)
 	}
@@ -69,7 +70,9 @@ func runFundCmd(ctx context.Context, args []string, stdout io.Writer, newPayer f
 
 	fk, err := client.New(*url, client.WithAPIKey(*key))
 	if err != nil {
-		return err
+		// client.New only ever fails on a malformed --url; that is a usage
+		// mistake (exit 2), not a runtime failure.
+		return wrapUsageError(err)
 	}
 
 	var w payer

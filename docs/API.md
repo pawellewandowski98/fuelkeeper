@@ -137,7 +137,7 @@ FuelKeeper's treasury mints fuel from its own wallet balance. `GET`/`POST /v1/fu
 | Status | Code | Meaning | Retry-After |
 |--------|------|---------|-------------|
 | 400 | `bad_request` | Malformed request (bad base64, a `sender_identity_key` that is not 66 hex chars) | No |
-| 400 | `bad_funding` | The treasury could not verify or accept the payment (wrong derivation, missing output, insufficient value, ...) | No |
+| 400 | `bad_funding` | The treasury could not verify or accept the payment (wrong derivation, missing output, insufficient value, invalid sender identity key (hex but not a valid compressed point), ...) | No |
 | 404 | `funding_disabled` | This instance has no funding treasury configured | No |
 | 503 | `unavailable` | The treasury is temporarily unable to internalize the payment (e.g. mid-broadcast) | Yes (1s) |
 
@@ -146,10 +146,10 @@ FuelKeeper's treasury mints fuel from its own wallet balance. `GET`/`POST /v1/fu
 ### `fuelkeeper fund` CLI
 
 ```
-fuelkeeper fund --sats N [--url http://127.0.0.1:8080] [--key K | FUELKEEPER_API_KEY] [--wallet http://localhost:3321] [--output-index -1]
+fuelkeeper fund --sats N [--url http://127.0.0.1:8080] [--key K | FUELKEEPER_API_KEY] [--wallet http://localhost:3321] [--output-index 0]
 ```
 
-Drives your local BRC-100 wallet (default `http://localhost:3321`) through the flow above: fetches funding instructions, derives a payment key, pays a P2PKH output for `--sats` satoshis, and posts the result. `--key` must be an admin key when the server has `api.admin_keys` configured. On success it prints `funded <sats> sats in <txid>`. If the wallet broadcasts the payment but `POST /v1/funding` then fails, the error names the already-broadcast txid and the `derivation_prefix`/`derivation_suffix` pair to retry with -- never re-run `fuelkeeper fund` from scratch in that case, since that would pay again.
+Drives your local BRC-100 wallet (default `http://localhost:3321`) through the flow above: fetches funding instructions, derives a payment key, pays a P2PKH output for `--sats` satoshis, and posts the result. `--key` must be an admin key when the server has `api.admin_keys` configured. On success it prints `funded <sats> sats in <txid>`. `--output-index` defaults to `0`; `-1` (auto-detect) is not yet supported by the treasury and is rejected as `bad_funding`. If the wallet broadcasts the payment but `POST /v1/funding` then fails, the error names the already-broadcast txid and the `derivation_prefix`/`derivation_suffix` pair to retry with -- never re-run `fuelkeeper fund` from scratch in that case, since that would pay again.
 
 ## Go Client Quick Start
 

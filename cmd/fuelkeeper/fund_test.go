@@ -215,3 +215,19 @@ func TestFundCmdBadFlagIsUsageError(t *testing.T) {
 	var uerr *usageError
 	require.ErrorAs(t, err, &uerr, "expected a usageError, got %T: %v", err, err)
 }
+
+// TestFundCmdBadURLIsUsageError checks that a malformed --url (client.New's
+// only failure mode) is a usageError (exit 2), not a bare runtime error (exit
+// 1): the operator mistyped a flag, the wallet was never touched, and no
+// network call was attempted.
+func TestFundCmdBadURLIsUsageError(t *testing.T) {
+	var stdout bytes.Buffer
+	err := runFundCmd(context.Background(), []string{"--sats", "100", "--url", "://bad"}, &stdout, func(string) payer {
+		t.Fatal("the wallet must not be touched when --url is malformed")
+		return nil
+	})
+	require.Error(t, err)
+	var uerr *usageError
+	require.ErrorAs(t, err, &uerr, "expected a usageError, got %T: %v", err, err)
+	assert.Empty(t, stdout.String())
+}
