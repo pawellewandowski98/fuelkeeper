@@ -226,7 +226,11 @@ export FK_TTN_STORAGE=$HOME/fk-ttn-treasury.sqlite   # persistent: funding lands
 go test -tags ttn -run TestTeratestnetSmoke -v -timeout 15m ./pkg/treasury/toolbox/
 ```
 
-The test skips when a variable is unset. The first run on a new storage
+`FK_TTN_STORAGE` is optional: without it the test uses a fresh sqlite file
+in a temporary directory that is deleted when the test ends, so any funding
+sent to that wallet is stranded (the derivation data is gone with the
+file). Set it to a persistent path before funding. The test skips when a
+required variable is unset. The first run on a new storage
 prints the treasury identity key and skips with "has no funds". To fund it,
 run FuelKeeper with the same key and treasury storage
 (`examples/teratestnet.yaml` with `FUELKEEPER_TREASURY_KEY=$FK_TTN_ROOT_KEY`

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/client"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/config"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
 )
@@ -469,4 +472,62 @@ type closeRecorder struct {
 func (c closeRecorder) Close() error {
 	c.onClose()
 	return c.Store.Close()
+}
+
+// leaseCounter counts job lease acquisitions.
+type leaseCounter struct {
+	store.Store
+	jobLeases *atomic.Int32
+}
+
+func (l leaseCounter) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
+	if strings.HasPrefix(name, "jobs/") {
+		l.jobLeases.Add(1)
+	}
+	return l.Store.TryAcquireOrRenew(ctx, name, holder, ttl)
+}
+
+// TestRunServeConfigListenFailsBeforeJobsStart checks that the listener is
+// bound before any job starts: with the port taken, no job lease is ever
+// requested, so no minter round can touch the treasury.
+func TestRunServeConfigListenFailsBeforeJobsStart(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+	cfg := shutdownTestConfig(t)
+	cfg.API.Listen = ln.Addr().String()
+	require.True(t, cfg.Jobs.Enabled)
+	var leases atomic.Int32
+	hooks := serveHooks{newStore: func(ctx context.Context, sc factory.Config, now func() time.Time) (store.Store, error) {
+		st, err := factory.New(ctx, sc, now)
+		return leaseCounter{Store: st, jobLeases: &leases}, err
+	}}
+	err = runServeConfig(context.Background(), cfg, hooks)
+	require.ErrorContains(t, err, "listen")
+	assert.Zero(t, leases.Load(), "no job ran")
+}
+
+func TestWarnUnverifiableSpends(t *testing.T) {
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	cfg := shutdownTestConfig(t)
+	cfg.Oracle.Kind = "arcade"
+	cfg.Oracle.ArcadeURL = "http://arcade"
+	cfg.Pools[0].SpendPolicy = pool.SpendVerify
+	warnUnverifiableSpends(log, cfg)
+	assert.Contains(t, buf.String(), "spend_policy: verify with an oracle that cannot answer outpoint queries")
+	assert.Contains(t, buf.String(), "pool=main")
+
+	buf.Reset()
+	cfg.Oracle.TeranodeURL = "http://teranode"
+	cfg.Oracle.Kind = "composite"
+	warnUnverifiableSpends(log, cfg)
+	assert.Empty(t, buf.String(), "teranode answers outpoints")
+
+	buf.Reset()
+	cfg.Oracle = config.Default().Oracle
+	cfg.Oracle.Kind = "arcade"
+	cfg.Pools[0].SpendPolicy = pool.SpendTrust
+	warnUnverifiableSpends(log, cfg)
+	assert.Empty(t, buf.String(), "trust needs no outpoint verdict")
 }

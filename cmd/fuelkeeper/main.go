@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -73,13 +74,24 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	if err != nil {
+	if code := exitCode(err); code != 0 {
 		fmt.Fprintln(os.Stderr, "error:", err)
-		var uerr *usageError
-		if errors.As(err, &uerr) {
-			os.Exit(2)
-		}
-		os.Exit(1)
+		os.Exit(code)
+	}
+}
+
+// exitCode maps a command's error to the process exit code: 0 for success
+// and for -h/--help (the flag set has already printed its usage), 2 for a
+// usage mistake, 1 for anything else.
+func exitCode(err error) int {
+	var uerr *usageError
+	switch {
+	case err == nil, errors.Is(err, flag.ErrHelp):
+		return 0
+	case errors.As(err, &uerr):
+		return 2
+	default:
+		return 1
 	}
 }
 

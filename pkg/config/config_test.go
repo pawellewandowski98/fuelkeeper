@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 
@@ -362,7 +363,7 @@ func TestApplyPoolDefaultsForProgrammaticConfig(t *testing.T) {
 	c := config.Default()
 	p := pool.DefaultPoolConfig("main", 50)
 	require.Equal(t, pool.SpendVerify, p.SpendPolicy, "DefaultPoolConfig assumes an oracle")
-	config.ApplyPoolDefaults(&p, c.Oracle.Kind) // c.Oracle.Kind == "none"
+	config.ApplyPoolDefaults(&p, c.Oracle) // c.Oracle.Kind == "none"
 	c.Pools = []pool.Config{p}
 	// Default().API.Listen (":8080") is not loopback-only and carries no
 	// api_keys; opt into the insecure guard here since this test is about
@@ -406,12 +407,14 @@ func TestLoadExampleTeratestnet(t *testing.T) {
 	require.Len(t, c.Pools, 1)
 	assert.Equal(t, 50, c.Pools[0].SplitSize)
 	assert.Equal(t, int64(500), c.Pools[0].TargetAvailable)
-	assert.Equal(t, pool.SpendVerify, c.Pools[0].SpendPolicy)
+	assert.Equal(t, pool.SpendTrust, c.Pools[0].SpendPolicy, "arcade-only oracle: spends are trusted")
+	assert.Equal(t, pool.ReleaseTrust, c.Pools[0].ReleasePolicy)
 
 	t.Setenv("FUELKEEPER_TERANODE_URL", "http://teranode:8090/api/v1")
 	c, err = config.Load("../../examples/teratestnet.yaml")
 	require.NoError(t, err)
 	assert.Equal(t, "http://teranode:8090/api/v1", c.Oracle.TeranodeURL)
+	assert.Equal(t, pool.SpendVerify, c.Pools[0].SpendPolicy, "with teranode, spends are verified")
 }
 
 func TestLoadExampleTeratestnetNeedsTreasuryKey(t *testing.T) {
@@ -500,4 +503,78 @@ func TestDefaultTreasuryToolboxIsTTN(t *testing.T) {
 	assert.Equal(t, "ttn", c.Treasury.Toolbox.Network)
 	assert.Equal(t, "fuelkeeper", c.Treasury.Toolbox.Originator)
 	assert.Equal(t, time.Minute, c.Jobs.Minter.BuildTimeout)
+}
+
+// TestOperationsDocConfigBlocksLoad parses every fenced yaml block of
+// docs/OPERATIONS.md with the strict loader, so the documented templates
+// cannot drift from what FuelKeeper accepts.
+func TestOperationsDocConfigBlocksLoad(t *testing.T) {
+	raw, err := os.ReadFile("../../docs/OPERATIONS.md")
+	require.NoError(t, err)
+	blocks := regexp.MustCompile("(?s)```yaml\n(.*?)```").FindAllStringSubmatch(string(raw), -1)
+	require.GreaterOrEqual(t, len(blocks), 2, "the full template and the nullnet example")
+	for i, b := range blocks {
+		_, err := config.Parse([]byte(b[1]))
+		require.NoError(t, err, "docs/OPERATIONS.md yaml block %d", i+1)
+	}
+}
+
+// oracleYAML is a minimal config with the given oracle block and pool extras.
+func oracleYAML(oracleBlock, poolExtra string) []byte {
+	return []byte(`
+store: {backend: memory}
+pools:
+  - name: main
+    denomination: 50
+` + poolExtra + `
+oracle:
+` + oracleBlock + `
+api: {listen: "127.0.0.1:0"}
+`)
+}
+
+func TestSpendPolicyDefaultFollowsOutpointOracle(t *testing.T) {
+	cases := []struct {
+		oracle string
+		want   pool.SpendPolicy
+	}{
+		{"  kind: none", pool.SpendTrust},
+		{"  kind: mock", pool.SpendVerify},
+		{"  kind: arcade\n  arcade_url: http://arcade", pool.SpendTrust},
+		{"  kind: composite\n  arcade_url: http://arcade", pool.SpendTrust},
+		{"  kind: composite\n  arcade_url: http://arcade\n  teranode_url: http://teranode", pool.SpendVerify},
+		{"  kind: teranode\n  teranode_url: http://teranode", pool.SpendVerify},
+	}
+	for _, tc := range cases {
+		c, err := config.Parse(oracleYAML(tc.oracle, ""))
+		require.NoError(t, err, tc.oracle)
+		assert.Equal(t, tc.want, c.Pools[0].SpendPolicy, tc.oracle)
+	}
+
+	// An explicit verify with an arcade-only oracle is kept (serve warns).
+	c, err := config.Parse(oracleYAML("  kind: arcade\n  arcade_url: http://arcade", "    spend_policy: verify"))
+	require.NoError(t, err)
+	assert.Equal(t, pool.SpendVerify, c.Pools[0].SpendPolicy)
+	assert.False(t, c.Oracle.AnswersOutpoints())
+}
+
+func TestReleaseVerifyNeedsOutpointOracle(t *testing.T) {
+	for _, o := range []string{
+		"  kind: arcade\n  arcade_url: http://arcade",
+		"  kind: composite\n  arcade_url: http://arcade",
+	} {
+		_, err := config.Parse(oracleYAML(o, "    release_policy: verify"))
+		require.ErrorContains(t, err, "release_policy=verify needs an oracle that answers outpoint queries", o)
+		require.ErrorContains(t, err, "teranode_url", "the message names the fix")
+	}
+	for _, o := range []string{
+		"  kind: composite\n  arcade_url: http://arcade\n  teranode_url: http://teranode",
+		"  kind: teranode\n  teranode_url: http://teranode",
+		"  kind: mock",
+	} {
+		_, err := config.Parse(oracleYAML(o, "    release_policy: verify"))
+		require.NoError(t, err, o)
+	}
+	_, err := config.Parse(oracleYAML("  kind: none", "    release_policy: verify"))
+	require.ErrorContains(t, err, "release_policy=verify requires an oracle")
 }

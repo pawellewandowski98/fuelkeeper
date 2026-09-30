@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -61,14 +62,13 @@ func TestOutpointsPreservesOrderAndLength(t *testing.T) {
 	assert.Equal(t, ops[1], res[1].Outpoint)
 }
 
-func TestTxFillsInputsFromSecondary(t *testing.T) {
+func TestTxNeverCallsSecondary(t *testing.T) {
 	ctx := context.Background()
 	txid := storetest.NewTxID()
 	txOracle := oracle.NewMock()
 	opsOracle := oracle.NewMock()
 	txOracle.SetTx(txid, oracle.TxStatus{Known: true, Mined: true, Status: "MINED", BlockHeight: 42})
-	inputs := []store.Outpoint{{TxID: storetest.NewTxID(), Vout: 1}}
-	opsOracle.SetTx(txid, oracle.TxStatus{Known: true, Inputs: inputs})
+	opsOracle.SetTx(txid, oracle.TxStatus{Known: true, Inputs: []store.Outpoint{{TxID: storetest.NewTxID(), Vout: 1}}})
 
 	c := composite.New(txOracle, opsOracle)
 	st, err := c.Tx(ctx, txid)
@@ -77,122 +77,81 @@ func TestTxFillsInputsFromSecondary(t *testing.T) {
 	assert.True(t, st.Mined)
 	assert.Equal(t, "MINED", st.Status)
 	assert.Equal(t, uint32(42), st.BlockHeight)
-	assert.Equal(t, inputs, st.Inputs)
-	assert.Equal(t, 1, opsOracle.Calls())
-}
-
-func TestTxSecondaryDownKeepsPrimary(t *testing.T) {
-	ctx := context.Background()
-	txid := storetest.NewTxID()
-	txOracle := oracle.NewMock()
-	opsOracle := oracle.NewMock()
-	txOracle.SetTx(txid, oracle.TxStatus{Known: true, Mined: true})
-	opsOracle.SetDown(true)
-
-	c := composite.New(txOracle, opsOracle)
-	st, err := c.Tx(ctx, txid)
-	require.NoError(t, err)
-	assert.True(t, st.Known)
-	assert.True(t, st.Mined)
-	assert.Nil(t, st.Inputs)
-}
-
-func TestTxPrimaryUnknownSkipsSecondary(t *testing.T) {
-	ctx := context.Background()
-	txid := storetest.NewTxID()
-	txOracle := oracle.NewMock() // no SetTx: Known stays false.
-	opsOracle := oracle.NewMock()
-
-	c := composite.New(txOracle, opsOracle)
-	st, err := c.Tx(ctx, txid)
-	require.NoError(t, err)
-	assert.False(t, st.Known)
-	assert.Equal(t, 0, opsOracle.Calls())
-}
-
-func TestTxPrimaryAlreadyHasInputsSkipsSecondary(t *testing.T) {
-	ctx := context.Background()
-	txid := storetest.NewTxID()
-	txOracle := oracle.NewMock()
-	opsOracle := oracle.NewMock()
-	existing := []store.Outpoint{{TxID: storetest.NewTxID(), Vout: 0}}
-	txOracle.SetTx(txid, oracle.TxStatus{Known: true, Inputs: existing})
-
-	c := composite.New(txOracle, opsOracle)
-	st, err := c.Tx(ctx, txid)
-	require.NoError(t, err)
-	assert.Equal(t, existing, st.Inputs)
-	assert.Equal(t, 0, opsOracle.Calls())
+	assert.Nil(t, st.Inputs, "Inputs come from TxInputs, not Tx")
+	assert.Equal(t, 0, opsOracle.Calls(), "the watcher's Tx checks never reach the secondary")
 }
 
 func TestTxPrimaryErrorPropagates(t *testing.T) {
 	ctx := context.Background()
-	txid := storetest.NewTxID()
 	txOracle := oracle.NewMock()
 	txOracle.SetDown(true)
-	opsOracle := oracle.NewMock()
-
-	c := composite.New(txOracle, opsOracle)
-	_, err := c.Tx(ctx, txid)
+	c := composite.New(txOracle, oracle.NewMock())
+	_, err := c.Tx(ctx, storetest.NewTxID())
 	require.ErrorIs(t, err, oracle.ErrUnavailable)
-	assert.Equal(t, 0, opsOracle.Calls())
 }
 
-func TestTxNoSecondaryConfigured(t *testing.T) {
+func TestTxInputsFromSecondaryTx(t *testing.T) {
 	ctx := context.Background()
 	txid := storetest.NewTxID()
-	txOracle := oracle.NewMock()
-	txOracle.SetTx(txid, oracle.TxStatus{Known: true, Mined: true})
-
-	c := composite.New(txOracle, nil)
-	st, err := c.Tx(ctx, txid)
-	require.NoError(t, err)
-	assert.True(t, st.Known)
-	assert.Nil(t, st.Inputs)
-}
-
-// TestTxSecondaryEmptyInputsStaysNonNil covers N2: a secondary that reports
-// Inputs as a non-nil, zero-length slice ("known, spends nothing we could
-// find") must not have that collapsed into the nil "unknown" sentinel by the
-// copy composite.Tx makes.
-func TestTxSecondaryEmptyInputsStaysNonNil(t *testing.T) {
-	ctx := context.Background()
-	txid := storetest.NewTxID()
-	txOracle := oracle.NewMock()
 	opsOracle := oracle.NewMock()
-	txOracle.SetTx(txid, oracle.TxStatus{Known: true})
-	opsOracle.SetTx(txid, oracle.TxStatus{Known: true, Inputs: []store.Outpoint{}})
+	inputs := []store.Outpoint{{TxID: storetest.NewTxID(), Vout: 1}}
+	opsOracle.SetTx(txid, oracle.TxStatus{Known: true, Inputs: inputs})
+	c := composite.New(oracle.NewMock(), opsOracle)
 
-	c := composite.New(txOracle, opsOracle)
-	st, err := c.Tx(ctx, txid)
+	got, err := c.TxInputs(ctx, txid)
 	require.NoError(t, err)
-	assert.NotNil(t, st.Inputs)
-	assert.Empty(t, st.Inputs)
+	assert.Equal(t, inputs, got)
+
+	got, err = c.TxInputs(ctx, storetest.NewTxID())
+	require.NoError(t, err)
+	assert.Nil(t, got, "a tx the secondary does not know has unknown inputs")
+
+	opsOracle.SetDown(true)
+	_, err = c.TxInputs(ctx, txid)
+	require.ErrorIs(t, err, oracle.ErrUnavailable)
 }
 
-// TestTxSecondaryInputsAreClonedNotAliased covers the other half of N2:
-// composite.Tx must copy the secondary's Inputs slice rather than alias it,
-// so a caller mutating the returned slice cannot corrupt the secondary
-// oracle's own state.
-func TestTxSecondaryInputsAreClonedNotAliased(t *testing.T) {
-	ctx := context.Background()
-	txid := storetest.NewTxID()
+func TestTxInputsNoSecondaryIsUnknown(t *testing.T) {
 	txOracle := oracle.NewMock()
-	opsOracle := oracle.NewMock()
-	txOracle.SetTx(txid, oracle.TxStatus{Known: true})
-	original := []store.Outpoint{{TxID: storetest.NewTxID(), Vout: 0}}
-	opsOracle.SetTx(txid, oracle.TxStatus{Known: true, Inputs: original})
-
-	c := composite.New(txOracle, opsOracle)
-	st, err := c.Tx(ctx, txid)
+	txid := storetest.NewTxID()
+	txOracle.SetTx(txid, oracle.TxStatus{Known: true, Inputs: []store.Outpoint{{Vout: 3}}})
+	got, err := composite.New(txOracle, nil).TxInputs(context.Background(), txid)
 	require.NoError(t, err)
-	require.Len(t, st.Inputs, 1)
+	assert.Nil(t, got)
+}
 
-	st.Inputs[0].Vout = 99
+// sharedInputs is an oracle.InputsResolver that returns (and keeps) one
+// shared slice, the way a caching backend would, so aliasing is observable.
+type sharedInputs struct {
+	oracle.None
+	ins []store.Outpoint
+}
 
-	st2, err := c.Tx(ctx, txid)
+func (s *sharedInputs) TxInputs(context.Context, chainhash.Hash) ([]store.Outpoint, error) {
+	return s.ins, nil
+}
+
+func TestTxInputsUsesSecondaryResolverAndDoesNotAlias(t *testing.T) {
+	ctx := context.Background()
+	sec := &sharedInputs{ins: []store.Outpoint{{Vout: 0}}}
+	c := composite.New(oracle.NewMock(), sec)
+
+	got, err := c.TxInputs(ctx, storetest.NewTxID())
 	require.NoError(t, err)
-	assert.Equal(t, uint32(0), st2.Inputs[0].Vout, "mutating the returned Inputs must not affect later answers")
+	require.Equal(t, []store.Outpoint{{Vout: 0}}, got)
+	got[0].Vout = 99
+	assert.Equal(t, uint32(0), sec.ins[0].Vout, "mutating the result must not reach the backend's slice")
+
+	sec.ins = []store.Outpoint{}
+	got, err = c.TxInputs(ctx, storetest.NewTxID())
+	require.NoError(t, err)
+	assert.NotNil(t, got, "known, spends nothing: stays non-nil")
+	assert.Empty(t, got)
+
+	sec.ins = nil
+	got, err = c.TxInputs(ctx, storetest.NewTxID())
+	require.NoError(t, err)
+	assert.Nil(t, got)
 }
 
 // TestNewPanicsOnNilTx covers N6: the primary tx oracle is required.

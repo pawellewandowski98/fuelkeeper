@@ -540,3 +540,19 @@ func TestUnexpectedStatusError(t *testing.T) {
 		assert.Equal(t, http.StatusBadGateway, use.Code)
 	})
 }
+
+// TestNewRedactsUserinfo checks that a credential in the base URL never
+// reaches an error message.
+func TestNewRedactsUserinfo(t *testing.T) {
+	for _, base := range []string{
+		"ftp://user:s3cr3t@arcade.example",
+		"http://user:s3cr3t@arcade.example/v1?x=1",
+		"http://user:s3cr3t@[::1",
+		"//user:s3cr3t@arcade.example",
+	} {
+		_, err := arcadeclient.New(base)
+		require.Error(t, err, base)
+		assert.NotContains(t, err.Error(), "s3cr3t", base)
+		assert.NotContains(t, err.Error(), "user:", base)
+	}
+}

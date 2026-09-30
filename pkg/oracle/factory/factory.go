@@ -66,6 +66,23 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// AnswersOutpoints reports whether the configured oracle can give a verdict
+// on an outpoint (Oracle.Outpoints): mock, teranode, and composite with a
+// teranode_url. none, arcade, and composite without teranode answer every
+// outpoint Unknown, so rows that need an outpoint verdict (expired
+// reservations, releases under release_policy verify, unhinted spends under
+// spend_policy verify) stay quarantined until an operator requeues them.
+func (c Config) AnswersOutpoints() bool {
+	switch c.Kind {
+	case KindMock, KindTeranode:
+		return true
+	case KindComposite:
+		return c.TeranodeURL != ""
+	default:
+		return false
+	}
+}
+
 // New builds the configured oracle. Kind mock returns an *oracle.Mock, so a
 // caller can drive it further.
 func New(c Config) (oracle.Oracle, error) {

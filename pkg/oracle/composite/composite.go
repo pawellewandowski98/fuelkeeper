@@ -1,13 +1,12 @@
 // Package composite pairs two oracle.Oracle backends behind one Oracle: one
 // answers Outpoints, the other answers Tx. This lets a deployment use, say,
 // an arcade broadcast gateway for Tx lifecycle (mined/rejected/competing)
-// while a teranode node answers Outpoints and fills in the Inputs that
+// while a teranode node answers Outpoints and, through TxInputs, supplies the Inputs that
 // arcade cannot supply.
 package composite
 
 import (
 	"context"
-	"slices"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
@@ -46,28 +45,45 @@ func (o *Oracle) Outpoints(ctx context.Context, ops []store.Outpoint) ([]oracle.
 	return o.tx.Outpoints(ctx, ops)
 }
 
-// Tx asks the tx backend for txid's verdict. When that verdict is Known but
-// has no Inputs (a broadcast gateway tracks lifecycle but cannot serve raw
-// transactions), and a secondary outpoints backend is configured, Tx also
-// asks the secondary for its own verdict and copies its Inputs across. A
-// secondary that errors, or itself reports no Inputs, leaves the primary
-// verdict untouched: an unavailable secondary must never fail the primary
-// verdict, so on a nil Inputs the reaper falls back to its documented trust
-// model (SpentHint plus quarantine) instead of resolving the row.
+// Tx asks the tx backend for txid's verdict. It never calls the outpoints
+// backend: the watcher checks Tx for every unmined shard each tick and never
+// needs Inputs, so fetching raw transactions there would be wasted. The
+// reaper gets Inputs, when it needs them, from TxInputs.
 func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, error) {
-	st, err := o.tx.Tx(ctx, txid)
-	if err != nil {
-		return oracle.TxStatus{}, err
-	}
-	if st.Known && st.Inputs == nil && o.outpoints != nil {
-		if sec, secErr := o.outpoints.Tx(ctx, txid); secErr == nil && sec.Inputs != nil {
-			// Clone rather than alias: sec.Inputs may be backed by state the
-			// secondary oracle owns, and slices.Clone(nil) never happens here
-			// (sec.Inputs != nil already), so a non-nil-but-empty slice stays
-			// non-nil -- "known, spends nothing we could find" is preserved
-			// rather than collapsing to the nil "unknown" sentinel.
-			st.Inputs = slices.Clone(sec.Inputs)
-		}
-	}
-	return st, nil
+	return o.tx.Tx(ctx, txid)
 }
+
+// TxInputs implements oracle.InputsResolver from the outpoints backend: its
+// own TxInputs when it has one, else the Inputs of its Tx verdict. Without
+// an outpoints backend (a tx-only gateway such as arcade) it reports nil
+// (unknown). The result is a copy: a non-nil, empty slice ("known, spends
+// nothing we could find") stays non-nil, and the caller cannot alias the
+// backend's state.
+func (o *Oracle) TxInputs(ctx context.Context, txid chainhash.Hash) ([]store.Outpoint, error) {
+	if o.outpoints == nil {
+		return nil, nil
+	}
+	var ins []store.Outpoint
+	if r, ok := o.outpoints.(oracle.InputsResolver); ok {
+		got, err := r.TxInputs(ctx, txid)
+		if err != nil {
+			return nil, err
+		}
+		ins = got
+	} else {
+		st, err := o.outpoints.Tx(ctx, txid)
+		if err != nil {
+			return nil, err
+		}
+		if !st.Known {
+			return nil, nil
+		}
+		ins = st.Inputs
+	}
+	if ins == nil {
+		return nil, nil
+	}
+	return append(make([]store.Outpoint, 0, len(ins)), ins...), nil
+}
+
+var _ oracle.InputsResolver = (*Oracle)(nil)

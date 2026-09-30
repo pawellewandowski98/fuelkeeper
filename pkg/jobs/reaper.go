@@ -133,7 +133,12 @@ func (c ReaperConfig) Validate() error {
 // could name any mined, unrelated txid as its hint and have the row
 // incorrectly resolved to spent.
 //
-// When TxStatus.Inputs is nil — an oracle that cannot serve the raw
+// When a mined verdict's Inputs is nil and the oracle implements
+// oracle.InputsResolver (a composite of arcade and teranode), the reaper asks
+// it for the inputs, once per txid per tick (fillInputs); the watcher never
+// pays for that lookup.
+//
+// When TxStatus.Inputs is still nil — an oracle that cannot serve the raw
 // transaction (e.g. a gateway that only tracks broadcast status) reports
 // unknown inputs, never "no inputs" — this check cannot be performed and the
 // previous trust model applies: a Spent verdict or a client's hint is trusted
@@ -449,6 +454,7 @@ func (r *Reaper) resolveViaTx(
 			return nil
 		}
 		oracleRequests.WithLabelValues("tx", "ok").Inc()
+		r.fillInputs(ctx, p, txid, &got)
 		entry = &txCacheEntry{ts: &got}
 		if got.Inputs != nil {
 			entry.inputs = make(map[store.Outpoint]struct{}, len(got.Inputs))
@@ -484,6 +490,29 @@ func (r *Reaper) resolveViaTx(
 	}
 	toSpent[txid] = append(toSpent[txid], outpoint)
 	return nil
+}
+
+// fillInputs asks an oracle.InputsResolver for the inputs of a mined spender
+// whose verdict carries none (a tx-only gateway such as arcade, behind a
+// composite oracle with teranode). It runs once per txid per tick (the
+// result is cached with the verdict). A failure leaves Inputs nil, i.e.
+// unknown: the mined verdict is then trusted as documented on Reaper.
+func (r *Reaper) fillInputs(ctx context.Context, p string, txid chainhash.Hash, ts *oracle.TxStatus) {
+	if ts.Inputs != nil || !ts.Known || !ts.Mined || ts.Rejected {
+		return
+	}
+	ir, ok := r.orc.(oracle.InputsResolver)
+	if !ok {
+		return
+	}
+	ins, err := ir.TxInputs(ctx, txid)
+	if err != nil {
+		oracleRequests.WithLabelValues("tx_inputs", "error").Inc()
+		r.log.Warn("oracle TxInputs unavailable; trusting the mined spender without an input check", "pool", p, "txid", txid, "err", err)
+		return
+	}
+	oracleRequests.WithLabelValues("tx_inputs", "ok").Inc()
+	ts.Inputs = ins
 }
 
 // resolve applies the classified outcomes, chunking to the store's MaxBatch.

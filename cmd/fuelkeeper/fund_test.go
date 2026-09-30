@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -230,4 +233,43 @@ func TestFundCmdBadURLIsUsageError(t *testing.T) {
 	var uerr *usageError
 	require.ErrorAs(t, err, &uerr, "expected a usageError, got %T: %v", err, err)
 	assert.Empty(t, stdout.String())
+}
+
+// TestRunFundRejectsUnknownProtocol checks that a server advertising a
+// different BRC-29 protocol is refused before the wallet derives or pays
+// anything.
+func TestRunFundRejectsUnknownProtocol(t *testing.T) {
+	idKey := mustPubKeyHex(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/funding" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"identity_key":%q,"derivation_prefix":"cHJlZml4","network":"ttn","protocol":"ffff","instructions":""}`, idKey)
+	}))
+	defer srv.Close()
+	p := newFakePayer(t)
+	var stdout bytes.Buffer
+	err := runFundCmd(context.Background(), []string{"--sats", "100", "--url", srv.URL}, &stdout, func(string) payer { return p })
+	require.ErrorContains(t, err, `protocol "ffff"`)
+	assert.Equal(t, 1, exitCode(err))
+	assert.Empty(t, p.calls, "the wallet is never asked for a key")
+	assert.Empty(t, stdout.String())
+}
+
+// TestHelpExitsZero checks that -h/--help on every command prints usage
+// (to the flag set's output) and maps to exit code 0, while a bad flag
+// stays a usage error (2).
+func TestHelpExitsZero(t *testing.T) {
+	ctx := context.Background()
+	for _, h := range []string{"-h", "--help"} {
+		assert.Equal(t, 0, exitCode(runFundCmd(ctx, []string{h}, io.Discard, nil)), "fund "+h)
+		assert.Equal(t, 0, exitCode(serveCmd(ctx, []string{h})), "serve "+h)
+		assert.Equal(t, 0, exitCode(adminCmd(ctx, "pools", []string{h})), "pools "+h)
+	}
+	assert.Equal(t, 2, exitCode(runFundCmd(ctx, []string{"--nope"}, io.Discard, nil)))
+	assert.Equal(t, 1, exitCode(errors.New("boom")))
+	assert.Equal(t, 0, exitCode(nil))
 }

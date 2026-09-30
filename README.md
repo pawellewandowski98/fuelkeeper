@@ -5,13 +5,14 @@ that wallets reserve on demand and attach as one extra input to pay transaction
 fees. Fuel is spendable with unlocking data prepared in advance (a hash-puzzle
 preimage by default), so no signing service sits on the hot path.
 
-Status: Plan 3 complete: HTTP API, Go client and `serve` command. Pool core
-(Plan 2): hash-puzzle fuel, sharded per-instance ownership with batched
-(group-commit) reservations, and background jobs (reaper, proof watcher,
-minter) behind leased runners. This branch (`feat/treasury`) adds the
-go-wallet-toolbox treasury and BRC-29 funding: see `docs/TREASURY.md` and
-`docs/FUNDING.md` (a module importing `pkg/config` or `pkg/treasury/...`
-must copy the three `replace` lines from this `go.mod`). Design:
+Status: Plan 5 complete: the go-wallet-toolbox treasury, BRC-29 funding
+and the arcade/teranode/composite oracles (see `docs/TREASURY.md` and
+`docs/FUNDING.md`), on top of the HTTP API, Go client and `serve` command
+(Plan 3) and the pool core (Plan 2): hash-puzzle fuel, sharded per-instance
+ownership with batched (group-commit) reservations, and background jobs
+(reaper, proof watcher, minter) behind leased runners. A module importing
+`pkg/config` or `pkg/treasury/...` must copy the three `replace` lines from
+this `go.mod`. Design:
 `docs/superpowers/specs/2026-09-29-fuelkeeper-design.md`.
 
 ## Develop

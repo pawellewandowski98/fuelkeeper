@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -703,4 +704,52 @@ func TestDecodeJSONLimitedAllowsTrailingWhitespace(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, res, 1)
 	assert.Equal(t, oracle.StatusUnspent, res[0].Status)
+}
+
+// TestNewRedactsUserinfo checks that a credential in the base URL never
+// reaches an error message.
+func TestNewRedactsUserinfo(t *testing.T) {
+	for _, base := range []string{
+		"//user:s3cr3t@teranode.example",
+		"http://user:s3cr3t@[::1",
+	} {
+		_, err := teranode.New(teranode.Config{BaseURL: base})
+		require.Error(t, err, base)
+		assert.NotContains(t, err.Error(), "s3cr3t", base)
+	}
+}
+
+func TestRequestErrorsRedactUserinfo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	o, err := teranode.NewURL(strings.Replace(srv.URL, "http://", "http://user:s3cr3t@", 1))
+	require.NoError(t, err)
+	_, err = o.Tx(context.Background(), storetest.NewTxID())
+	require.ErrorIs(t, err, oracle.ErrUnavailable)
+	assert.NotContains(t, err.Error(), "s3cr3t")
+}
+
+func TestTxInputs(t *testing.T) {
+	raw, txid, inputs := buildRawTx(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/tx/{txid}", func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("txid") != txid.String() {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write(raw)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	o, err := teranode.NewURL(srv.URL + "/api/v1")
+	require.NoError(t, err)
+
+	got, err := o.TxInputs(context.Background(), txid)
+	require.NoError(t, err)
+	assert.Equal(t, inputs, got)
+	got, err = o.TxInputs(context.Background(), storetest.NewTxID())
+	require.NoError(t, err)
+	assert.Nil(t, got, "an unknown tx has unknown inputs")
 }

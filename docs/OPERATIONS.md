@@ -25,7 +25,7 @@ instance:
   lease_ttl: 30s               # Duration the instance holds shard leases; must exceed rescan_interval; default 30s
   rescan_interval: 5s          # How often to rescan the store for new shards; default 5s
   reserve_timeout: 2s          # Max time a single reserve request can take; default 2s
-  flush_window: 0              # Extra time the coalescer waits to batch concurrent Reserve calls into one store write; default 0 (flush as soon as a slot is free)
+  flush_window: 0s             # Extra time the coalescer waits to batch concurrent Reserve calls into one store write; default 0 (flush as soon as a slot is free)
   max_batch: 0                 # Max rows to batch before flushing; default 0 (no limit)
   flush_timeout: 5s            # Max time to hold a partial batch before flushing; default 5s
   adopt_timeout: 200ms         # Max time a reserve request waits for shard adoption; default 200ms
@@ -54,7 +54,8 @@ pools:
     max_ttl: 10m                     # Maximum allowed TTL; default 10m
     max_count: 100                   # Max outputs per reserve request; default 100
     release_policy: trust            # trust (default) | verify; verify released outputs via oracle
-    spend_policy: verify             # trust | verify (default unless oracle.kind: none); verify spent outputs via oracle
+    spend_policy: trust              # trust | verify; default verify when the oracle answers outpoint queries
+                                     #   (mock, teranode, composite with teranode_url), else trust; see "Oracle kinds and policies"
     expected_tps: 0                  # Expected transactions per second (for capacity validation); no check if 0
 
 # Background jobs (enabled by default)
@@ -131,8 +132,8 @@ treasury:
 api:
   listen: ":8080"                    # Host:port to bind; default :8080
   insecure: false                    # Allow access without API keys (non-loopback listen requires explicit insecure: true)
-  api_keys: []                       # Bearer tokens for /v1/ endpoints; cannot be empty if omitted
-  admin_keys: []                     # Bearer tokens for admin endpoints; empty = use fuel keys
+  api_keys: ["${FUELKEEPER_API_KEY}"]      # Bearer tokens for /v1/ endpoints; required unless listen is loopback or insecure: true
+  admin_keys: ["${FUELKEEPER_ADMIN_KEY}"]  # Bearer tokens for admin endpoints (funding, quarantine); empty = use api_keys
   read_timeout: 10s                  # HTTP read timeout; default 10s
   write_timeout: 30s                 # HTTP write timeout; default 30s
   idle_timeout: 120s                 # HTTP idle keep-alive timeout; default 120s
@@ -155,6 +156,7 @@ On startup, FuelKeeper validates the configuration:
 - `jobs.watcher.limit` must exceed `jobs.minter.max_pending_shards`
 - Mint capacity must be ≥ 1.2× `expected_tps` for each pool (when expected_tps > 0)
 - Pools with `spend_policy: verify` or `release_policy: verify` require an oracle (`oracle.kind` != "none")
+- `release_policy: verify` requires an oracle that answers outpoint queries (`teranode`, `composite` with `teranode_url`, or `mock`); `spend_policy` defaults to `verify` only for such an oracle and to `trust` otherwise
 - `oracle.kind: arcade` and `composite` need `oracle.arcade_url` (or a toolbox treasury, whose arcade they then use); `teranode` needs `oracle.teranode_url`
 - `treasury.kind: toolbox` needs a valid `root_key_hex` (plus `arcade_url` and `chaintracks_url` on `test`/`tstn`; `main` and `ttn` default to the toolbox's public endpoints), and every pool must share one leaf cost class (same `split_size` × `denomination`, same leaf size): one treasury keeps one chunk denomination (see [TREASURY.md](TREASURY.md))
 - `treasury.toolbox.reconcile_grace` must exceed `jobs.minter.build_timeout` + 10 s (the reconcile budget), or Reconcile could abort a split whose Build and PutShard were merely slow
@@ -165,6 +167,39 @@ nested blocks to flat keys: `oracle.arcade.url` is now `oracle.arcade_url`
 and `oracle.teranode.url` is now `oracle.teranode_url`. The old keys are
 rejected as unknown fields. `oracle.mock.assume_unspent` and
 `treasury.mock.confirm_after` are unchanged.
+
+### Oracle Kinds and Policies
+
+The reaper settles quarantined rows with two oracle questions: *is this
+outpoint spent?* (`Outpoints`) and *is this txid mined, and what does it
+spend?* (`Tx`, plus the inputs lookup). Not every oracle answers both:
+
+| `oracle.kind` | Outpoints | Mined status | Spender inputs |
+|---|---|---|---|
+| `none` | never (Unknown) | never | no |
+| `mock` | nullnet only | nullnet only | as configured |
+| `arcade` | never (Unknown) | yes | no |
+| `composite` without `teranode_url` | never (Unknown) | yes (arcade) | no |
+| `composite` with `teranode_url` | yes (teranode) | yes (arcade) | yes (teranode raw tx, fetched only by the reaper) |
+| `teranode` | yes | **never** | yes |
+
+What that means for rows (and shards):
+
+| Situation | Needs | none / arcade / composite without teranode | composite with teranode | teranode alone |
+|---|---|---|---|---|
+| Expired reservation (every policy) | an Unspent outpoint verdict | stays quarantined until requeued by hand (`fuelkeeper quarantine requeue`) | requeued after `min_unspent_age` | requeued |
+| Release, `release_policy: trust` | nothing | available at once | available at once | available at once |
+| Release, `release_policy: verify` | an Unspent outpoint verdict | **rejected by config** | requeued after `min_unspent_age` | requeued |
+| Spend, `spend_policy: trust` | nothing | spent at once | spent at once | spent at once |
+| Spend, `spend_policy: verify` | the hinted txid mined, or a Spent verdict | resolved once the hinted txid is mined, **with no input check**: a client hint naming *any* mined txid is trusted; a false hint leaves the row quarantined (none: always quarantined; config rejects verify with none) | resolved once mined, and only if the mined spender's inputs include the outpoint | stays quarantined: teranode never reports Mined |
+| Split shards (watcher) | Mined status | never mined with `none` (use the mock treasury); mined via arcade | mined via arcade | **never mined**: do not use teranode alone |
+
+So: use `composite` with `teranode_url` for production. An arcade-only
+oracle (`arcade`, or `composite` without `teranode_url`) is only suitable
+with `release_policy: trust` and `spend_policy: trust` (the defaults it
+gets), and even then expired reservations accumulate in quarantine until an
+operator requeues them. Config rejects `release_policy: verify` with such an
+oracle, and `serve` logs a Warn for `spend_policy: verify` with one.
 
 ## Deployment Topologies
 
@@ -435,7 +470,7 @@ Pools with `spend_policy: verify` need an oracle that is not "none"; FuelKeeper 
 
 Similarly, `release_policy: verify` requires an oracle with error `"release_policy=verify requires an oracle"`.
 
-Remedy: either set `oracle.kind` to arcade, teranode or composite (with its `arcade_url`/`teranode_url`), or mock (with assume_unspent: true for nullnet), or change the policies to "trust".
+Remedy: set `oracle.kind: composite` with `oracle.teranode_url` (arcade alone cannot answer outpoint queries, so `release_policy: verify` is rejected with it and `spend_policy: verify` trusts any mined hint; see [Oracle Kinds and Policies](#oracle-kinds-and-policies)), use `mock` with `assume_unspent: true` for nullnet, or change the policies to "trust".
 
 ### Configuration Validation Errors
 

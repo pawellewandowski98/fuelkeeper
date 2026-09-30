@@ -72,8 +72,10 @@ All non-2xx responses are JSON with the shape `{"code", "message", "retry_after"
 | Status | Code | Meaning | Retry-After |
 |--------|------|---------|-------------|
 | 400 | `bad_request` | Malformed or invalid request | No |
+| 400 | `bad_funding` | `POST /v1/funding`: the treasury could not verify or accept the payment (see [Funding errors](#errors-1)) | No |
 | 401 | `unauthorized` | Invalid or missing API key (`WWW-Authenticate: Bearer` header present) | No |
 | 404 | `unknown_pool` or `not_found` | Pool not found or resource missing | No |
+| 404 | `funding_disabled` | `/v1/funding`: this instance has no funding treasury (mock/nullnet) | No |
 | 405 | `method_not_allowed` | Wrong HTTP method; `Allow` header lists permitted methods | No |
 | 409 | `insufficient` | Fewer than `min_count` outputs available; nothing is held | Yes (1s) |
 | 499 | `client_closed_request` | Client disconnected before response sent | No |

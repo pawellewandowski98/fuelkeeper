@@ -99,6 +99,11 @@ func runFund(ctx context.Context, fk *client.Client, w payer, sats uint64, outpu
 	if err != nil {
 		return "", 0, fmt.Errorf("fund: get funding info: %w", err)
 	}
+	if info.Protocol != brc29Protocol {
+		// Deriving under another protocol would pay a key the treasury
+		// cannot find: refuse before the wallet spends anything.
+		return "", 0, fmt.Errorf("fund: server reports BRC-29 protocol %q, this client derives under %q; upgrade one of them", info.Protocol, brc29Protocol)
+	}
 	fkKey, err := ec.PublicKeyFromString(info.IdentityKey)
 	if err != nil {
 		return "", 0, fmt.Errorf("fund: parse treasury identity key: %w", err)

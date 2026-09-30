@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -92,10 +93,10 @@ func New(cfg Config) (*Oracle, error) {
 	}
 	u, err := url.Parse(cfg.BaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("teranode: invalid base url %q: %w", cfg.BaseURL, err)
+		return nil, fmt.Errorf("teranode: invalid base url %q: %w", redactURL(cfg.BaseURL), parseErrCause(err))
 	}
 	if u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("teranode: base url %q must be absolute (scheme and host required)", cfg.BaseURL)
+		return nil, fmt.Errorf("teranode: base url %q must be absolute (scheme and host required)", redactURL(cfg.BaseURL))
 	}
 
 	httpClient := cfg.HTTPClient
@@ -192,7 +193,7 @@ func (o *Oracle) getOutpoint(ctx context.Context, op store.Outpoint) (oracle.Res
 	}
 	resp, err := o.http.Do(req)
 	if err != nil {
-		return oracle.Result{}, fmt.Errorf("%w: GET %s: %w", oracle.ErrUnavailable, u, err)
+		return oracle.Result{}, fmt.Errorf("%w: GET %s: %w", oracle.ErrUnavailable, redactURL(u), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -205,7 +206,7 @@ func (o *Oracle) getOutpoint(ctx context.Context, op store.Outpoint) (oracle.Res
 		// reasons this client cannot introspect), which this tick cannot
 		// fix by retrying differently; ErrUnavailable lets the caller retry
 		// the tick later rather than treating it as a definitive verdict.
-		return oracle.Result{}, fmt.Errorf("%w: GET %s: unexpected status %s", oracle.ErrUnavailable, u, resp.Status)
+		return oracle.Result{}, fmt.Errorf("%w: GET %s: unexpected status %s", oracle.ErrUnavailable, redactURL(u), resp.Status)
 	}
 
 	var sr wireSpendResponse
@@ -237,14 +238,14 @@ func (o *Oracle) outpointsBatch(ctx context.Context, ops []store.Outpoint) ([]or
 
 	resp, err := o.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: POST %s: %w", oracle.ErrUnavailable, u, err)
+		return nil, fmt.Errorf("%w: POST %s: %w", oracle.ErrUnavailable, redactURL(u), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		// Covers 400 (bad length), 413 (too large), 429 (rate-limited) and
 		// 5xx alike: none of these are a verdict this tick can act on.
-		return nil, fmt.Errorf("%w: POST %s: unexpected status %s", oracle.ErrUnavailable, u, resp.Status)
+		return nil, fmt.Errorf("%w: POST %s: unexpected status %s", oracle.ErrUnavailable, redactURL(u), resp.Status)
 	}
 
 	// []*wireSpendResponse, not []wireSpendResponse: a rogue "null" element
@@ -320,7 +321,7 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 	}
 	resp, err := o.http.Do(req)
 	if err != nil {
-		return oracle.TxStatus{}, fmt.Errorf("%w: GET %s: %w", oracle.ErrUnavailable, u, err)
+		return oracle.TxStatus{}, fmt.Errorf("%w: GET %s: %w", oracle.ErrUnavailable, redactURL(u), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -328,7 +329,7 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 		return oracle.TxStatus{}, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return oracle.TxStatus{}, fmt.Errorf("%w: GET %s: unexpected status %s", oracle.ErrUnavailable, u, resp.Status)
+		return oracle.TxStatus{}, fmt.Errorf("%w: GET %s: unexpected status %s", oracle.ErrUnavailable, redactURL(u), resp.Status)
 	}
 
 	raw, err := readLimited(resp.Body)
@@ -351,6 +352,37 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 	}
 
 	return oracle.TxStatus{Known: true, Status: "known", Inputs: inputs}, nil
+}
+
+// TxInputs implements oracle.InputsResolver: the outpoints txid spends, from
+// its raw transaction, or nil when the node does not know it.
+func (o *Oracle) TxInputs(ctx context.Context, txid chainhash.Hash) ([]store.Outpoint, error) {
+	st, err := o.Tx(ctx, txid)
+	if err != nil || !st.Known {
+		return nil, err
+	}
+	return st.Inputs, nil
+}
+
+var _ oracle.InputsResolver = (*Oracle)(nil)
+
+// userinfoPattern matches the userinfo ("user:pass@") of a URL-like string,
+// even one url.Parse rejects.
+var userinfoPattern = regexp.MustCompile(`^((?:[^:/?#]*:)?//)[^/?#@]*@`)
+
+// redactURL hides a URL's userinfo so a credential in a configured URL
+// never reaches an error message or log.
+func redactURL(s string) string {
+	return userinfoPattern.ReplaceAllString(s, "${1}redacted@")
+}
+
+// parseErrCause is url.Parse's error without the URL it echoes.
+func parseErrCause(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }
 
 // inputsFromTx converts tx's inputs to the outpoints they spend, in order.

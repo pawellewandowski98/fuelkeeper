@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -236,18 +237,19 @@ func New(base string, opts ...Option) (*Client, error) {
 	if base == "" {
 		return nil, errors.New("arcadeclient: base url must not be empty")
 	}
+	shown := redactURL(base)
 	u, err := url.Parse(base)
 	if err != nil {
-		return nil, fmt.Errorf("arcadeclient: invalid base url %q: %w", base, err)
+		return nil, fmt.Errorf("arcadeclient: invalid base url %q: %w", shown, parseErrCause(err))
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, fmt.Errorf("arcadeclient: base url %q must use the http or https scheme", base)
+		return nil, fmt.Errorf("arcadeclient: base url %q must use the http or https scheme", shown)
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("arcadeclient: base url %q must be absolute (scheme and host required)", base)
+		return nil, fmt.Errorf("arcadeclient: base url %q must be absolute (scheme and host required)", shown)
 	}
 	if u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("arcadeclient: base url %q must not contain a query string or fragment", base)
+		return nil, fmt.Errorf("arcadeclient: base url %q must not contain a query string or fragment", shown)
 	}
 	c := &Client{
 		base: strings.TrimRight(base, "/"),
@@ -284,6 +286,25 @@ func (c *Client) do(ctx context.Context, method, path, contentType string, body 
 		return nil, fmt.Errorf("arcadeclient: %s %s: %w", method, path, err)
 	}
 	return resp, nil
+}
+
+// userinfoPattern matches the userinfo ("user:pass@") of a URL-like string,
+// even one url.Parse rejects.
+var userinfoPattern = regexp.MustCompile(`^((?:[^:/?#]*:)?//)[^/?#@]*@`)
+
+// redactURL hides a URL's userinfo so a credential in a configured URL
+// never reaches an error message or log.
+func redactURL(s string) string {
+	return userinfoPattern.ReplaceAllString(s, "${1}redacted@")
+}
+
+// parseErrCause is url.Parse's error without the URL it echoes.
+func parseErrCause(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }
 
 // isValidTxID reports whether txid is exactly 64 lowercase hex characters.

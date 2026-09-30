@@ -243,7 +243,7 @@ func Parse(data []byte) (*Config, error) {
 		// Only resolve via oracle context when the operator left spend_policy
 		// unset; an explicit choice (verify or trust) is never overridden.
 		if c.Pools[i].SpendPolicy == "" {
-			ApplyPoolDefaults(&c.Pools[i], c.Oracle.Kind)
+			ApplyPoolDefaults(&c.Pools[i], c.Oracle)
 		}
 	}
 	if err := c.Validate(); err != nil {
@@ -262,26 +262,28 @@ func Parse(data []byte) (*Config, error) {
 //     ("puzzle"). A caller who set LockMode directly without LockModeName
 //     keeps that choice, exactly as (*pool.Config).Validate documents for an
 //     empty LockModeName.
-//   - SpendPolicy is always resolved from oracleKind: SpendTrust with no
-//     oracle configured (oracleKind == "none"), SpendVerify otherwise. This
-//     overrides pool.DefaultPoolConfig's own SpendPolicy, which assumes an
-//     oracle is present (see its doc comment), whenever that assumption does
-//     not hold.
+//   - SpendPolicy is always resolved from the oracle: SpendVerify when it
+//     answers outpoint queries (ofactory.Config.AnswersOutpoints: mock,
+//     teranode, composite with teranode_url), SpendTrust otherwise (none,
+//     arcade, composite without teranode), since an unhinted spend could
+//     never be verified there. This overrides pool.DefaultPoolConfig's own
+//     SpendPolicy, which assumes such an oracle (see its doc comment),
+//     whenever that assumption does not hold.
 //
 // Go callers composing a pool.Config programmatically should call this after
 // pool.DefaultPoolConfig so they get the same resolution the YAML loader
 // applies. Parse itself only calls this for a pool whose YAML left
 // spend_policy unset, so an operator's explicit choice is never overridden;
 // a direct caller has no such guard and should only call it when it wants
-// SpendPolicy recomputed from oracleKind unconditionally.
-func ApplyPoolDefaults(p *pool.Config, oracleKind string) {
+// SpendPolicy recomputed from the oracle unconditionally.
+func ApplyPoolDefaults(p *pool.Config, orc ofactory.Config) {
 	if p.LockModeName == "" {
 		p.LockModeName = pool.DefaultPoolConfig("", 0).LockModeName
 	}
-	if oracleKind == "none" {
-		p.SpendPolicy = pool.SpendTrust
-	} else {
+	if orc.AnswersOutpoints() {
 		p.SpendPolicy = pool.SpendVerify
+	} else {
+		p.SpendPolicy = pool.SpendTrust
 	}
 }
 
@@ -395,6 +397,14 @@ func (c *Config) Validate() error {
 		}
 		if p.ReleasePolicy == pool.ReleaseVerify && c.Oracle.Kind == "none" {
 			return fmt.Errorf("config: pool %s: release_policy=verify requires an oracle (oracle.kind is none)", p.Name)
+		}
+		if p.ReleasePolicy == pool.ReleaseVerify && !c.Oracle.AnswersOutpoints() {
+			// A verified release is requeued only on an Unspent outpoint
+			// verdict, which this oracle never gives: every released row
+			// would stay quarantined.
+			return fmt.Errorf("config: pool %s: release_policy=verify needs an oracle that answers outpoint queries, "+
+				"and oracle.kind %s does not; set oracle.teranode_url (kind composite) or oracle.kind: teranode, or use release_policy: trust",
+				p.Name, c.Oracle.Kind)
 		}
 	}
 	switch c.Log.Level {

@@ -194,6 +194,23 @@ func warnInsecureListener(log *slog.Logger, cfg *config.Config) {
 		"make sure that is intentional", "listen", cfg.API.Listen)
 }
 
+// warnUnverifiableSpends logs a Warn for each pool with spend_policy: verify
+// whose oracle cannot answer outpoint queries (none is rejected by config;
+// arcade, or composite without teranode_url, answers every outpoint
+// Unknown): its unhinted spent rows stay quarantined until an operator
+// requeues them. See docs/OPERATIONS.md "Oracle kinds and policies".
+func warnUnverifiableSpends(log *slog.Logger, cfg *config.Config) {
+	if cfg.Oracle.AnswersOutpoints() {
+		return
+	}
+	for _, p := range cfg.Pools {
+		if p.SpendPolicy == pool.SpendVerify {
+			log.Warn("spend_policy: verify with an oracle that cannot answer outpoint queries: unhinted spent rows stay quarantined until requeued by hand; set oracle.teranode_url or use spend_policy: trust",
+				"pool", p.Name, "oracle", cfg.Oracle.Kind)
+		}
+	}
+}
+
 // serveHooks lets tests observe or intercept points runServeConfig would
 // otherwise only expose via logs, real network I/O or a real store backend.
 type serveHooks struct {
@@ -257,6 +274,7 @@ func runServeConfig(ctx context.Context, cfg *config.Config, hooks serveHooks) e
 	log := newLogger(cfg.Log)
 	logNullnetHint(log, cfg)
 	warnInsecureListener(log, cfg)
+	warnUnverifiableSpends(log, cfg)
 
 	// Build the oracle and open the treasury before the store is ever opened.
 	orc, mockOrc, err := buildOracle(cfg.Oracle)
@@ -340,8 +358,16 @@ func runServeConfig(ctx context.Context, cfg *config.Config, hooks serveHooks) e
 		closeTreasury()
 	}()
 
+	// Bind before the jobs start: a port-in-use failure must not let a minter
+	// round touch the treasury wallet first.
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", cfg.API.Listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", cfg.API.Listen, err)
+	}
 	if cfg.Jobs.Enabled {
 		if err := startJobs(jobCtx, &jobWG, st, orc, tr, names, cfg, clock, log); err != nil {
+			_ = ln.Close()
 			return err
 		}
 	}
@@ -359,11 +385,6 @@ func runServeConfig(ctx context.Context, cfg *config.Config, hooks serveHooks) e
 		Funder:         ot.Funder,
 	})
 	srv := api.NewServer(cfg.API.Listen, h, cfg.API.ReadTimeout, cfg.API.WriteTimeout, cfg.API.IdleTimeout)
-	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", cfg.API.Listen)
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", cfg.API.Listen, err)
-	}
 	log.Info("fuelkeeper listening", "addr", ln.Addr().String(), "version", version, "pools", names, "store", cfg.Store.Backend)
 	if hooks.onListen != nil {
 		hooks.onListen(ln.Addr().String())
