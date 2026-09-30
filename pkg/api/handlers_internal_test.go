@@ -64,3 +64,12 @@ func TestClientCancellation(t *testing.T) {
 
 	assert.Equal(t, 499, rec.Code)
 }
+
+// TestBeefURLEscapesPoolName guards item 12: pool names are only length
+// bounded (store.ValidatePool), not charset restricted, so beefURL must not
+// assume a name is already URL-safe.
+func TestBeefURLEscapesPoolName(t *testing.T) {
+	got := beefURL("weird pool/name", chainhash.Hash{})
+	assert.NotContains(t, got, " ")
+	assert.Contains(t, got, "weird%20pool%2Fname")
+}

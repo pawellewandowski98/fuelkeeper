@@ -72,12 +72,16 @@ type OutpointsRequest struct {
 	Outpoints []string `json:"outpoints"`
 }
 
-// CountResponse reports how many rows changed.
+// CountResponse reports how many rows changed. Only the field named by the
+// endpoint that returned it is meaningful (e.g. release populates Released
+// only); the other three are always present, not omitted when zero, so a
+// client can rely on every field's presence rather than treating a missing
+// key as "unknown".
 type CountResponse struct {
-	Released int `json:"released,omitempty"`
-	Accepted int `json:"accepted,omitempty"`
-	Requeued int `json:"requeued,omitempty"`
-	Retired  int `json:"retired,omitempty"`
+	Released int `json:"released"`
+	Accepted int `json:"accepted"`
+	Requeued int `json:"requeued"`
+	Retired  int `json:"retired"`
 }
 
 // ShardCounts are shards by status.

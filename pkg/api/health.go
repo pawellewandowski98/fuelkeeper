@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -29,7 +30,11 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 // how many configured pools report Ready(ctx) == true, so an operator can
 // alert on 0 even when the overall response is 200 "ready" (a fresh instance
 // that has not yet adopted a shard is still able to serve, just not primed).
-func readyz(p Pinger, pools []PoolService) http.HandlerFunc {
+//
+// A ping failure's real error (which may embed a DSN, host, user or SQL
+// state) is logged at Warn, not returned to the client: the response's error
+// field is always the fixed string "store ping failed".
+func readyz(log *slog.Logger, p Pinger, pools []PoolService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if len(pools) == 0 {
 			writeJSON(w, http.StatusServiceUnavailable, wire.Ready{Status: "no pools configured"})
@@ -38,10 +43,11 @@ func readyz(p Pinger, pools []PoolService) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), readinessPingTimeout)
 		defer cancel()
 		if err := p.Ping(ctx); err != nil {
+			log.Warn("readyz: store ping failed", "err", err)
 			writeJSON(w, http.StatusServiceUnavailable, wire.Ready{
 				Status: "store unavailable",
 				Pools:  len(pools),
-				Error:  err.Error(),
+				Error:  "store ping failed",
 			})
 			return
 		}

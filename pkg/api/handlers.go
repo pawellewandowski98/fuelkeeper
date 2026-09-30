@@ -2,8 +2,10 @@ package api
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/api/wire"
@@ -26,13 +28,18 @@ const (
 	quarantineHorizon = 24 * time.Hour
 )
 
+// maxReserveTTLSeconds is the largest ttl_seconds reserve accepts: beyond
+// this, converting to a time.Duration (seconds * time.Second) would overflow
+// int64 and wrap into an unpredictable (possibly negative) duration.
+const maxReserveTTLSeconds = math.MaxInt64 / int64(time.Second)
+
 // listPools returns every configured pool with its live store stats.
 func (s *server) listPools(w http.ResponseWriter, r *http.Request) {
 	out := make([]wire.Pool, 0, len(s.pools))
 	for _, p := range s.pools {
 		stats, err := p.Stats(r.Context())
 		if err != nil {
-			writeError(w, err)
+			s.writeError(w, err)
 			return
 		}
 		out = append(out, toPool(p.Config(), stats))
@@ -44,12 +51,12 @@ func (s *server) listPools(w http.ResponseWriter, r *http.Request) {
 func (s *server) getPool(w http.ResponseWriter, r *http.Request) {
 	p, err := s.pool(r.PathValue("pool"))
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	stats, err := p.Stats(r.Context())
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toPool(p.Config(), stats))
@@ -60,16 +67,20 @@ func (s *server) reserve(w http.ResponseWriter, r *http.Request) {
 	poolName := r.PathValue("pool")
 	p, err := s.pool(poolName)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	var req wire.ReserveRequest
 	if err := decode(r, &req); err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	if req.Count < 0 || req.MinCount < 0 || req.TTLSeconds < 0 {
-		writeError(w, fmt.Errorf("%w: count, min_count and ttl_seconds must be >= 0", pool.ErrBadRequest))
+		s.writeError(w, fmt.Errorf("%w: count, min_count and ttl_seconds must be >= 0", pool.ErrBadRequest))
+		return
+	}
+	if int64(req.TTLSeconds) > maxReserveTTLSeconds {
+		s.writeError(w, fmt.Errorf("%w: ttl_seconds must be <= %d", pool.ErrBadRequest, maxReserveTTLSeconds))
 		return
 	}
 	res, err := p.Reserve(r.Context(), pool.ReserveRequest{
@@ -78,7 +89,7 @@ func (s *server) reserve(w http.ResponseWriter, r *http.Request) {
 		TTL:      time.Duration(req.TTLSeconds) * time.Second,
 	})
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toReserveResponse(poolName, res))
@@ -88,27 +99,27 @@ func (s *server) reserve(w http.ResponseWriter, r *http.Request) {
 func (s *server) release(w http.ResponseWriter, r *http.Request) {
 	p, err := s.pool(r.PathValue("pool"))
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	var req wire.ReleaseRequest
 	if err := decode(r, &req); err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	tok, err := parseToken(req.Token)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	ops, err := parseOutpoints(req.Outpoints, p.Config().MaxCount)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	n, err := p.Release(r.Context(), tok, ops)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, wire.CountResponse{Released: n})
@@ -118,32 +129,32 @@ func (s *server) release(w http.ResponseWriter, r *http.Request) {
 func (s *server) spend(w http.ResponseWriter, r *http.Request) {
 	p, err := s.pool(r.PathValue("pool"))
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	var req wire.SpendRequest
 	if err := decode(r, &req); err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	tok, err := parseToken(req.Token)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	ops, err := parseOutpoints(req.Outpoints, p.Config().MaxCount)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	txid, err := parseTxID(req.TxID)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	n, err := p.Spend(r.Context(), tok, ops, txid)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, wire.CountResponse{Accepted: n})
@@ -153,17 +164,17 @@ func (s *server) spend(w http.ResponseWriter, r *http.Request) {
 func (s *server) beef(w http.ResponseWriter, r *http.Request) {
 	p, err := s.pool(r.PathValue("pool"))
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	txid, err := parseTxID(r.PathValue("txid"))
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	beef, version, status, err := p.BEEF(r.Context(), txid)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	etag := fmt.Sprintf("%q", "v"+strconv.FormatInt(version, 10))
@@ -174,7 +185,7 @@ func (s *server) beef(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.Header().Set("Cache-Control", "no-cache")
 	}
-	if inm := r.Header.Get("If-None-Match"); inm != "" && inm == etag {
+	if inm := r.Header.Get("If-None-Match"); inm != "" && ifNoneMatchHit(inm, etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -187,27 +198,27 @@ func (s *server) beef(w http.ResponseWriter, r *http.Request) {
 func (s *server) listShards(w http.ResponseWriter, r *http.Request) {
 	poolName := r.PathValue("pool")
 	if _, err := s.pool(poolName); err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	var f store.ShardFilter
 	if raw := r.URL.Query().Get("status"); raw != "" {
 		st, ok := parseShardStatus(raw)
 		if !ok {
-			writeError(w, fmt.Errorf("%w: unknown status %q", pool.ErrBadRequest, raw))
+			s.writeError(w, fmt.Errorf("%w: unknown status %q", pool.ErrBadRequest, raw))
 			return
 		}
 		f.Statuses = []store.ShardStatus{st}
 	}
 	limit, err := parseLimit(r.URL.Query().Get("limit"))
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	f.Limit = limit
 	shards, err := s.store.ListShards(r.Context(), poolName, f)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	out := make([]wire.ShardInfo, 0, len(shards))
@@ -221,17 +232,17 @@ func (s *server) listShards(w http.ResponseWriter, r *http.Request) {
 func (s *server) retireShard(w http.ResponseWriter, r *http.Request) {
 	poolName := r.PathValue("pool")
 	if _, err := s.pool(poolName); err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	txid, err := parseTxID(r.PathValue("txid"))
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	n, err := s.store.RetireShard(r.Context(), poolName, txid)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	s.log.Warn("shard retired via admin API", "pool", poolName, "txid", txid.String(), "rows_invalidated", n)
@@ -242,17 +253,17 @@ func (s *server) retireShard(w http.ResponseWriter, r *http.Request) {
 func (s *server) listQuarantined(w http.ResponseWriter, r *http.Request) {
 	poolName := r.PathValue("pool")
 	if _, err := s.pool(poolName); err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	limit, err := parseLimit(r.URL.Query().Get("limit"))
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	rows, err := s.store.ListQuarantined(r.Context(), poolName, time.Now().Add(quarantineHorizon), nil, limit)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	out := make([]wire.Row, 0, len(rows))
@@ -266,26 +277,47 @@ func (s *server) listQuarantined(w http.ResponseWriter, r *http.Request) {
 func (s *server) requeue(w http.ResponseWriter, r *http.Request) {
 	poolName := r.PathValue("pool")
 	if _, err := s.pool(poolName); err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	var req wire.OutpointsRequest
 	if err := decode(r, &req); err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	ops, err := parseOutpoints(req.Outpoints, maxRequeueOutpoints)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	n, err := s.store.Resolve(r.Context(), poolName, ops, store.StateAvailable, nil)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, err)
 		return
 	}
 	s.log.Warn("outpoints requeued via admin API", "pool", poolName, "count", n)
 	writeJSON(w, http.StatusOK, wire.CountResponse{Requeued: n})
+}
+
+// ifNoneMatchHit reports whether header (an If-None-Match value, possibly a
+// comma-separated list) matches etag under RFC 9110 §13.1.2's weak
+// comparison: "*" always matches, and each comma-separated member matches
+// when its opaque-tag equals etag's after stripping an optional leading "W/"
+// weak indicator. etag itself is always a strong tag (a quoted "v<version>",
+// see beef), so it is compared as-is.
+func ifNoneMatchHit(header, etag string) bool {
+	header = strings.TrimSpace(header)
+	if header == "*" {
+		return true
+	}
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(part)
+		part = strings.TrimPrefix(part, "W/")
+		if part == etag {
+			return true
+		}
+	}
+	return false
 }
 
 // parseShardStatus maps the wire status filter to a store.ShardStatus.

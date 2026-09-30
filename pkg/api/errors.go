@@ -63,12 +63,19 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // writeError maps err to an HTTP status and a stable error code, sets
 // Retry-After when the error is retryable, and writes the wire.Error
-// envelope. Internal errors never leak their detail to the client.
+// envelope. Internal and unavailable errors never leak their detail (a
+// wrapped DSN, host, credential or SQL state, for example) to the client: a
+// fixed, safe message is sent instead. Callers that want the real error
+// logged should do so themselves before or instead of calling this directly
+// (see (*server).writeError).
 func writeError(w http.ResponseWriter, err error) {
 	status, code, retryAfter := mapErr(err)
 	msg := err.Error()
-	if code == "internal" {
+	switch code {
+	case "internal":
 		msg = "internal error"
+	case "unavailable":
+		msg = "store temporarily unavailable"
 	}
 	if retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))

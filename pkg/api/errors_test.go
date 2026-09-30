@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -49,4 +50,18 @@ func TestMapErr(t *testing.T) {
 	writeError(rec, errors.New("secret detail"))
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 	assert.NotContains(t, rec.Body.String(), "secret detail", "internal errors are not leaked")
+}
+
+// TestWriteErrorDoesNotLeakUnavailableDetail guards against a wrapped
+// store.ErrUnavailable carrying connection detail (DSN host, user, password)
+// through to the client: writeError must always answer 503 with a fixed,
+// safe message.
+func TestWriteErrorDoesNotLeakUnavailableDetail(t *testing.T) {
+	err := fmt.Errorf("%w: dial tcp 10.1.2.3:5432: password authentication failed", store.ErrUnavailable)
+	rec := httptest.NewRecorder()
+	writeError(rec, err)
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.NotContains(t, rec.Body.String(), "10.1.2.3")
+	assert.NotContains(t, rec.Body.String(), "password")
+	assert.JSONEq(t, `{"code":"unavailable","message":"store temporarily unavailable","retry_after":1}`, rec.Body.String())
 }

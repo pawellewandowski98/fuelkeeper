@@ -3,6 +3,8 @@ package api
 import (
 	"encoding/hex"
 	"fmt"
+	"net/url"
+	"regexp"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -12,16 +14,18 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 )
 
-// beefURL is the pool-scoped BEEF URL for txid.
+// beefURL is the pool-scoped BEEF URL for txid. poolName is escaped: pool
+// names are only length-bounded (see store.ValidatePool), not charset
+// restricted, so this must not assume it is already URL-safe.
 func beefURL(poolName string, txid chainhash.Hash) string {
-	return "/v1/pools/" + poolName + "/beef/" + txid.String()
+	return "/v1/pools/" + url.PathEscape(poolName) + "/beef/" + txid.String()
 }
 
 // toReserveResponse converts a pool.Reservation to its wire form.
 func toReserveResponse(poolName string, r *pool.Reservation) wire.ReserveResponse {
 	out := wire.ReserveResponse{
 		Token:      r.Token.String(),
-		ExpiresAt:  r.ExpiresAt,
+		ExpiresAt:  r.ExpiresAt.UTC(),
 		TTLSeconds: int(r.TTL / time.Second),
 		LockMode:   r.LockMode.String(),
 		Outputs:    make([]wire.Output, 0, len(r.Outputs)),
@@ -106,10 +110,10 @@ func toShardInfo(sh store.Shard) wire.ShardInfo {
 		Status:    sh.Status.String(),
 		Owner:     sh.Owner,
 		Version:   sh.Version,
-		CreatedAt: sh.CreatedAt,
+		CreatedAt: sh.CreatedAt.UTC(),
 	}
 	if !sh.LeaseUntil.IsZero() {
-		lu := sh.LeaseUntil
+		lu := sh.LeaseUntil.UTC()
 		info.LeaseUntil = &lu
 	}
 	return info
@@ -123,12 +127,15 @@ func hashStr(h *chainhash.Hash) string {
 	return h.String()
 }
 
-// timePtr returns nil for a zero time, else a pointer to t.
+// timePtr returns nil for a zero time, else a pointer to t.UTC(). Calling
+// UTC() on the zero Time is safe: it only changes the Location, not the
+// instant, so IsZero() is unaffected.
 func timePtr(t time.Time) *time.Time {
 	if t.IsZero() {
 		return nil
 	}
-	return &t
+	u := t.UTC()
+	return &u
 }
 
 // toRow converts a store.Row to its admin wire view.
@@ -177,8 +184,19 @@ func parseToken(s string) (store.Token, error) {
 	return tok, nil
 }
 
+// hexTxIDPattern matches a display-form txid: exactly 64 lowercase hex
+// characters. chainhash.NewHashFromHex accepts (and left-pads) shorter input,
+// which would silently store a wrong hash, so callers must check this first.
+var hexTxIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 // parseTxID parses a wire txid, wrapping a malformed one as ErrBadRequest.
+// The input must be exactly 64 lowercase hex characters: chainhash.NewHashFromHex
+// on its own accepts and zero-pads shorter input (e.g. "abc"), which would
+// silently store the wrong SpentHint/txid rather than reject the request.
 func parseTxID(s string) (chainhash.Hash, error) {
+	if !hexTxIDPattern.MatchString(s) {
+		return chainhash.Hash{}, fmt.Errorf("%w: txid must be 64 lowercase hex characters", pool.ErrBadRequest)
+	}
 	h, err := chainhash.NewHashFromHex(s)
 	if err != nil {
 		return chainhash.Hash{}, fmt.Errorf("%w: txid: %w", pool.ErrBadRequest, err)
