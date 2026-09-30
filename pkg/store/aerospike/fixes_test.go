@@ -583,3 +583,64 @@ func TestListQuarantinedProjectsDiscoveryAndPagesExactlyOnce(t *testing.T) {
 		assert.Equal(t, store.StateQuarantined, r.State)
 	}
 }
+
+// TestListQuarantinedDropsRowsChangedBetweenDiscoveryAndFetch reproduces the
+// review's follow-up finding: fetchQuarantinedRows' BatchGet reads each
+// candidate's CURRENT record, not a snapshot from discovery. Without the
+// fix, a row Resolved back to available in the window between the discovery
+// query and the BatchGet came back in the page with State == available and
+// a zero QuarantinedAt (Resolve clears it) -- corrupting a reaper's
+// oldest-age gauge and resume cursor, and, for a row re-quarantined instead
+// of resolved, breaking the documented (quarantined_at, txid, vout) page
+// order. The fix must drop such a row from the page instead (the contract
+// allows a page to come back short of limit) and keep every remaining row
+// in cursor order.
+//
+// The race is reproduced deterministically with the queryHook (fired once
+// the discovery query has fully streamed, i.e. exactly between the two
+// phases): it resolves one candidate row to available right there, before
+// fetchQuarantinedRows' BatchGet ever runs.
+func TestListQuarantinedDropsRowsChangedBetweenDiscoveryAndFetch(t *testing.T) {
+	clk := storetest.NewClock(storetest.Start)
+	s := isolatedStore(t, testHost(t), clk.Now)
+	ctx := context.Background()
+
+	const n = 6
+	_, rows := storetest.MintShard(t, s, "main", n, store.ShardMined)
+	tok := store.NewToken()
+	exp := clk.Now().Add(time.Minute)
+	storetest.MustReserve(t, s, "main", rows, tok, exp)
+	got, err := s.Spend(ctx, "main", tok, storetest.Ops(rows), storetest.NewTxID(), false)
+	require.NoError(t, err)
+	require.Equal(t, n, got, "non-terminal spend must quarantine every row")
+
+	victim := rows[2].Outpoint
+	s.queryHook = func(set string, _ []*as.Record) {
+		if set != s.rowsSet {
+			return
+		}
+		s.queryHook = nil // fire exactly once, between discovery and the fetch
+		_, rerr := s.Resolve(ctx, "main", []store.Outpoint{victim}, store.StateAvailable, nil)
+		assert.NoError(t, rerr, "resolving the victim row mid-flight must itself succeed")
+	}
+	page, err := s.ListQuarantined(ctx, "main", clk.Now().Add(time.Hour), nil, n)
+	s.queryHook = nil
+	require.NoError(t, err)
+
+	for _, r := range page {
+		assert.NotEqual(t, victim, r.Outpoint, "a row Resolved between discovery and fetch must not appear in the page")
+	}
+	assert.Len(t, page, n-1, "the page comes back short by exactly the one dropped row, per contract")
+
+	for i := 1; i < len(page); i++ {
+		prev, cur := page[i-1], page[i]
+		assert.True(t,
+			quarantineCursorAfter(store.RowCursor{At: cur.QuarantinedAt, Outpoint: cur.Outpoint}, store.RowCursor{At: prev.QuarantinedAt, Outpoint: prev.Outpoint}),
+			"the surviving rows must stay in (quarantined_at, txid, vout) order")
+	}
+
+	// Control: the victim really did move to available, not just vanish.
+	victimRow := storetest.RowsByOutpoint(t, s, "main", []store.Outpoint{victim})[victim]
+	assert.Equal(t, store.StateAvailable, victimRow.State)
+	assert.True(t, victimRow.QuarantinedAt.IsZero())
+}

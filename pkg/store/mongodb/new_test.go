@@ -33,12 +33,22 @@ func TestNew_ConnectErrorIncludesHost(t *testing.T) {
 }
 
 // TestNew_MalformedURIErrorNeverLeaksCredentials reproduces the review's
-// IMPORTANT finding: a malformed mongodb:// URI whose userinfo has an
-// unescaped special character (an unescaped "/" in the password, or a
-// second unescaped "@" as in "user:p@ss@host") must fail with an error that
-// names the real host and never any fragment of the username or password.
-// The driver rejects both URIs synchronously in mongo.Connect (a URI parse
-// error), before any network I/O, so this needs no running mongod.
+// IMPORTANT finding: a malformed mongodb:// (or mongodb+srv://) URI whose
+// userinfo has an unescaped special character (an unescaped "/" in the
+// password, a second unescaped "@" as in "user:p@ss@host", or an unescaped
+// "?" as in "user:pa?ss") must fail with an error that names the real host
+// -- or, when the "?" case's ambiguity makes that impossible to do safely,
+// the literal fallback "mongodb" -- and never any fragment of the username
+// or password.
+//
+// The "/" and second-"@" cases are rejected synchronously by mongo.Connect
+// itself (a URI parse error), before any network I/O, so they need no
+// running mongod. The "?" case is different: an unescaped "?" in the
+// password does not, on its own, make the driver's own URI parser reject
+// the string, so these two cases instead target an address nothing listens
+// on (mongodb://) or a domain that cannot resolve (mongodb+srv://), with a
+// short server-selection timeout, so New still fails quickly and
+// deterministically without needing a running mongod either.
 func TestNew_MalformedURIErrorNeverLeaksCredentials(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -57,6 +67,18 @@ func TestNew_MalformedURIErrorNeverLeaksCredentials(t *testing.T) {
 			uri:           "mongodb://bob:p@ssword@host:27017/db",
 			wantHost:      "host:27017",
 			mustNotAppear: []string{"bob", "ssword"},
+		},
+		{
+			name:          "unescaped ? in password (mongodb://) falls back to the literal host",
+			uri:           "mongodb://alice:pa?ss1234@127.0.0.1:1/?serverSelectionTimeoutMS=500&connectTimeoutMS=500",
+			wantHost:      "mongodb",
+			mustNotAppear: []string{"alice", "pa?ss1234", "ss1234"},
+		},
+		{
+			name:          "unescaped ? in password (mongodb+srv://) falls back to the literal host",
+			uri:           "mongodb+srv://alice:pa?ss1234@cluster0.invalid.example/?serverSelectionTimeoutMS=500&connectTimeoutMS=500",
+			wantHost:      "mongodb",
+			mustNotAppear: []string{"alice", "pa?ss1234", "ss1234"},
 		},
 	}
 	for _, tc := range cases {

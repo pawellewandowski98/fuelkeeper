@@ -429,6 +429,12 @@ func lessQuarantinedOrder(a, b store.Row) bool {
 // O(n^2/limit) overall for a full walk, instead of O(limit) full records
 // per page and O(n) overall.
 //
+// The fetch phase (fetchQuarantinedRows) re-checks each candidate against
+// its own current record and drops any that changed between the two phases
+// (Resolved away, or re-quarantined at a different instant) rather than
+// returning stale or mismatched data, so a page can come back shorter than
+// limit even when more rows exist.
+//
 // A before at or before the epoch, or a cursor at or after before, matches
 // nothing and returns an empty page without querying.
 func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Time, after *store.RowCursor, limit int) ([]store.Row, error) {
@@ -494,18 +500,32 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 	if len(candidates) == 0 {
 		return []store.Row{}, nil
 	}
-	return s.batchGetRowsOrdered(ctx, rowOutpoints(candidates))
+	return s.fetchQuarantinedRows(ctx, pool, candidates)
 }
 
-// batchGetRowsOrdered fetches the full row for each of ops by key in one
-// BatchGet and returns them in ops' own order: the client returns records in
-// input order, with a nil slot for any key not found (never expected here --
-// this package never deletes rows -- but skipped defensively, matching
-// GetRows).
-func (s *Store) batchGetRowsOrdered(ctx context.Context, ops []store.Outpoint) ([]store.Row, error) {
-	keys := make([]*as.Key, len(ops))
-	for i, op := range ops {
-		k, err := s.rowKey(op)
+// fetchQuarantinedRows fetches the full row for each of candidates by key in
+// one BatchGet, and keeps only the ones that are still exactly what
+// discovery saw: same pool, state still quarantined, and QuarantinedAt
+// unchanged from the qx value discovery read.
+//
+// BatchGet reads each key's CURRENT record, not a snapshot from discovery:
+// a candidate that Resolved back to available between the two phases would
+// otherwise come back with State == available and a zero QuarantinedAt
+// (Resolve clears it), corrupting a reaper's oldest-age gauge and its resume
+// cursor; one that was re-quarantined at a different instant in that same
+// window would come back with a QuarantinedAt that no longer matches the
+// position candidates was sorted into, breaking the documented
+// (quarantined_at, txid, vout) page order. Dropping any such row instead of
+// returning it is safe: ListQuarantined's contract allows a page to come
+// back shorter than limit.
+//
+// The client returns records in candidates' own order, with a nil slot for
+// any key not found (never expected here -- this package never deletes rows
+// -- but skipped defensively, matching GetRows).
+func (s *Store) fetchQuarantinedRows(ctx context.Context, pool string, candidates []store.Row) ([]store.Row, error) {
+	keys := make([]*as.Key, len(candidates))
+	for i, c := range candidates {
+		k, err := s.rowKey(c.Outpoint)
 		if err != nil {
 			return nil, err
 		}
@@ -515,14 +535,17 @@ func (s *Store) batchGetRowsOrdered(ctx context.Context, ops []store.Outpoint) (
 	if aerr != nil {
 		return nil, wrap(aerr)
 	}
-	out := make([]store.Row, 0, len(ops))
-	for _, rec := range recs {
+	out := make([]store.Row, 0, len(candidates))
+	for i, rec := range recs {
 		if rec == nil {
 			continue
 		}
 		r, err := rowFromRecord(rec)
 		if err != nil {
 			return nil, err
+		}
+		if r.Pool != pool || r.State != store.StateQuarantined || !r.QuarantinedAt.Equal(candidates[i].QuarantinedAt) {
+			continue // changed between discovery and fetch: drop, don't return stale/mismatched data
 		}
 		out = append(out, r)
 	}

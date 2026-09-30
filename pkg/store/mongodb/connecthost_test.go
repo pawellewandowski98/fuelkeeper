@@ -9,8 +9,18 @@ import "testing"
 // "mongodb://alice:1234/s3cretPW@localhost:27017/" (an unescaped "/" in the
 // password) parsed to Host == "alice:1234" -- itself part of the
 // username:password pair. connectHost must instead find the real host by
-// cutting at the LAST "@" before any "?" and stopping at the next "/" or
-// "?", and must never return a value containing the credentials.
+// taking the text after the LAST "@" anywhere in the URI and stopping at
+// the next "/" or "?", and must never return a value containing the
+// credentials.
+//
+// It also reproduces the follow-up review finding that an earlier fixed
+// version still leaked credentials for an unescaped "?" in the password
+// (it cut the search string at the first "?" before ever looking for "@",
+// so "mongodb://alice:pa?ss1234@localhost:27017/" yielded host "alice:pa"):
+// connectHost must instead refuse to guess a host at all -- falling back to
+// the literal "mongodb" -- whenever a "?" appears anywhere before the last
+// "@", since that ambiguity means it cannot tell a malformed userinfo "?"
+// from an "@" that is actually inside the query string.
 func TestConnectHost_NeverLeaksCredentials(t *testing.T) {
 	cases := []struct {
 		name string
@@ -46,6 +56,21 @@ func TestConnectHost_NeverLeaksCredentials(t *testing.T) {
 			name: "unparseable scheme falls back to the literal label",
 			uri:  "not-a-uri",
 			want: "mongodb",
+		},
+		{
+			name: "unescaped ? in password (mongodb://) falls back rather than leaking a userinfo fragment",
+			uri:  "mongodb://alice:pa?ss1234@localhost:27017/",
+			want: "mongodb",
+		},
+		{
+			name: "unescaped ? in password (mongodb+srv://) falls back rather than leaking a userinfo fragment",
+			uri:  "mongodb+srv://alice:pa?ss1234@cluster0.example.net/db",
+			want: "mongodb",
+		},
+		{
+			name: "well-formed mongodb+srv credentials still resolve to the host",
+			uri:  "mongodb+srv://user:pass@cluster0.example.net/db?retryWrites=true&w=majority",
+			want: "cluster0.example.net",
 		},
 	}
 	for _, tc := range cases {

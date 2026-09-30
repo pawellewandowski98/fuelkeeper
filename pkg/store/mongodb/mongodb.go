@@ -173,8 +173,9 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 	return s, nil
 }
 
-// connectHost extracts just the host(s) portion of a mongodb:// URI for use
-// in connection-error messages, without ever including embedded credentials.
+// connectHost extracts just the host(s) portion of a mongodb:// (or
+// mongodb+srv://) URI for use in connection-error messages, without ever
+// including embedded credentials.
 //
 // It deliberately does not use net/url.Parse: a URI with an unescaped
 // special character in the userinfo (for example an unescaped "/" in the
@@ -183,14 +184,29 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 // credentials (net/url stops the authority at the first "/", so
 // "alice:1234" -- part of the username:password pair -- is taken for the
 // host), silently leaking part of the credentials into logs/metrics via the
-// "mongodb: connect <host>" prefix. Parsing the authority by hand instead:
-// take everything after "://", cut at the LAST "@" that appears before any
-// "?" (so a password containing its own "@", as in "user:p@ss@host", still
-// resolves to the real host after the final "@"), and stop at the next "/"
-// or "?" to drop the path/query. This never looks at anything before that
-// last "@", so no prefix of the credentials can leak even when the URI is
-// malformed. It falls back to the literal "mongodb" rather than failing New
-// over a cosmetic detail if no host-like substring can be found (which
+// "mongodb: connect <host>" prefix.
+//
+// Parsing the authority by hand instead: take everything after "://", then
+// the text after the LAST "@" anywhere in it (so a password containing its
+// own "@", as in "user:p@ss@host", still resolves to the real host after the
+// final "@"), and stop that at the next "/" or "?" to drop the path/query.
+//
+// A "?" is only ever legitimate at the START of the query string, which
+// always comes after the host -- so a "?" appearing anywhere before the
+// last "@" means either the userinfo itself contains an unescaped "?" (an
+// earlier version of this function cut there and mistook a userinfo
+// fragment such as "alice:pa" -- from "alice:pa?ss1234@host" -- for the
+// host), or the last "@" is not a userinfo separator at all but a stray
+// byte inside the query string. Either way, this function cannot tell which
+// case it is looking at, so it refuses to guess a host at all and returns
+// the safe literal "mongodb" instead of risking a fragment of the
+// credentials or query string. The same applies, as a second, independent
+// check, when the extracted candidate host itself contains "=" or "&": a
+// real host never does, so a candidate that does is itself evidence the
+// last "@" was inside the query string, not a userinfo separator.
+//
+// It falls back to the literal "mongodb" rather than failing New over a
+// cosmetic detail whenever no host can be confidently identified (which
 // New's own connection attempt will report anyway).
 func connectHost(uri string) string {
 	const sep = "://"
@@ -200,25 +216,33 @@ func connectHost(uri string) string {
 	}
 	rest := uri[i+len(sep):]
 
-	// Only look for credentials ahead of the query string: a "?" cannot be
-	// part of a legitimate userinfo/host, so anything after it is never
-	// mistaken for a later "@"-delimited host.
-	search := rest
-	if q := strings.IndexByte(search, '?'); q >= 0 {
-		search = search[:q]
+	at := strings.LastIndexByte(rest, '@')
+	if at < 0 {
+		// No credentials at all: rest starts with the host itself.
+		host := cutAtPathOrQuery(rest)
+		if host == "" {
+			return "mongodb"
+		}
+		return host
+	}
+	if strings.IndexByte(rest[:at], '?') >= 0 {
+		return "mongodb"
 	}
 
-	host := search
-	if at := strings.LastIndexByte(search, '@'); at >= 0 {
-		host = search[at+1:]
-	}
-	if slash := strings.IndexByte(host, '/'); slash >= 0 {
-		host = host[:slash]
-	}
-	if host == "" {
+	host := cutAtPathOrQuery(rest[at+1:])
+	if host == "" || strings.ContainsAny(host, "=&") {
 		return "mongodb"
 	}
 	return host
+}
+
+// cutAtPathOrQuery truncates s at its first "/" or "?", whichever comes
+// first, dropping everything from there on (the path and/or query string).
+func cutAtPathOrQuery(s string) string {
+	if i := strings.IndexAny(s, "/?"); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // ensureCollections creates every collection this package uses, explicitly
