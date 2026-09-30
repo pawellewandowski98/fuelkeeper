@@ -60,4 +60,92 @@ func testArgumentValidation(t *testing.T, s store.Store, clk *Clock) {
 
 	require.ErrorIs(t, s.ReleaseShard(ctx, "main", txid, ""), store.ErrInvalidArgument, "empty holder")
 	require.ErrorIs(t, s.ReleaseLease(ctx, "", "h"), store.ErrInvalidArgument, "empty lease name")
+
+	zeroTok := store.Token{}
+	_, err = s.Release(ctx, "main", zeroTok, Ops(rows))
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "zero token")
+	_, err = s.Spend(ctx, "main", zeroTok, Ops(rows), txid, false)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "zero token")
+
+	dup := append(Ops(rows), Ops(rows)[0])
+	_, err = s.Release(ctx, "main", tok, dup)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "duplicate outpoint")
+	_, err = s.Spend(ctx, "main", tok, dup, txid, false)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "duplicate outpoint")
+	_, err = s.Resolve(ctx, "main", dup, store.StateAvailable, nil)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "duplicate outpoint")
+	_, err = s.GetRows(ctx, "main", dup)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "duplicate outpoint")
+
+	tooMany := make([]store.Outpoint, s.Capabilities().MaxBatch+1)
+	for i := range tooMany {
+		tooMany[i] = store.Outpoint{TxID: NewTxID(), Vout: uint32(i)}
+	}
+	_, err = s.Release(ctx, "main", tok, tooMany)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "batch above MaxBatch")
+	_, err = s.Spend(ctx, "main", tok, tooMany, txid, false)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "batch above MaxBatch")
+	_, err = s.Resolve(ctx, "main", tooMany, store.StateAvailable, nil)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "batch above MaxBatch")
+	_, err = s.GetRows(ctx, "main", tooMany)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "batch above MaxBatch")
+
+	zeroExpOp := []store.ReserveOp{{Outpoint: rows[0].Outpoint, Token: tok, ExpiresAt: time.Time{}}}
+	_, err = s.Reserve(ctx, "main", zeroExpOp)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "zero ExpiresAt")
+}
+
+// testPoolIsolation pins that every row and shard read/write is scoped strictly to
+// its pool: calling any of them against pool "other" while passing outpoints or a
+// txid that belong to pool "main" must neither find nor mutate anything, and must
+// leave "main" completely untouched.
+func testPoolIsolation(t *testing.T, s store.Store, clk *Clock) {
+	ctx := context.Background()
+	shard, rows := MintShard(t, s, "main", 3, store.ShardMined)
+	tok := store.NewToken()
+	MustReserve(t, s, "main", rows[:1], tok, clk.Now().Add(time.Minute))
+	before := RowsByOutpoint(t, s, "main", Ops(rows))
+
+	n, err := s.Quarantine(ctx, "other", clk.Now().Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Equal(t, 0, n, "Quarantine against another pool must not touch main's reserved row")
+
+	q, err := s.ListQuarantined(ctx, "other", clk.Now().Add(time.Hour), nil, 10)
+	require.NoError(t, err)
+	require.Empty(t, q, "ListQuarantined must not see main's rows from another pool")
+
+	rn, err := s.Resolve(ctx, "other", Ops(rows[:1]), store.StateAvailable, nil)
+	require.NoError(t, err)
+	require.Equal(t, 0, rn, "Resolve must not cross pools")
+
+	relN, err := s.Release(ctx, "other", tok, Ops(rows[:1]))
+	require.NoError(t, err)
+	require.Equal(t, 0, relN, "Release must not cross pools even with the right token")
+
+	spendN, err := s.Spend(ctx, "other", tok, Ops(rows[:1]), NewTxID(), false)
+	require.NoError(t, err)
+	require.Equal(t, 0, spendN, "Spend must not cross pools even with the right token")
+
+	got, err := s.GetRows(ctx, "other", Ops(rows))
+	require.NoError(t, err)
+	require.Empty(t, got, "GetRows must not see main's rows from another pool")
+
+	avail, err := s.ListAvailable(ctx, "other", shard.TxID, 0, 10)
+	require.NoError(t, err)
+	require.Empty(t, avail, "ListAvailable must not see main's shard from another pool")
+
+	otherStats, err := s.Stats(ctx, "other")
+	require.NoError(t, err)
+	require.Equal(t, store.Stats{}, otherStats, "Stats for an untouched pool must be all zero")
+
+	shards, err := s.ListShards(ctx, "other", store.ShardFilter{})
+	require.NoError(t, err)
+	require.Empty(t, shards, "ListShards must not see main's shard from another pool")
+
+	after := RowsByOutpoint(t, s, "main", Ops(rows))
+	require.Equal(t, before, after, "none of the above may have touched main's rows")
+
+	mainShard, err := s.GetShard(ctx, "main", shard.TxID)
+	require.NoError(t, err)
+	require.Equal(t, store.ShardMined, mainShard.Status, "none of the above may have touched main's shard")
 }

@@ -71,6 +71,138 @@ func testReserveBasic(t *testing.T, s store.Store, clk *Clock) {
 	}
 	_, err = s.Reserve(ctx, "main", tooMany)
 	require.ErrorIs(t, err, store.ErrInvalidArgument, "batch above MaxBatch")
+
+	// One batch mixing every reservation outcome in a single call: an available
+	// row, one reserved under another token, a same-token replay, an unknown
+	// outpoint, an outpoint from another pool, a spent row and an invalid row.
+	_, otherPoolRows := MintShard(t, s, "other", 1, store.ShardMined)
+	invalidShard, invalidRows := MintShard(t, s, "main", 1, store.ShardMined)
+	_, err = s.RetireShard(ctx, "main", invalidShard.TxID)
+	require.NoError(t, err)
+
+	_, mixed := MintShard(t, s, "main", 4, store.ShardMined)
+	tokMixed, tokOther := store.NewToken(), store.NewToken()
+	mixedExp := clk.Now().Add(time.Minute)
+	MustReserve(t, s, "main", mixed[1:2], tokMixed, mixedExp) // replayed below
+	MustReserve(t, s, "main", mixed[2:3], tokMixed, mixedExp) // spent below
+	MustReserve(t, s, "main", mixed[3:4], tokOther, mixedExp) // reserved by another token
+
+	spentN, err := s.Spend(ctx, "main", tokMixed, Ops(mixed[2:3]), NewTxID(), true)
+	require.NoError(t, err)
+	require.Equal(t, 1, spentN)
+
+	beforeReplay := RowsByOutpoint(t, s, "main", Ops(mixed[1:2]))[mixed[1].Outpoint]
+	beforeOther := RowsByOutpoint(t, s, "main", Ops(mixed[3:4]))[mixed[3].Outpoint]
+	beforeSpent := RowsByOutpoint(t, s, "main", Ops(mixed[2:3]))[mixed[2].Outpoint]
+	beforeInvalid := RowsByOutpoint(t, s, "main", Ops(invalidRows))[invalidRows[0].Outpoint]
+
+	unknownOp := store.Outpoint{TxID: NewTxID(), Vout: 0}
+	mixedOps := []store.ReserveOp{
+		{Outpoint: mixed[0].Outpoint, Token: tokMixed, ExpiresAt: mixedExp},                 // available
+		{Outpoint: mixed[1].Outpoint, Token: tokMixed, ExpiresAt: clk.Now().Add(time.Hour)}, // same-token replay
+		{Outpoint: mixed[3].Outpoint, Token: tokMixed, ExpiresAt: mixedExp},                 // reserved by another token
+		{Outpoint: unknownOp, Token: tokMixed, ExpiresAt: mixedExp},                         // unknown
+		{Outpoint: otherPoolRows[0].Outpoint, Token: tokMixed, ExpiresAt: mixedExp},         // wrong pool
+		{Outpoint: mixed[2].Outpoint, Token: tokMixed, ExpiresAt: mixedExp},                 // spent
+		{Outpoint: invalidRows[0].Outpoint, Token: tokMixed, ExpiresAt: mixedExp},           // invalid
+	}
+	mixedApplied, err := s.Reserve(ctx, "main", mixedOps)
+	require.NoError(t, err)
+	require.Len(t, mixedApplied, 2, "only the available row and the same-token replay apply")
+	appliedSet := make(map[store.Outpoint]store.ReserveOp, len(mixedApplied))
+	for _, op := range mixedApplied {
+		appliedSet[op.Outpoint] = op
+	}
+	_, ok := appliedSet[mixed[0].Outpoint]
+	assert.True(t, ok, "the available row applies")
+	replayOp, ok := appliedSet[mixed[1].Outpoint]
+	assert.True(t, ok, "the same-token replay applies")
+	assert.Equal(t, mixedExp, replayOp.ExpiresAt.UTC(), "replay reports the original expiry, not the new one")
+
+	afterReplay := RowsByOutpoint(t, s, "main", Ops(mixed[1:2]))[mixed[1].Outpoint]
+	assert.Equal(t, beforeReplay.UpdatedAt, afterReplay.UpdatedAt, "same-token replay does not stamp UpdatedAt")
+	afterOther := RowsByOutpoint(t, s, "main", Ops(mixed[3:4]))[mixed[3].Outpoint]
+	assert.Equal(t, beforeOther, afterOther, "row reserved by another token is unchanged")
+	afterSpent := RowsByOutpoint(t, s, "main", Ops(mixed[2:3]))[mixed[2].Outpoint]
+	assert.Equal(t, beforeSpent, afterSpent, "spent row is unchanged")
+	afterInvalid := RowsByOutpoint(t, s, "main", Ops(invalidRows))[invalidRows[0].Outpoint]
+	assert.Equal(t, beforeInvalid, afterInvalid, "invalid row is unchanged")
+}
+
+// testSameTokenNeverRevives pins that once a row leaves the reserved state for any
+// reason other than Release, a Reserve replay under the very token that reserved
+// it never revives the row: the CAS predicate (available OR reserved-by-this-
+// token) already excludes quarantined, spent and invalid rows, but this pins it
+// explicitly for every path that leads there. It also pins the opposite: a replay
+// after expiry but before the reaper's Quarantine call IS still applied, because
+// expiry is Quarantine's job, not Reserve's.
+func testSameTokenNeverRevives(t *testing.T, s store.Store, clk *Clock) {
+	ctx := context.Background()
+	tok := store.NewToken()
+	exp := clk.Now().Add(time.Minute)
+
+	assertDead := func(row store.Row, msg string) {
+		t.Helper()
+		before := RowsByOutpoint(t, s, "main", []store.Outpoint{row.Outpoint})[row.Outpoint]
+		applied, err := s.Reserve(ctx, "main", ReserveOps([]store.Row{row}, tok, clk.Now().Add(time.Minute)))
+		require.NoError(t, err)
+		assert.Empty(t, applied, msg)
+		after := RowsByOutpoint(t, s, "main", []store.Outpoint{row.Outpoint})[row.Outpoint]
+		assert.Equal(t, before, after, msg+": row must be left unchanged")
+	}
+
+	// Quarantine, via the reaper's expiry sweep.
+	_, qRows := MintShard(t, s, "main", 1, store.ShardMined)
+	shortExp := clk.Now().Add(time.Second)
+	MustReserve(t, s, "main", qRows, tok, shortExp)
+	clk.Advance(2 * time.Second)
+	n, err := s.Quarantine(ctx, "main", clk.Now(), 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	assertDead(qRows[0], "a quarantined row does not revive under the original token")
+
+	// Spend(false): reserved -> quarantined directly.
+	_, sfRows := MintShard(t, s, "main", 1, store.ShardMined)
+	MustReserve(t, s, "main", sfRows, tok, exp)
+	_, err = s.Spend(ctx, "main", tok, Ops(sfRows), NewTxID(), false)
+	require.NoError(t, err)
+	assertDead(sfRows[0], "a spend(false)-quarantined row does not revive")
+
+	// Spend(true): reserved -> spent directly.
+	_, stRows := MintShard(t, s, "main", 1, store.ShardMined)
+	MustReserve(t, s, "main", stRows, tok, exp)
+	_, err = s.Spend(ctx, "main", tok, Ops(stRows), NewTxID(), true)
+	require.NoError(t, err)
+	assertDead(stRows[0], "a spend(true)-spent row does not revive")
+
+	// Resolve to spent, via quarantine first.
+	_, rsRows := MintShard(t, s, "main", 1, store.ShardMined)
+	MustReserve(t, s, "main", rsRows, tok, exp)
+	_, err = s.Spend(ctx, "main", tok, Ops(rsRows), NewTxID(), false)
+	require.NoError(t, err)
+	resolveTx := NewTxID()
+	_, err = s.Resolve(ctx, "main", Ops(rsRows), store.StateSpent, &resolveTx)
+	require.NoError(t, err)
+	assertDead(rsRows[0], "a resolved-to-spent row does not revive")
+
+	// RetireShard: reserved -> invalid.
+	rtShard, rtRows := MintShard(t, s, "main", 1, store.ShardMined)
+	MustReserve(t, s, "main", rtRows, tok, exp)
+	_, err = s.RetireShard(ctx, "main", rtShard.TxID)
+	require.NoError(t, err)
+	assertDead(rtRows[0], "an invalidated (retired) row does not revive")
+
+	// The counterpoint: a replay after expiry but before quarantine IS applied and
+	// reports the original (past) expiry. Idempotent replay is what the coalescer
+	// relies on; sweeping expired reservations is the reaper's job, not Reserve's.
+	_, epRows := MintShard(t, s, "main", 1, store.ShardMined)
+	epExp := clk.Now().Add(time.Second)
+	MustReserve(t, s, "main", epRows, tok, epExp)
+	clk.Advance(2 * time.Second)
+	applied, err := s.Reserve(ctx, "main", ReserveOps(epRows, tok, clk.Now().Add(time.Minute)))
+	require.NoError(t, err)
+	require.Len(t, applied, 1, "same-token replay still applies after expiry, before quarantine")
+	assert.Equal(t, epExp, applied[0].ExpiresAt.UTC(), "replay reports the original (past) expiry")
 }
 
 func testReserveMixedTokensMixedShards(t *testing.T, s store.Store, clk *Clock) {
@@ -110,6 +242,8 @@ func testReleaseGuard(t *testing.T, s store.Store, clk *Clock) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, n, "wrong token")
 
+	clk.Advance(time.Second)
+	tRelease := clk.Now()
 	n, err = s.Release(ctx, "main", tokA, Ops(rows[:2]))
 	require.NoError(t, err)
 	assert.Equal(t, 2, n)
@@ -120,6 +254,9 @@ func testReleaseGuard(t *testing.T, s store.Store, clk *Clock) {
 		assert.True(t, g.ReservedBy.IsZero())
 		assert.True(t, g.ReservedAt.IsZero())
 		assert.True(t, g.ExpiresAt.IsZero())
+		assert.True(t, g.QuarantinedAt.IsZero(), "Release clears QuarantinedAt too")
+		assert.Nil(t, g.SpentHint, "Release clears SpentHint too")
+		assert.Equal(t, tRelease, g.UpdatedAt.UTC(), "UpdatedAt is stamped by Release")
 	}
 	assert.Equal(t, store.StateReserved, got[rows[2].Outpoint].State)
 
@@ -147,7 +284,9 @@ func testSpendGuard(t *testing.T, s store.Store, clk *Clock) {
 	_, rows := MintShard(t, s, "main", 3, store.ShardMined)
 	tokA, tokB := store.NewToken(), store.NewToken()
 	tx1, tx2 := NewTxID(), NewTxID()
-	MustReserve(t, s, "main", rows, tokA, clk.Now().Add(time.Minute))
+	reservedAt := clk.Now()
+	exp := reservedAt.Add(time.Minute)
+	MustReserve(t, s, "main", rows, tokA, exp)
 	clk.Advance(time.Second)
 	t1 := clk.Now()
 
@@ -165,6 +304,9 @@ func testSpendGuard(t *testing.T, s store.Store, clk *Clock) {
 	assert.Nil(t, g.SpentBy)
 	assert.Equal(t, t1, g.QuarantinedAt.UTC())
 	assert.Equal(t, tokA, g.ReservedBy, "provenance kept")
+	assert.Equal(t, reservedAt, g.ReservedAt.UTC(), "ReservedAt kept for provenance")
+	assert.Equal(t, exp, g.ExpiresAt.UTC(), "ExpiresAt kept for provenance")
+	assert.Equal(t, t1, g.UpdatedAt.UTC(), "UpdatedAt is stamped by Spend(false)")
 
 	n, err = s.Spend(ctx, "main", tokA, Ops(rows[:1]), tx2, false)
 	require.NoError(t, err)
@@ -180,6 +322,10 @@ func testSpendGuard(t *testing.T, s store.Store, clk *Clock) {
 	require.NotNil(t, g.SpentBy)
 	assert.Equal(t, tx1, *g.SpentBy)
 	assert.Nil(t, g.SpentHint)
+	assert.Equal(t, tokA, g.ReservedBy, "provenance kept (terminal spend)")
+	assert.Equal(t, reservedAt, g.ReservedAt.UTC(), "ReservedAt kept (terminal spend)")
+	assert.Equal(t, exp, g.ExpiresAt.UTC(), "ExpiresAt kept (terminal spend)")
+	assert.Equal(t, t1, g.UpdatedAt.UTC(), "UpdatedAt is stamped by Spend(true)")
 
 	applied, err := s.Reserve(ctx, "main", ReserveOps(rows[1:2], tokB, clk.Now().Add(time.Minute)))
 	require.NoError(t, err)
@@ -250,6 +396,68 @@ func testQuarantineByExpiry(t *testing.T, s store.Store, clk *Clock) {
 	q, err = s.ListQuarantined(ctx, "main", clk.Now().Add(time.Second), nil, 2)
 	require.NoError(t, err)
 	require.Len(t, q, 2)
+
+	// The rest of this test uses a fresh pool so its counts cannot be disturbed by
+	// rows[4] above, which is deliberately left reserved (its tokC expiry, t0+30s,
+	// is never reached in the flow above).
+	//
+	// Three rows with distinct, already-due expiries: Quarantine(limit=1) always
+	// moves the earliest by (expires_at, txid internal bytes, vout); a row whose
+	// expires_at equals `before` is NOT quarantined (before is exclusive, matching
+	// ListQuarantined's own semantics).
+	_, distinct := MintShard(t, s, "distinct", 3, store.ShardMined)
+	tokD := store.NewToken()
+	base := clk.Now()
+	MustReserve(t, s, "distinct", distinct[0:1], tokD, base.Add(time.Second))
+	MustReserve(t, s, "distinct", distinct[1:2], tokD, base.Add(2*time.Second))
+	MustReserve(t, s, "distinct", distinct[2:3], tokD, base.Add(3*time.Second))
+	clk.Advance(10 * time.Second) // all three now due
+
+	n1, err := s.Quarantine(ctx, "distinct", clk.Now(), 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n1)
+	afterFirst := RowsByOutpoint(t, s, "distinct", Ops(distinct))
+	assert.Equal(t, store.StateQuarantined, afterFirst[distinct[0].Outpoint].State, "the earliest expiry is quarantined first")
+	assert.Equal(t, store.StateReserved, afterFirst[distinct[1].Outpoint].State)
+	assert.Equal(t, store.StateReserved, afterFirst[distinct[2].Outpoint].State)
+
+	nBoundary, err := s.Quarantine(ctx, "distinct", base.Add(3*time.Second), 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, nBoundary, "only distinct[1] is strictly before the boundary; distinct[0] is already quarantined")
+	afterBoundary := RowsByOutpoint(t, s, "distinct", Ops(distinct))
+	assert.Equal(t, store.StateQuarantined, afterBoundary[distinct[1].Outpoint].State)
+	assert.Equal(t, store.StateReserved, afterBoundary[distinct[2].Outpoint].State, "expires_at == before is not quarantined (strict <)")
+
+	nRest, err := s.Quarantine(ctx, "distinct", clk.Now().Add(time.Hour), 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, nRest, "distinct[2] is the only row left")
+
+	// With limit=2, ListQuarantined returns the two oldest by the documented tuple
+	// order (quarantined_at, txid internal bytes, vout).
+	qAll, err := s.ListQuarantined(ctx, "distinct", clk.Now().Add(time.Hour), nil, 10)
+	require.NoError(t, err)
+	require.Len(t, qAll, 3)
+	qTwo, err := s.ListQuarantined(ctx, "distinct", clk.Now().Add(time.Hour), nil, 2)
+	require.NoError(t, err)
+	require.Len(t, qTwo, 2)
+	assert.Equal(t, []store.Outpoint{qAll[0].Outpoint, qAll[1].Outpoint}, []store.Outpoint{qTwo[0].Outpoint, qTwo[1].Outpoint},
+		"limit=2 returns the two oldest by (quarantined_at, txid, vout)")
+
+	// Cursor pagination: page with limit=1 twice using the cursor and get the two
+	// oldest rows in order; a cursor past the last row returns empty.
+	page1, err := s.ListQuarantined(ctx, "distinct", clk.Now().Add(time.Hour), nil, 1)
+	require.NoError(t, err)
+	require.Len(t, page1, 1)
+	assert.Equal(t, qAll[0].Outpoint, page1[0].Outpoint)
+	cursor1 := page1[0].QuarantineCursor()
+	page2, err := s.ListQuarantined(ctx, "distinct", clk.Now().Add(time.Hour), &cursor1, 1)
+	require.NoError(t, err)
+	require.Len(t, page2, 1)
+	assert.Equal(t, qAll[1].Outpoint, page2[0].Outpoint, "the cursor resumes strictly after the first page")
+	cursorLast := qAll[2].QuarantineCursor()
+	pageEnd, err := s.ListQuarantined(ctx, "distinct", clk.Now().Add(time.Hour), &cursorLast, 10)
+	require.NoError(t, err)
+	assert.Empty(t, pageEnd, "a cursor past the last row returns empty")
 }
 
 func testResolveGuard(t *testing.T, s store.Store, clk *Clock) {
@@ -260,16 +468,23 @@ func testResolveGuard(t *testing.T, s store.Store, clk *Clock) {
 	MustReserve(t, s, "main", rows, tokA, clk.Now().Add(time.Minute))
 	_, err := s.Spend(ctx, "main", tokA, Ops(rows[:2]), tx1, false)
 	require.NoError(t, err)
+	beforeResolve := RowsByOutpoint(t, s, "main", Ops(rows[1:2]))[rows[1].Outpoint]
+	require.NotNil(t, beforeResolve.SpentHint)
+	require.False(t, beforeResolve.QuarantinedAt.IsZero())
 
+	clk.Advance(time.Second)
+	tResolveAvail := clk.Now()
 	n, err := s.Resolve(ctx, "main", Ops(rows[:1]), store.StateAvailable, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
 	g := RowsByOutpoint(t, s, "main", Ops(rows[:1]))[rows[0].Outpoint]
 	assert.Equal(t, store.StateAvailable, g.State)
 	assert.True(t, g.ReservedBy.IsZero())
+	assert.True(t, g.ReservedAt.IsZero())
 	assert.True(t, g.ExpiresAt.IsZero())
 	assert.True(t, g.QuarantinedAt.IsZero())
 	assert.Nil(t, g.SpentHint)
+	assert.Equal(t, tResolveAvail, g.UpdatedAt.UTC(), "UpdatedAt is stamped by Resolve")
 	avail, err := s.ListAvailable(ctx, "main", shard.TxID, 0, 10)
 	require.NoError(t, err)
 	require.Len(t, avail, 1)
@@ -278,6 +493,8 @@ func testResolveGuard(t *testing.T, s store.Store, clk *Clock) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, n, "only quarantined rows resolve")
 
+	clk.Advance(time.Second)
+	tResolveSpent := clk.Now()
 	n, err = s.Resolve(ctx, "main", Ops(rows[1:2]), store.StateSpent, &tx1)
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
@@ -285,6 +502,10 @@ func testResolveGuard(t *testing.T, s store.Store, clk *Clock) {
 	assert.Equal(t, store.StateSpent, g.State)
 	require.NotNil(t, g.SpentBy)
 	assert.Equal(t, tx1, *g.SpentBy)
+	require.NotNil(t, g.SpentHint, "SpentHint kept for provenance after Resolve to spent")
+	assert.Equal(t, *beforeResolve.SpentHint, *g.SpentHint)
+	assert.Equal(t, beforeResolve.QuarantinedAt, g.QuarantinedAt, "QuarantinedAt kept for provenance after Resolve to spent")
+	assert.Equal(t, tResolveSpent, g.UpdatedAt.UTC(), "UpdatedAt is stamped by Resolve")
 
 	n, err = s.Resolve(ctx, "main", Ops(rows[2:3]), store.StateSpent, &tx1)
 	require.NoError(t, err)
@@ -346,6 +567,10 @@ func testListAvailablePagination(t *testing.T, s store.Store, clk *Clock) {
 	_, err = s.ListAvailable(ctx, "main", shard.TxID, 0, 0)
 	require.ErrorIs(t, err, store.ErrInvalidArgument)
 
+	unknownAvail, err := s.ListAvailable(ctx, "main", NewTxID(), 0, 10)
+	require.NoError(t, err)
+	assert.Empty(t, unknownAvail, "an unknown txid returns an empty slice, not ErrNotFound, like GetRows")
+
 	all := RowsByOutpoint(t, s, "main", Ops(rows))
 	require.Len(t, all, 25)
 	_, err = s.GetRows(ctx, "main", nil)
@@ -369,12 +594,14 @@ func testStatsCounts(t *testing.T, s store.Store, clk *Clock) {
 	require.NoError(t, err)
 	_, err = s.RetireShard(ctx, "main", b.TxID)
 	require.NoError(t, err)
+	c, _ := MintShard(t, s, "main", 2, store.ShardMined)
+	require.NoError(t, s.UpdateShard(ctx, "main", c.TxID, store.ShardRetired, nil))
 
 	st, err := s.Stats(ctx, "main")
 	require.NoError(t, err)
 	assert.Equal(t, store.Stats{
-		Available: 2, Reserved: 1, Quarantined: 1, Spent: 1, Invalid: 5,
-		ShardsUnmined: 1, ShardsMined: 0, ShardsRetired: 0, ShardsInvalid: 1,
+		Available: 4, Reserved: 1, Quarantined: 1, Spent: 1, Invalid: 5,
+		ShardsUnmined: 1, ShardsMined: 0, ShardsRetired: 1, ShardsInvalid: 1,
 	}, st)
 
 	empty, err := s.Stats(ctx, "nothing")

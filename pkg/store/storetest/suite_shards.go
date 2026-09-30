@@ -370,7 +370,8 @@ func testRetireShardCascade(t *testing.T, s store.Store, clk *Clock) {
 	// rows[2] stays reserved (under a second token) into the retire, proving the
 	// cascade also invalidates reserved rows, not just available/quarantined ones.
 	secondTok := store.NewToken()
-	MustReserve(t, s, "main", rows[2:3], secondTok, clk.Now().Add(time.Minute))
+	secondExp := clk.Now().Add(time.Minute)
+	MustReserve(t, s, "main", rows[2:3], secondTok, secondExp)
 
 	got, err := s.AcquireShard(ctx, "main", "a", clk.Now(), clk.Now().Add(time.Minute), []store.ShardStatus{store.ShardMined}, nil)
 	require.NoError(t, err)
@@ -395,6 +396,7 @@ func testRetireShardCascade(t *testing.T, s store.Store, clk *Clock) {
 	assert.Equal(t, store.StateSpent, states[rows[1].Outpoint].State)
 	assert.Equal(t, store.StateInvalid, states[rows[2].Outpoint].State)
 	assert.Equal(t, secondTok, states[rows[2].Outpoint].ReservedBy, "retire keeps provenance fields for reserved rows too")
+	assert.Equal(t, secondExp, states[rows[2].Outpoint].ExpiresAt.UTC(), "retire keeps ExpiresAt for provenance too")
 	for _, r := range rows[3:] {
 		assert.Equal(t, store.StateInvalid, states[r.Outpoint].State)
 	}
