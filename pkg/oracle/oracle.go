@@ -1,6 +1,11 @@
 // Package oracle answers "is this outpoint spent?" and "what happened to this tx?"
 // from the chain/mempool. The reaper and watcher never guess: an Unknown answer
-// leaves rows quarantined.
+// never by itself moves a row to spent or available. A quarantined row with
+// no other evidence instead holds until the reaper's expiry/hint rules
+// requeue it -- an unhinted row after jobs.reaper.unknown_requeue_age (or
+// indefinitely, for an operator, under a pool's expiry_policy: hold), a
+// hinted row from its own transaction's fate (see pkg/jobs.Reaper's doc
+// comment).
 package oracle
 
 import (
@@ -45,10 +50,12 @@ func (s Status) String() string {
 	return "unknown"
 }
 
-// RejectReason classifies a Rejected verdict for the reaper: whether the
-// fuel output a client's spend hint names is gone (an input was already
-// spent) or untouched (the transaction itself was invalid), or the oracle
-// could not tell. Meaningful only when TxStatus.Rejected is true.
+// RejectReason classifies a Rejected verdict for the reaper: whether an
+// input of the rejected transaction was already spent or conflicting (not
+// necessarily the fuel output the client's spend hint names — see
+// RejectReasonInputsSpent and TxStatus.SpentInputs), the transaction itself
+// was invalid (every input untouched), or the oracle could not tell.
+// Meaningful only when TxStatus.Rejected is true.
 //
 // RejectReasonTxInvalid is evidence about one submission to one gateway, not
 // a global verdict on the transaction: a gateway-local policy code (e.g.
@@ -75,9 +82,11 @@ const (
 	// untouched and the row may be requeued. See the type doc: this is
 	// gateway-local evidence, not a global verdict.
 	RejectReasonTxInvalid
-	// RejectReasonInputsSpent means an input was already spent — missing,
-	// non-existent, or conflicting with another transaction; the fuel
-	// output this row names is gone.
+	// RejectReasonInputsSpent means an input of the hinted transaction is
+	// spent or conflicting — not necessarily the fuel output this row
+	// names: the rejected transaction may have had several inputs, and
+	// only one of them need be the spent/conflicting one. TxStatus.
+	// SpentInputs says which outpoint(s), when the gateway names them.
 	RejectReasonInputsSpent
 )
 
@@ -125,6 +134,16 @@ type TxStatus struct {
 	MerklePath []byte
 	// CompetingTxs lists txids competing for the same inputs, when known.
 	CompetingTxs []string
+	// SpentInputs lists the outpoints the gateway itself named as already
+	// spent or conflicting, when a Rejected verdict's underlying detail
+	// names any. nil means unknown — the gateway rejected on a spent/
+	// conflicting input (RejectReasonInputsSpent) but did not say which —
+	// never "none": a Rejected/InputsSpent verdict always means at least
+	// one input is spent, so an empty SpentInputs would misreport
+	// certainty this package does not have. Not to be confused with
+	// Inputs (below): SpentInputs identifies which named inputs are gone,
+	// while Inputs is the full list of what the transaction spends.
+	SpentInputs []store.Outpoint
 	// Inputs lists the outpoints the transaction spends, when the oracle can
 	// supply them (a node that serves the raw transaction can; a gateway that
 	// only tracks broadcast status cannot). nil means unknown, never "no

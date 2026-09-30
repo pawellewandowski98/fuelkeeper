@@ -136,6 +136,9 @@ func copyTxStatus(st TxStatus) TxStatus {
 	if st.CompetingTxs != nil {
 		st.CompetingTxs = append([]string(nil), st.CompetingTxs...)
 	}
+	if st.SpentInputs != nil {
+		st.SpentInputs = slices.Clone(st.SpentInputs)
+	}
 	if st.Inputs != nil {
 		st.Inputs = slices.Clone(st.Inputs)
 	}

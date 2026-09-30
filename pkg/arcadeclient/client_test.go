@@ -254,6 +254,35 @@ func TestSubmitResponseDoubleSpendBranches(t *testing.T) {
 	}
 }
 
+// TestRejectErrorDoubleSpend is a table test over RejectError.DoubleSpend().
+// The "extraInfo only" row — a populated, double-spend-unrelated ExtraInfo
+// ("fee too low") with no CompetingTxs — catches a mutation that treated
+// any non-empty ExtraInfo as double-spend evidence: ExtraInfo is free-form
+// rejection detail for every ARC code, not a double-spend signal on its own
+// (see RejectError.CompetingTxs's doc: what actually signals a double-spend
+// is Status 466 with a specific ExtraInfo shape, which this method does not
+// inspect at all).
+func TestRejectErrorDoubleSpend(t *testing.T) {
+	competitor := strings.Repeat("c", 64)
+	tests := []struct {
+		name         string
+		extraInfo    string
+		competingTxs []string
+		want         bool
+	}{
+		{"neither", "", nil, false},
+		{"extraInfo only, unrelated to a double-spend", "fee too low", nil, false},
+		{"competingTxs only", "", []string{competitor}, true},
+		{"both", "already spent", []string{competitor}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			re := &arcadeclient.RejectError{ExtraInfo: tt.extraInfo, CompetingTxs: tt.competingTxs}
+			assert.Equal(t, tt.want, re.DoubleSpend())
+		})
+	}
+}
+
 func TestNew(t *testing.T) {
 	tests := []struct {
 		name string

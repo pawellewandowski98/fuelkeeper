@@ -187,3 +187,40 @@ func TestMockOracleTxStatusRejectReasonRoundTrips(t *testing.T) {
 		})
 	}
 }
+
+// TestMockOracleTxStatusSpentInputsAreCopied mirrors
+// TestMockOracleTxStatusInputsAreCopied for SpentInputs: SetTx must not
+// alias the caller's slice, Tx must return a fresh copy each time, an empty
+// non-nil SpentInputs must stay non-nil, and nil SpentInputs stays nil.
+func TestMockOracleTxStatusSpentInputsAreCopied(t *testing.T) {
+	ctx := context.Background()
+	m := oracle.NewMock()
+	txid := storetest.NewTxID()
+	a, b := storetest.NewTxID(), storetest.NewTxID()
+
+	src := []store.Outpoint{{TxID: a, Vout: 1}}
+	m.SetTx(txid, oracle.TxStatus{Known: true, Rejected: true, RejectReason: oracle.RejectReasonInputsSpent, SpentInputs: src})
+	src[0] = store.Outpoint{TxID: b, Vout: 9} // caller mutates its own slice after SetTx
+
+	got, err := m.Tx(ctx, txid)
+	require.NoError(t, err)
+	require.Len(t, got.SpentInputs, 1)
+	assert.Equal(t, store.Outpoint{TxID: a, Vout: 1}, got.SpentInputs[0], "SetTx must copy SpentInputs")
+	got.SpentInputs[0] = store.Outpoint{TxID: b, Vout: 9} // caller mutates the returned slice
+	again, err := m.Tx(ctx, txid)
+	require.NoError(t, err)
+	assert.Equal(t, store.Outpoint{TxID: a, Vout: 1}, again.SpentInputs[0], "Tx must return a fresh copy")
+
+	empty := storetest.NewTxID()
+	m.SetTx(empty, oracle.TxStatus{Known: true, Rejected: true, SpentInputs: []store.Outpoint{}})
+	got, err = m.Tx(ctx, empty)
+	require.NoError(t, err)
+	assert.NotNil(t, got.SpentInputs, "an empty non-nil SpentInputs must stay non-nil")
+	assert.Empty(t, got.SpentInputs)
+
+	unset := storetest.NewTxID()
+	m.SetTx(unset, oracle.TxStatus{Known: true})
+	got, err = m.Tx(ctx, unset)
+	require.NoError(t, err)
+	assert.Nil(t, got.SpentInputs, "nil SpentInputs stays nil")
+}

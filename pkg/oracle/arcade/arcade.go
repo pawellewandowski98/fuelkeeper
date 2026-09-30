@@ -17,6 +17,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
@@ -49,16 +51,25 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 		}
 		return oracle.TxStatus{}, fmt.Errorf("%w: arcade GetTx %s: %w", oracle.ErrUnavailable, txid.String(), err)
 	}
-	// RejectReason is gated on Rejected: st.Status is only ever populated by
-	// arcade alongside a REJECTED verdict (arcade.openapi.yaml:1221, "recorded
-	// with a REJECTED verdict"), but nothing stops another txStatus from
-	// carrying a stray nonzero numeric code, and rejectReasonForCode's table
-	// is meaningless outside a REJECTED verdict — most sharply for 476
-	// StatusNotFinal, which really is used on a live, still-pending
-	// transaction's line in other contexts (see its table entry below).
+	// RejectReason (and, for 466, SpentInputs / the named spender) is gated
+	// on Rejected: st.Status/st.ExtraInfo are only ever populated by arcade
+	// alongside a REJECTED verdict (arcade.openapi.yaml:1221, "recorded with
+	// a REJECTED verdict"), but nothing stops another txStatus from carrying
+	// a stray nonzero numeric code, and this classification is meaningless
+	// outside a REJECTED verdict — most sharply for 476 StatusNotFinal,
+	// which really is used on a live, still-pending transaction's line in
+	// other contexts (see its table entry below).
 	rr := oracle.RejectReasonUnknown
+	competingTxs := st.CompetingTxs
+	var spentInputs []store.Outpoint
 	if st.Rejected() {
-		rr = rejectReasonForCode(st.Status)
+		rr = rejectReasonForCode(st.Status, st.ExtraInfo)
+		if st.Status == 466 {
+			var spender string
+			if spentInputs, spender = spentInputsFromExtraInfo(st.ExtraInfo); spender != "" {
+				competingTxs = append(append([]string(nil), st.CompetingTxs...), spender)
+			}
+		}
 	}
 	return oracle.TxStatus{
 		Known:        true,
@@ -68,9 +79,66 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 		Status:       st.TxStatus,
 		BlockHeight:  st.BlockHeight,
 		MerklePath:   st.MerklePathBytes(),
-		CompetingTxs: st.CompetingTxs,
+		CompetingTxs: competingTxs,
+		SpentInputs:  spentInputs,
 		Inputs:       nil,
 	}, nil
+}
+
+// utxoSpentLinePattern matches a UTXO_SPENT extraInfo line's fixed message
+// shape. The "<NAME> (<code>): <message>" envelope (errCodeMsgFmt,
+// /git/teranode/errors/errors.go) is universal to every teranode *Error;
+// the message for UTXO_SPENT specifically is produced by exactly one
+// constructor used identically by every call site (NewUtxoSpentError,
+// /git/teranode/errors/error_data_utxo_spent.go:75 — format
+// "%s (%d): %s:%d utxo already spent by tx %v", where %v is
+// SpendingData.String() = "%s[%d]",
+// /git/teranode/stores/utxo/spend/spending_data.go:76-82). Teranode
+// sometimes wraps the inner error's UserMessage, doubling the
+// "UTXO_SPENT (n): " prefix — arcade's
+// services/propagation/classify_test.go documents this as an "Exact
+// doubled-prefix shape observed on mainnet 409 responses" — so the prefix
+// group matches one or more repeats.
+var utxoSpentLinePattern = regexp.MustCompile(
+	`^(?:UTXO_SPENT \(\d+\): )+([0-9a-f]{64}):(\d+) utxo already spent by tx ([0-9a-f]{64})\[\d+\]`,
+)
+
+// spentInputsFromExtraInfo best-effort parses a REJECTED/466 verdict's
+// ExtraInfo (arcade's verbatim teranode line) for the spent outpoint and,
+// when named, the competing transaction that spent it. It returns
+// (nil, "") — never a partial result — for every shape other than
+// UTXO_SPENT's, including the TX_CONFLICTING and TX_INVALID_DOUBLE_SPEND
+// lines that also classify InputsSpent (see rejectReasonFor466):
+//
+//   - TX_INVALID_DOUBLE_SPEND's only observed message
+//     (arcade's services/propagation/classify_test.go:65,
+//     "[ProcessTransaction][<txid>] tx invalid double spend") never names
+//     an outpoint or a spender.
+//   - TX_CONFLICTING's message varies by call site, not one format:
+//     /git/teranode/stores/utxo/sql/sql.go:2439/2943 name an outpoint
+//     ("[Spend] tx is conflicting for %s:%d"), but
+//     /git/teranode/services/validator/Validator.go:1202/1216 name only
+//     the submitted txid with no vout ("[Validate][%s] tx is
+//     conflicting"), and /git/teranode/stores/utxo/aerospike/spend.go:1051
+//     interposes a block height where a vout might otherwise be expected
+//     ("[SPEND_BATCH_LUA][%s] transaction is conflicting, blockHeight %d -
+//     %s"). None of these name a spender either way. Guessing which shape
+//     produced a given line risks mistaking a block height for a vout or
+//     the submitted txid for the spent outpoint's, so TX_CONFLICTING lines
+//     are classified InputsSpent without SpentInputs/CompetingTxs detail.
+//
+// UTXO_SPENT alone has one constructor used identically everywhere (see
+// utxoSpentLinePattern's doc), so it alone is safe to parse.
+func spentInputsFromExtraInfo(extraInfo string) (spent []store.Outpoint, spenderTxID string) {
+	m := utxoSpentLinePattern.FindStringSubmatch(extraInfo)
+	if m == nil {
+		return nil, ""
+	}
+	op, err := store.ParseOutpoint(m[1] + ":" + m[2])
+	if err != nil {
+		return nil, ""
+	}
+	return []store.Outpoint{op}, m[3]
 }
 
 // rejectReasonForCode maps arcadeclient.TxStatus.Status — the numeric ARC
@@ -125,22 +193,53 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 //	                              low".                            → TxInvalid
 //	466 StatusConflict            "Conflicting tx found" / "Transaction is
 //	                              valid, but there is a conflicting tx in
-//	                              the block template" — a double-spend: the
-//	                              input is owned by a competing/confirmed
-//	                              tx. propagator.go:1841-1846 assigns this
-//	                              code for TX_CONFLICTING, UTXO_SPENT,
-//	                              TX_INVALID_DOUBLE_SPEND and TX_LOCKED —
-//	                              every one of them an already-decided
-//	                              ownership of the input, never a property
-//	                              of the submitted bytes. This is the one
-//	                              code this table maps to InputsSpent.
-//	                                                               → InputsSpent
+//	                              the block template". propagator.go:
+//	                              1841-1846 assigns this single ARC code to
+//	                              FOUR distinct teranode names, and they do
+//	                              not all mean the same thing — see
+//	                              rejectReasonFor466, which parses
+//	                              ExtraInfo's leading "<NAME> (<code>):" to
+//	                              tell them apart:
+//	                                UTXO_SPENT, TX_CONFLICTING,
+//	                                TX_INVALID_DOUBLE_SPEND: an
+//	                                already-decided ownership of the
+//	                                input.                    → InputsSpent
+//	                                TX_LOCKED: the parent transaction's own
+//	                                UTXO record is still finishing its
+//	                                two-phase commit inside teranode's
+//	                                store — transient, not a decided
+//	                                ownership (/git/teranode/stores/utxo/
+//	                                sql/sql.go:2443-2447, "the parent tx's
+//	                                own in-flight commit", distinct from
+//	                                the alert system's height-gated freeze
+//	                                hold, which is UTXO_FROZEN/471
+//	                                instead). Classifying it InputsSpent
+//	                                would retire an unspent fuel output
+//	                                permanently at exactly the moment a
+//	                                consumer spends it from a freshly
+//	                                broadcast parent.            → Unknown
+//	                              An ExtraInfo that is empty or not the
+//	                              "NAME (n): ..." envelope also → Unknown:
+//	                              466 with no parseable detail is not
+//	                              evidence either way.        → (see above)
 //	467 StatusGeneric             "Generic error" / "Transaction could not
-//	                              be processed" — propagator.go:1818
-//	                              documents this as TX_INVALID wrapping
-//	                              fee/script/policy failures (the name
-//	                              alone can't recover which), never a
-//	                              spent-input verdict.             → TxInvalid
+//	                              be processed". propagator.go:1847-1848
+//	                              assigns this for TX_INVALID, wrapping
+//	                              fee/script/policy failures the name alone
+//	                              can't recover — plausibly TxInvalid. But
+//	                              arcade's own local validator ALSO assigns
+//	                              467 for teranode's internal ERR_PROCESSING
+//	                              (validator/errmap.go:30-33, "Internal
+//	                              BDK/cgo failure... not attributable to
+//	                              the submitted transaction" — i.e. an
+//	                              arcade/BDK-side fault, not a verdict on
+//	                              the bytes at all, and plausibly transient
+//	                              on retry). 467 therefore has two
+//	                              producers whose implications disagree,
+//	                              and ExtraInfo carries no equivalent of
+//	                              466's leading name to tell them apart —
+//	                              unlike 466, there is nothing here to
+//	                              parse.                        → Unknown
 //	468 StatusBeefInvalid         "Invalid BEEF" / "BEEF validation failed:
 //	                              BEEF invalid" — envelope format.
 //	                                                               → TxInvalid
@@ -153,18 +252,31 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 //	471 StatusFrozenPolicy        "Input Frozen" / "Input Frozen (blacklist
 //	                              manager policy blacklisted)" — the output
 //	                              itself is untouched (not spent), merely
-//	                              refused by this instance's policy. Unlike
-//	                              476's non-finality, a freeze does not
-//	                              expire: because the output stays frozen,
-//	                              resubmitting this exact spend — or any
-//	                              other spend of the same outpoint — will
-//	                              draw the same TxInvalid rejection from
-//	                              every future consumer, not just this one.
+//	                              refused by this instance's policy. This
+//	                              is not always as durable as 476's
+//	                              non-finality is transient, though: a
+//	                              UTXO_FROZEN condition covers both a
+//	                              standing blacklist entry AND the alert
+//	                              system's height-gated hold, which clears
+//	                              on its own once the chain reaches a
+//	                              target height (/git/teranode/stores/utxo/
+//	                              sql/sql.go:2451, NewUtxoFrozenError("...
+//	                              not spendable until %d", ..., *r.
+//	                              spendableIn)) — arcade's own producer of
+//	                              471 (propagator.go's PROCESSING+HTTP-403
+//	                              catch-all) cannot tell the two apart, so
+//	                              neither can this table. TxInvalid is
+//	                              still the conservative answer either way
+//	                              — the output is untouched now — but a
+//	                              resubmission is not guaranteed hopeless.
 //	                                                               → TxInvalid
 //	472 StatusFrozenConsensus     "Input Frozen" / "Input Frozen (blacklist
 //	                              manager consensus blacklisted)" — same
-//	                              reasoning as 471, including the
-//	                              permanent-rejection note.        → TxInvalid
+//	                              reasoning as 471. No producer of this
+//	                              code was found in arcade's current
+//	                              services; kept TxInvalid for whenever one
+//	                              is added, on the same footing as 471.
+//	                                                               → TxInvalid
 //	473 StatusCumulativeFees      "Cumulative fee validation failed".
 //	                                                               → TxInvalid
 //	474 StatusTxSize              "Transaction size validation failed".
@@ -198,18 +310,41 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 // Any code this table does not list, including 0 ("zero/unclassified" per
 // arcade.openapi.yaml:1221), also falls to Unknown — never TxInvalid: an
 // unrecognized code is not evidence the inputs are untouched.
-func rejectReasonForCode(code int) oracle.RejectReason {
+func rejectReasonForCode(code int, extraInfo string) oracle.RejectReason {
 	switch code {
 	case 466:
-		return oracle.RejectReasonInputsSpent
-	case 460, 461, 462, 463, 464, 465, 467, 468, 469, 471, 472, 473, 474, 475:
+		// 466 alone needs extraInfo: it is arcade's catch-all for four
+		// distinct teranode verdicts (see the 466 table entry above), only
+		// three of which are actually InputsSpent.
+		return rejectReasonFor466(extraInfo)
+	case 460, 461, 462, 463, 464, 465, 468, 469, 471, 472, 473, 474, 475:
 		return oracle.RejectReasonTxInvalid
-	case 476:
-		// Deliberately Unknown, not TxInvalid: see the 476 table entry
-		// above (requeueing would race a later rebroadcast once the
-		// locktime passes).
+	case 467, 476:
+		// Deliberately Unknown, not TxInvalid: see the 467 and 476 table
+		// entries above (467 can be an internal arcade/BDK fault rather
+		// than a verdict on the bytes; 476 requeueing would race a later
+		// rebroadcast once the locktime passes).
 		return oracle.RejectReasonUnknown
 	default:
+		return oracle.RejectReasonUnknown
+	}
+}
+
+// rejectReasonFor466 classifies a 466 StatusConflict verdict by parsing the
+// leading "<NAME> (<code>):" of extraInfo — arcade's ExtraInfo carries the
+// teranode line verbatim for this family (propagator.go's
+// classifyFailureLine returns the line unmodified into ExtraInfo for all
+// four names below). See the 466 table entry for the full citations and
+// reasoning; this only implements it.
+func rejectReasonFor466(extraInfo string) oracle.RejectReason {
+	name, _, found := strings.Cut(extraInfo, " (")
+	if !found {
+		return oracle.RejectReasonUnknown
+	}
+	switch name {
+	case "UTXO_SPENT", "TX_CONFLICTING", "TX_INVALID_DOUBLE_SPEND":
+		return oracle.RejectReasonInputsSpent
+	default: // "TX_LOCKED" and anything unrecognized
 		return oracle.RejectReasonUnknown
 	}
 }
