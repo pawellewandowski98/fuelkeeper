@@ -4,6 +4,7 @@ run:
   tests: true
   build-tags:
     - postgres
+    - mongodb
 linters:
   default: standard
   enable:
