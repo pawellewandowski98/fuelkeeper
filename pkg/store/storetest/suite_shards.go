@@ -303,6 +303,57 @@ func testAcquireRenewRelease(t *testing.T, s store.Store, clk *Clock) {
 	assert.Nil(t, got, `pool isolation: an unmined shard in pool "other" must not be adoptable from "main"`)
 }
 
+// testShardLeaseBoundary pins two properties across a single lease's life:
+// AcquireShard stamps UpdatedAt from the store's clock (not the caller's now), and a
+// lease is free at exactly LeaseUntil == now (the <= rule documented in store.go),
+// not just strictly after it. It also pins the Owner/LeaseUntil invariant
+// (Owner == "" iff LeaseUntil is zero) after both ReleaseShard and RetireShard.
+func testShardLeaseBoundary(t *testing.T, s store.Store, clk *Clock) {
+	ctx := context.Background()
+	mined := []store.ShardStatus{store.ShardMined}
+
+	// AcquireShard stamps UpdatedAt from the store's clock, not the passed `now`.
+	clockShard, _ := MintShard(t, s, "main", 1, store.ShardMined)
+	now := clk.Now().Add(-time.Second)
+	until := clk.Now().Add(time.Minute)
+	got, err := s.AcquireShard(ctx, "main", "a", now, until, mined, nil)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, clockShard.TxID, got.TxID)
+	assert.Equal(t, clk.Now(), got.UpdatedAt.UTC(), "AcquireShard stamps UpdatedAt from the store clock, not the passed now")
+
+	// Boundary: a lease is free at exactly LeaseUntil == now.
+	shard, _ := MintShard(t, s, "main", 1, store.ShardMined)
+	got, err = s.AcquireShard(ctx, "main", "a", clk.Now(), clk.Now().Add(10*time.Second), mined, nil)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, shard.TxID, got.TxID)
+
+	clk.Advance(10 * time.Second)
+
+	got, err = s.AcquireShard(ctx, "main", "b", clk.Now(), clk.Now().Add(time.Minute), mined, nil)
+	require.NoError(t, err)
+	require.NotNil(t, got, "lease is free at exactly its expiry instant (LeaseUntil == now)")
+	assert.Equal(t, shard.TxID, got.TxID)
+	assert.Equal(t, "b", got.Owner)
+
+	_, err = s.RenewShard(ctx, "main", shard.TxID, "a", clk.Now().Add(time.Minute))
+	require.ErrorIs(t, err, store.ErrNotOwner, "a lost ownership when b acquired the freed lease")
+
+	require.NoError(t, s.ReleaseShard(ctx, "main", shard.TxID, "b"))
+	afterRelease, err := s.GetShard(ctx, "main", shard.TxID)
+	require.NoError(t, err)
+	assert.Empty(t, afterRelease.Owner, "ReleaseShard clears Owner")
+	assert.True(t, afterRelease.LeaseUntil.IsZero(), "Owner == \"\" iff LeaseUntil is zero")
+
+	_, err = s.RetireShard(ctx, "main", shard.TxID)
+	require.NoError(t, err)
+	afterRetire, err := s.GetShard(ctx, "main", shard.TxID)
+	require.NoError(t, err)
+	assert.Empty(t, afterRetire.Owner, "RetireShard clears Owner")
+	assert.True(t, afterRetire.LeaseUntil.IsZero(), "Owner == \"\" iff LeaseUntil is zero")
+}
+
 func testRetireShardCascade(t *testing.T, s store.Store, clk *Clock) {
 	ctx := context.Background()
 	shard, rows := MintShard(t, s, "main", 6, store.ShardMined)

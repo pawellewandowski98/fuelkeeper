@@ -32,6 +32,7 @@ func subtests() []subtest {
 		{"ListShardsTieBreak", testListShardsTieBreak},
 		{"AcquireRenewRelease", testAcquireRenewRelease},
 		{"RetireShardCascade", testRetireShardCascade},
+		{"ShardLeaseBoundary", testShardLeaseBoundary},
 		{"ArgumentValidation", testArgumentValidation},
 		// Task 5 appends row subtests here; Task 6 appends concurrency subtests.
 	}
