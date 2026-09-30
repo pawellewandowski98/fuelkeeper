@@ -1043,3 +1043,48 @@ Commit: `docs: clients guide, architecture, changelog and README for 0.1.0`.
 - Metrics the spec lists but Plan 2 did not add: `coalescer_batch_size`, `coalescer_flush_latency_seconds`, `coalescer_inflight_ops`, `shard_adoptions_total{result}`, `shard_drops_total{reason}`, `lease_renew_failures_total`, `cas_unknown_total`, `compensating_release_total`, `store_op_latency_seconds{op}`, `clock_skew_seconds`; `fuelbench` needs at least the coalescer ones.
 - The client has `WithObserver` (per-call timing hook), `ReserveWithRetry`, and a tuned transport; a load generator should still pass its own `http.Client` (`WithHTTPClient`) with a large `MaxIdleConnsPerHost`.
 - There is no batch spend endpoint; the demo batches `spend` calls per token. Consider a `POST /v1/pools/{pool}/spend` body with several tokens only if profiling shows it matters.
+
+## Facts carried from Plans 4 and 5 and from Plan 6 execution (2026-09-30)
+
+- `treasury.Treasury.Send` is `Send(ctx, txid, beef []byte)` and is stateless
+  and wallet-first: the minter passes `nil` (first send of a wallet-held
+  `nosend` split), the watcher passes the stored shard BEEF for rebroadcast.
+  A `Broadcaster` must never return `treasury.ErrRejected`; the oracle is the
+  authority on rejection.
+- `oracle.TxStatus.Inputs` (nil = unknown) plus the optional
+  `oracle.InputsResolver` let the reaper verify that a mined spender really
+  spends the outpoint; `composite.Tx` never fetches raw transactions on the
+  watcher path. Arcade-only oracles (`arcade`, or `composite` without
+  `teranode_url`) cannot answer outpoint queries: config rejects
+  `release_policy: verify` for them and defaults `spend_policy` to `trust`;
+  a `teranode`-only oracle is rejected whenever jobs run.
+- Config keys the demo and benchmark configs use: `oracle.arcade_url`,
+  `oracle.teranode_url`, `treasury.toolbox.*` (`reconcile_grace` must exceed
+  `jobs.minter.build_timeout` + 10 s; `jobs.lease_ttl` must exceed
+  `build_timeout` + 20 s), `store.{pebble,mongodb,aerospike}` sections,
+  `api.insecure` for a keyless non-loopback listen. Deployments that link the
+  toolbox should set `SETTINGS_ENV_FILE=/dev/null`; library consumers of
+  `pkg/config` or `pkg/treasury/...` must copy the three `replace` lines.
+- Metrics added during Plan 6 (all `fuelkeeper_`): `coalescer_batch_size`,
+  `coalescer_flush_latency_seconds`, `coalescer_inflight_ops`,
+  `shard_adoptions_total{pool,result}`, `shard_drops_total{pool,reason}`,
+  `lease_renew_failures_total`, `cas_unknown_total`,
+  `compensating_release_total`, `store_op_latency_seconds{pool,op}`,
+  `pool_refilling{pool}`, `reaper_input_mismatch_total{pool,source}`.
+  `clock_skew_seconds` is deferred.
+- The shard manager now rotates drained shards immediately when hungry at
+  `max_shards` (up to two per pass; lease release runs in the background on
+  the request path), so a single instance no longer answers `exhausted` for
+  a rescan interval after draining its shards; the fuelbench test fixture no
+  longer needs a `MaxShards` bump.
+- The minter's refill is sticky: it starts below `low_water` and continues
+  across cap-interrupted rounds until `target_available` (in-memory per
+  process; visible as `pool_refilling`).
+- Benchmark cluster: rootless Podman needs the shared SELinux label (`:ro,z`)
+  on the config bind mount; the image is about 103 MB; three instances on one
+  Postgres gave 756 reserves/s (p50 37 ms, p99 274 ms) and 424 reserves/s
+  (p50 67 ms, p99 390 ms) in two 15–20 s smokes with zero errors.
+- The teratestnet smoke (Plan 5) and the teratestnet demo (Task 6 step 4)
+  have not been run: no `FK_TTN_*` environment or funded wallet is available
+  on this machine. `docs/PERFORMANCE.md` must say so and give the exact
+  procedure from `docs/TREASURY.md`.
