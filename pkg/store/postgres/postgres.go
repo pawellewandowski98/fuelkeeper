@@ -174,8 +174,10 @@ func (s *Store) Capabilities() store.Caps {
 
 // Close closes the pool. pgxpool.Pool.Close is itself idempotent (guarded by
 // a sync.Once), so Close just delegates to it directly: any store method
-// called after Close returns the pool's own "closed pool" error (wrapped as
-// store.ErrUnavailable by wrap), never a nil-pointer panic from a manually
+// called after Close returns the pool's own closed-pool error
+// (puddle.ErrClosedPool, "closed pool") passed through wrap unchanged --
+// isTransient does not recognise it, so it is not wrapped as
+// store.ErrUnavailable -- never a nil-pointer panic from a manually
 // nilled-out field.
 func (s *Store) Close() error {
 	s.pool.Close()
