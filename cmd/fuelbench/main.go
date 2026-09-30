@@ -438,6 +438,10 @@ func runMain(args []string) int {
 	}
 
 	fs := flag.NewFlagSet("fuelbench", flag.ContinueOnError)
+	fs.Usage = func() {
+		_, _ = fmt.Fprint(fs.Output(), "Usage:\n  fuelbench [flags]                 run a load test\n  fuelbench render <result.json>... render saved results as a markdown table\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
 	urlFlag := fs.String("url", "", "comma-separated FuelKeeper base URLs (round-robin)")
 	key := fs.String("key", os.Getenv("FUELKEEPER_API_KEY"), "API key (default: $FUELKEEPER_API_KEY)")
 	poolName := fs.String("pool", "main", "pool name")
