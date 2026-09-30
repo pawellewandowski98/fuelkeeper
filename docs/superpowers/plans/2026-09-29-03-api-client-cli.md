@@ -1399,7 +1399,7 @@ func (s *server) listQuarantined(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	rows, err := s.d.Store.ListQuarantined(r.Context(), p.Config().Name, time.Now().Add(24*time.Hour), limitParam(r, 100, 1000))
+	rows, err := s.d.Store.ListQuarantined(r.Context(), p.Config().Name, time.Now().Add(24*time.Hour), nil, limitParam(r, 100, 1000))
 	if err != nil {
 		writeError(w, err)
 		return

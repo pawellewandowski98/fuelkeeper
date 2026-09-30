@@ -680,7 +680,7 @@ Remaining row methods:
 - `ListAvailable`: iterate `rowPrefix(txid)` to `prefixEnd`; decode; keep `Pool==pool && State==available && Vout>=fromVout`; rows are already in vout order (key order); stop at limit.
 - `GetRows`: validate; `loadRow` each; keep `Pool==pool`.
 - `Release` / `Spend` / `Resolve`: lock; one batch; per op `loadRow`, check predicate (`reserved && ReservedBy==token` for Release/Spend; `quarantined` for Resolve), mutate exactly as the memory store does (clear fields on Release/Resolve-available; set hint+QuarantinedAt or SpentBy on Spend; SpentBy on Resolve-spent), `setRow(prev, next, deltas)`, count; apply counters; commit.
-- `ListQuarantined`: iterate `quarantinePrefix(pool)` to `upperBoundBefore(prefix, before)`, decode outpoints from key tails, `loadRow`, keep `State==quarantined`; limit.
+- `ListQuarantined(pool, before, after, limit)`: iterate from `quarantineKey(pool, after.At, after.Outpoint)` (exclusive: skip a key equal to it) or from `quarantinePrefix(pool)` when `after == nil`, up to `upperBoundBefore(prefix, before)`; decode outpoints from key tails, `loadRow`, keep `State==quarantined`; limit. The key order already is `(quarantined_at, txid bytes, vout)`.
 - `Stats`: read the ten counters.
 - Leases (`lease.go`): lock; `get(leaseKey)`; decode; grant/renew/lose exactly as the memory store; write JSON via a batch (or `db.Set` with `s.wo`).
 
@@ -1253,7 +1253,7 @@ Other row methods:
 - `GetRows`: `Find({_id: {$in}, p})`.
 - `Release`: `BulkWrite` of `UpdateOne({_id, p, st:1, rb: tok}, $set {st:0, ua}, $unset {rb, ra, ea, qa, h})` → `ModifiedCount`.
 - `Spend`: terminal → `$set {st:3, sb: txid, ua}`; else `$set {st:2, qa: now, h: txid, ua}`; same filter; `ModifiedCount`.
-- `ListQuarantined`: `Find({p, st:2, qa: {$lt: before}})` sort `{qa:1, _id:1}` limit.
+- `ListQuarantined(pool, before, after, limit)`: `Find({p, st:2, qa: {$lt: before}})` plus, when `after != nil`, `$or: [{qa: {$gt: after.At}}, {qa: after.At, _id: {$gt: rowID(after.Outpoint)}}]` (the `_id` = txid‖vout BE matches the `(txid, vout)` tuple order); sort `{qa:1, _id:1}` limit.
 - `Resolve`: filter `{_id, p, st:2}`; available → `$set {st:0, ua}, $unset {rb, ra, ea, qa, h}`; spent → `$set {st:3, sb, ua}`; `ModifiedCount`.
 - `Stats`: `Aggregate` `[{$match:{p}}, {$group:{_id:"$st", n:{$sum:1}}}]` on rows and `[{$match:{p}}, {$group:{_id:"$s", n:{$sum:1}}}]` on shards.
 - Leases (`lease.go`): `TryAcquireOrRenew`: `FindOneAndUpdate({_id: name, $or: [{h: holder}, {e: {$lte: now}}]}, $set {h, e: now+ttl}, upsert, ReturnDocument After)`; a duplicate-key error means another holder owns an unexpired lease → return zero time, nil (arcade's pattern). `ReleaseLease`: `DeleteOne({_id: name, h: holder})`.
@@ -1764,7 +1764,7 @@ Other row methods:
 - `ListAvailable`: query `NewEqualFilter("ak", akFor(pool, txid))` with `FilterExpression vout >= fromVout`; collect, sort by vout, limit.
 - `GetRows`: `BatchGet` of keys; keep records with `pool` bin equal.
 - `Release` / `Spend` / `Resolve`: `BatchOperate` with per-record filter expression (`pool==X && st==1 && rb==token` for Release/Spend; `pool==X && st==2` for Resolve) and the bin puts/removals: Release/Resolve-available → `st=0`, `pst`, restore `ak`, remove `rb, ra, ea, qa, hint`; Spend non-terminal → `st=2, qa=now, hint, pst`, remove `ea`; Spend terminal / Resolve-spent → `st=3, sb, pst`, remove `ea`/`qa`. Count records with `Err == nil`.
-- `ListQuarantined`: range query on `qa` `[0, before-1]` with `FilterExpression pool==X && st==2`; sort by `qa` then outpoint; limit.
+- `ListQuarantined(pool, before, after, limit)`: range query on `qa` `[after.At (or 0), before-1]` with `FilterExpression pool==X && st==2`; sort by `(qa, txid bytes, vout)`; drop entries `<=` the cursor tuple client-side; limit.
 - `Stats`: for each state, query `NewEqualFilter("pst", pstFor(pool, st))` with `qp.IncludeBinData=false` and count records; same for shards via `ps`. (Document: O(rows) per call; the janitor interval bounds it.)
 
 - [ ] **Step 6: Write `pkg/store/aerospike/shards.go`** — `AcquireShard` in full:
