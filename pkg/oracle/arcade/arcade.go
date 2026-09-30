@@ -98,7 +98,12 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 // "UTXO_SPENT (n): " prefix — arcade's
 // services/propagation/classify_test.go documents this as an "Exact
 // doubled-prefix shape observed on mainnet 409 responses" — so the prefix
-// group matches one or more repeats.
+// group matches one or more repeats. A line wrapped by a DIFFERENT leading
+// name, e.g. "TX_CONFLICTING (36): UTXO_SPENT (70): …", is a different case:
+// rejectReasonFor466 still classifies it InputsSpent (TX_CONFLICTING is in
+// its set), but this pattern is anchored at the start of the string, so it
+// does not match and SpentInputs comes back nil — by design, since only the
+// outer name's shape is known to this function, not the inner one's.
 var utxoSpentLinePattern = regexp.MustCompile(
 	`^(?:UTXO_SPENT \(\d+\): )+([0-9a-f]{64}):(\d+) utxo already spent by tx ([0-9a-f]{64})\[\d+\]`,
 )

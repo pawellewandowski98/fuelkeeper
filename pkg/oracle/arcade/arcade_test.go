@@ -275,17 +275,42 @@ func TestTxRejectReason466SpentInputsFromExtraInfo(t *testing.T) {
 		assert.Equal(t, []string{existing, spenderTxID}, st.CompetingTxs)
 	})
 
-	t.Run("malformed UTXO_SPENT line leaves SpentInputs nil and CompetingTxs untouched", func(t *testing.T) {
-		existing := storetest.NewTxID().String()
-		c, hash := newServer(t, map[string]any{
-			"extraInfo":    "UTXO_SPENT (70): not-a-valid-outpoint utxo already spent by tx also-not-valid",
-			"competingTxs": []string{existing},
+	// The parse is all-or-nothing: a line that names a well-formed outpoint
+	// but fails to name a well-formed spender (or vice versa) must not
+	// yield a partial SpentInputs — pinning that a future rewrite (e.g.
+	// splitting the outpoint and spender into two independently-matched
+	// regexes) can't silently start returning the outpoint alone.
+	malformedLines := []struct {
+		name      string
+		extraInfo string
+	}{
+		{
+			name:      "both outpoint and spender malformed",
+			extraInfo: "UTXO_SPENT (70): not-a-valid-outpoint utxo already spent by tx also-not-valid",
+		},
+		{
+			// Teranode really emits this: SpendingData.String() returns
+			// "<nil>" when the pointer is nil
+			// (/git/teranode/stores/utxo/spend/spending_data.go:76-79), so
+			// a well-formed, 64-hex outpoint can still arrive alongside an
+			// unparseable spender.
+			name:      "valid outpoint, spender printed as <nil>",
+			extraInfo: fmt.Sprintf("UTXO_SPENT (70): %s:3 utxo already spent by tx <nil>", spentTxID),
+		},
+	}
+	for _, tt := range malformedLines {
+		t.Run(tt.name, func(t *testing.T) {
+			existing := storetest.NewTxID().String()
+			c, hash := newServer(t, map[string]any{
+				"extraInfo":    tt.extraInfo,
+				"competingTxs": []string{existing},
+			})
+			st, err := arcade.New(c).Tx(context.Background(), hash)
+			require.NoError(t, err)
+			assert.Nil(t, st.SpentInputs, "an all-or-nothing parse must not return the outpoint alone")
+			assert.Equal(t, []string{existing}, st.CompetingTxs, "a malformed line must not touch the existing competingTxs")
 		})
-		st, err := arcade.New(c).Tx(context.Background(), hash)
-		require.NoError(t, err)
-		assert.Nil(t, st.SpentInputs)
-		assert.Equal(t, []string{existing}, st.CompetingTxs, "a malformed line must not touch the existing competingTxs")
-	})
+	}
 
 	t.Run("TX_CONFLICTING classifies InputsSpent but is not parsed for an outpoint", func(t *testing.T) {
 		extraInfo := fmt.Sprintf("TX_CONFLICTING (36): [Spend] tx is conflicting for %s:2", spentTxID)
