@@ -2,9 +2,14 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -94,23 +99,139 @@ func Default() *Config {
 	}
 }
 
-// Load reads a YAML file, expands ${ENV} references, applies defaults and validates.
+// envRefPattern matches the two forms expandEnv understands: a literal "$$",
+// or "${VAR}" / "${VAR:-default}" with VAR captured in group 1 and an
+// optional default in group 2.
+var envRefPattern = regexp.MustCompile(`\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}`)
+
+// expandEnv expands "${VAR}" and "${VAR:-default}" references in s.
+// "${VAR}" resolves to the named environment variable, or is an error naming
+// VAR if it is not set; "${VAR:-default}" falls back to default instead of
+// erroring when VAR is unset. "$$" is a literal "$". A bare "$word" (no
+// braces, and not part of "$$") is left untouched, so a literal "$" in a
+// value (an API key, say) never needs escaping unless it is immediately
+// followed by another "$" or by "{".
+func expandEnv(s string) (string, error) {
+	var missing []string
+	out := envRefPattern.ReplaceAllStringFunc(s, func(match string) string {
+		if match == "$$" {
+			return "$"
+		}
+		sub := envRefPattern.FindStringSubmatch(match)
+		name, def := sub[1], sub[2]
+		if v, ok := os.LookupEnv(name); ok {
+			return v
+		}
+		if strings.Contains(match, ":-") {
+			return def
+		}
+		missing = append(missing, name)
+		return ""
+	})
+	if len(missing) > 0 {
+		return "", fmt.Errorf("config: environment variable(s) not set: %s", strings.Join(missing, ", "))
+	}
+	return out, nil
+}
+
+// Load reads path, expands environment references, decodes, fills defaults
+// and validates the result.
+//
+// Within the file, "${VAR}" is replaced by the value of the environment
+// variable VAR (an error naming VAR if it is unset); "${VAR:-default}"
+// instead falls back to default when VAR is unset; "$$" is a literal "$";
+// and a bare "$word" (no braces) is left untouched. See expandEnv.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path) //nolint:gosec // operator-supplied path
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
-	return Parse([]byte(os.ExpandEnv(string(raw))))
+	expanded, err := expandEnv(string(raw))
+	if err != nil {
+		return nil, err
+	}
+	return Parse([]byte(expanded))
 }
 
-// Parse decodes YAML bytes over the defaults, fills pool defaults and validates.
+// rawPool decodes one pools[] entry. A plain struct decode gives a freshly
+// appended slice element the Go zero value for every field the YAML omits,
+// indistinguishable from a field explicitly set to zero. rawPool's
+// UnmarshalYAML instead pre-fills the entry from pool.DefaultPoolConfig
+// before the node is decoded onto it, so an omitted field keeps its default
+// while an explicit zero (e.g. low_water: 0, which pool.Config documents as
+// "always refill below target") survives decoding intact.
+//
+// SpendPolicy is the one field left unresolved ("") here: its default
+// depends on the oracle kind, which is only known once the whole document
+// has been read. See ApplyPoolDefaults, called from Parse.
+type rawPool pool.Config
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (p *rawPool) UnmarshalYAML(node *yaml.Node) error {
+	def := pool.DefaultPoolConfig("", 0)
+	def.SpendPolicy = ""
+	*p = rawPool(def)
+
+	// yaml.Node.Decode always runs through a fresh, non-strict decoder, so an
+	// outer *yaml.Decoder's KnownFields(true) never reaches here on its own
+	// (see Parse). Re-encode the node and decode it again through our own
+	// strict decoder so a typo'd field (e.g. spilt_size) is still rejected.
+	buf, err := yaml.Marshal(node)
+	if err != nil {
+		return fmt.Errorf("config: pool: %w", err)
+	}
+	type plain rawPool // avoid recursing back into UnmarshalYAML
+	dec := yaml.NewDecoder(bytes.NewReader(buf))
+	dec.KnownFields(true)
+	if err := dec.Decode((*plain)(p)); err != nil {
+		return fmt.Errorf("config: pool: %w", err)
+	}
+	return nil
+}
+
+// rawConfig mirrors Config field-for-field, except Pools decodes through
+// rawPool instead of pool.Config directly (see rawPool's doc comment).
+type rawConfig struct {
+	Instance pool.InstanceConfig `yaml:"instance"`
+	Store    factory.Config      `yaml:"store"`
+	Pools    []rawPool           `yaml:"pools"`
+	Jobs     JobsConfig          `yaml:"jobs"`
+	Oracle   OracleConfig        `yaml:"oracle"`
+	Treasury TreasuryConfig      `yaml:"treasury"`
+	API      APIConfig           `yaml:"api"`
+	Log      LogConfig           `yaml:"log"`
+}
+
+// Parse decodes YAML bytes over the defaults, rejecting unknown fields,
+// resolves each pool's oracle-dependent defaults and validates.
 func Parse(data []byte) (*Config, error) {
 	c := Default()
-	if err := yaml.Unmarshal(data, c); err != nil {
+	raw := rawConfig{
+		Instance: c.Instance,
+		Store:    c.Store,
+		Jobs:     c.Jobs,
+		Oracle:   c.Oracle,
+		Treasury: c.Treasury,
+		API:      c.API,
+		Log:      c.Log,
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&raw); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("config: parse: %w", err)
 	}
+	c.Instance, c.Store, c.Jobs = raw.Instance, raw.Store, raw.Jobs
+	c.Oracle, c.Treasury, c.API, c.Log = raw.Oracle, raw.Treasury, raw.API, raw.Log
+	c.Pools = make([]pool.Config, len(raw.Pools))
+	for i, p := range raw.Pools {
+		c.Pools[i] = pool.Config(p)
+	}
 	for i := range c.Pools {
-		applyPoolDefaults(&c.Pools[i], c.Oracle.Kind)
+		// Only resolve via oracle context when the operator left spend_policy
+		// unset; an explicit choice (verify or trust) is never overridden.
+		if c.Pools[i].SpendPolicy == "" {
+			ApplyPoolDefaults(&c.Pools[i], c.Oracle.Kind)
+		}
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -118,46 +239,36 @@ func Parse(data []byte) (*Config, error) {
 	return c, nil
 }
 
-// applyPoolDefaults fills zero fields of a pool from DefaultPoolConfig. The
-// spend policy defaults to trust without an oracle and verify with one.
-func applyPoolDefaults(p *pool.Config, oracleKind string) {
-	d := pool.DefaultPoolConfig(p.Name, p.Denomination)
+// ApplyPoolDefaults resolves the two pool fields whose default cannot be a
+// pure, context-free constant the way the rest of pool.DefaultPoolConfig's
+// fields are:
+//
+//   - LockModeName is left alone once set; if still empty (typically a Go
+//     caller building a pool.Config{} from scratch rather than starting from
+//     pool.DefaultPoolConfig) it is filled with the default lock mode name
+//     ("puzzle"). A caller who set LockMode directly without LockModeName
+//     keeps that choice, exactly as (*pool.Config).Validate documents for an
+//     empty LockModeName.
+//   - SpendPolicy is always resolved from oracleKind: SpendTrust with no
+//     oracle configured (oracleKind == "none"), SpendVerify otherwise. This
+//     overrides pool.DefaultPoolConfig's own SpendPolicy, which assumes an
+//     oracle is present (see its doc comment), whenever that assumption does
+//     not hold.
+//
+// Go callers composing a pool.Config programmatically should call this after
+// pool.DefaultPoolConfig so they get the same resolution the YAML loader
+// applies. Parse itself only calls this for a pool whose YAML left
+// spend_policy unset, so an operator's explicit choice is never overridden;
+// a direct caller has no such guard and should only call it when it wants
+// SpendPolicy recomputed from oracleKind unconditionally.
+func ApplyPoolDefaults(p *pool.Config, oracleKind string) {
 	if p.LockModeName == "" {
-		p.LockModeName = d.LockModeName
+		p.LockModeName = pool.DefaultPoolConfig("", 0).LockModeName
 	}
-	if p.SplitSize == 0 {
-		p.SplitSize = d.SplitSize
-	}
-	if p.TargetAvailable == 0 {
-		p.TargetAvailable = d.TargetAvailable
-	}
-	if p.LowWater == 0 {
-		p.LowWater = d.LowWater
-	}
-	if p.ServePolicy == "" {
-		p.ServePolicy = d.ServePolicy
-	}
-	if p.DefaultTTL == 0 {
-		p.DefaultTTL = d.DefaultTTL
-	}
-	if p.MinTTL == 0 {
-		p.MinTTL = d.MinTTL
-	}
-	if p.MaxTTL == 0 {
-		p.MaxTTL = d.MaxTTL
-	}
-	if p.MaxCount == 0 {
-		p.MaxCount = d.MaxCount
-	}
-	if p.ReleasePolicy == "" {
-		p.ReleasePolicy = d.ReleasePolicy
-	}
-	if p.SpendPolicy == "" {
-		if oracleKind == "none" {
-			p.SpendPolicy = pool.SpendTrust
-		} else {
-			p.SpendPolicy = pool.SpendVerify
-		}
+	if oracleKind == "none" {
+		p.SpendPolicy = pool.SpendTrust
+	} else {
+		p.SpendPolicy = pool.SpendVerify
 	}
 }
 
@@ -165,6 +276,21 @@ func applyPoolDefaults(p *pool.Config, oracleKind string) {
 func (c *Config) Validate() error {
 	if err := c.Instance.Validate(); err != nil {
 		return fmt.Errorf("config: instance: %w", err)
+	}
+	switch c.Store.Backend {
+	case "":
+		return errors.New("config: store.backend is required (memory|sqlite|postgres)")
+	case factory.BackendMemory:
+	case factory.BackendSQLite:
+		if c.Store.SQLite.Path == "" {
+			return errors.New("config: store.sqlite.path is required")
+		}
+	case factory.BackendPostgres:
+		if c.Store.Postgres.DSN == "" {
+			return errors.New("config: store.postgres.dsn is required")
+		}
+	default:
+		return fmt.Errorf("config: unknown store backend %q (memory|sqlite|postgres)", c.Store.Backend)
 	}
 	if len(c.Pools) == 0 {
 		return errors.New("config: at least one pool is required")
@@ -207,6 +333,9 @@ func (c *Config) Validate() error {
 		if c.Jobs.Watcher.Limit <= c.Jobs.Minter.MaxPendingShards {
 			return fmt.Errorf("config: jobs.watcher.limit (%d) must exceed jobs.minter.max_pending_shards (%d)", c.Jobs.Watcher.Limit, c.Jobs.Minter.MaxPendingShards)
 		}
+		// This capacity figure is a nominal best case: it assumes every pool
+		// gets its full max_per_round splits every single tick with no
+		// failures or contention, so real sustained throughput is lower.
 		for _, p := range c.Pools {
 			if p.ExpectedTPS <= 0 {
 				continue
@@ -236,8 +365,14 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("config: log.format %q is not one of text|json", c.Log.Format)
 	}
-	if c.API.Listen == "" || c.API.MaxBodyBytes <= 0 {
-		return errors.New("config: api.listen and api.max_body_bytes are required")
+	if _, _, err := net.SplitHostPort(c.API.Listen); err != nil {
+		return fmt.Errorf("config: api.listen %q is invalid: %w", c.API.Listen, err)
+	}
+	if c.API.MaxBodyBytes <= 0 {
+		return errors.New("config: api.max_body_bytes must be > 0")
+	}
+	if c.API.ReadTimeout <= 0 || c.API.WriteTimeout <= 0 || c.API.IdleTimeout <= 0 {
+		return errors.New("config: api.read_timeout, api.write_timeout and api.idle_timeout must be > 0")
 	}
 	return nil
 }

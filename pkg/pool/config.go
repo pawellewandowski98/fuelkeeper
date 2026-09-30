@@ -80,7 +80,10 @@ type Config struct {
 	ExpectedTPS float64 `yaml:"expected_tps"`
 }
 
-// DefaultPoolConfig returns the spec defaults for a puzzle pool.
+// DefaultPoolConfig returns the spec defaults for a puzzle pool. Its
+// SpendPolicy (SpendVerify) assumes an oracle is configured; a caller with no
+// oracle should resolve it via config.ApplyPoolDefaults, which picks
+// SpendTrust instead.
 func DefaultPoolConfig(name string, denomination uint64) Config {
 	return Config{
 		Name:            name,

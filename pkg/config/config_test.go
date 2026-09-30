@@ -1,6 +1,8 @@
 package config_test
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -128,9 +130,125 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 	c.Instance.InstanceID = ""
 	require.ErrorContains(t, c.Validate(), "instance")
 
+	c = base()
+	c.Store.Backend = factory.BackendPostgres
+	c.Store.Postgres.DSN = ""
+	require.ErrorContains(t, c.Validate(), "store.postgres.dsn")
+
+	c = base()
+	c.Store.Backend = factory.BackendSQLite
+	c.Store.SQLite.Path = ""
+	require.ErrorContains(t, c.Validate(), "store.sqlite.path")
+
+	c = base()
+	c.Store.Backend = "cassandra"
+	require.ErrorContains(t, c.Validate(), "unknown store backend")
+
+	c = base()
+	c.Store.Backend = ""
+	require.ErrorContains(t, c.Validate(), "store.backend")
+
+	c = base()
+	c.API.Listen = "not-a-valid-listen-address"
+	require.ErrorContains(t, c.Validate(), "api.listen")
+
+	c = base()
+	c.API.ReadTimeout = 0
+	require.ErrorContains(t, c.Validate(), "read_timeout")
+
 	_, err = config.Load("testdata/does-not-exist.yaml")
 	require.Error(t, err)
 
 	_, err = config.Parse([]byte("pools: [\n"))
 	require.ErrorContains(t, err, "parse")
+}
+
+// TestPoolDefaultsPreserveExplicitZero guards against a fill-if-zero
+// post-decode pass mistaking an operator's explicit zero for "unset": a pool
+// entry is pre-filled from pool.DefaultPoolConfig before its own YAML fields
+// are decoded onto it (see the unexported rawPool type), so low_water: 0
+// (documented as "always refill below target") must survive, while an
+// omitted field (split_size) still gets its default.
+func TestPoolDefaultsPreserveExplicitZero(t *testing.T) {
+	c, err := config.Parse([]byte("store:\n  backend: memory\npools:\n" +
+		"  - name: main\n    denomination: 50\n    low_water: 0\n"))
+	require.NoError(t, err)
+	require.Len(t, c.Pools, 1)
+	assert.Equal(t, int64(0), c.Pools[0].LowWater, "explicit low_water: 0 must survive")
+	assert.Equal(t, 500, c.Pools[0].SplitSize, "split_size omitted keeps the pool default")
+
+	// instance.low_water_rows: 0 already survived before this change (Instance
+	// is a single struct decoded onto its already-defaulted value, not a
+	// freshly zeroed slice element) -- this is a regression guard, not a fix.
+	c, err = config.Parse([]byte("instance:\n  low_water_rows: 0\nstore:\n  backend: memory\npools:\n" +
+		"  - name: main\n    denomination: 50\n"))
+	require.NoError(t, err)
+	assert.Equal(t, 0, c.Instance.LowWaterRows, "explicit instance.low_water_rows: 0 must survive")
+}
+
+// TestParseRejectsUnknownPoolField guards against typos such as spilt_size
+// silently vanishing (yaml.v3 ignores keys with no matching field unless
+// KnownFields is set); rawPool's UnmarshalYAML re-decodes each pool entry
+// through its own strict decoder since yaml.Node.Decode never inherits an
+// outer decoder's KnownFields setting.
+func TestParseRejectsUnknownPoolField(t *testing.T) {
+	_, err := config.Parse([]byte("store:\n  backend: memory\npools:\n" +
+		"  - name: main\n    denomination: 50\n    spilt_size: 200\n"))
+	require.ErrorContains(t, err, "spilt_size")
+}
+
+// TestParseRejectsUnknownTopLevelField is the same guard at the top level.
+func TestParseRejectsUnknownTopLevelField(t *testing.T) {
+	_, err := config.Parse([]byte("stroe:\n  backend: memory\npools:\n" +
+		"  - name: main\n    denomination: 50\n"))
+	require.ErrorContains(t, err, "stroe")
+}
+
+// TestLoadStrictEnvExpansion covers Load's "${VAR}" / "${VAR:-default}" /
+// "$$" / bare "$word" syntax: unlike os.ExpandEnv, an unset ${VAR} is an
+// error rather than silently becoming "", and a literal "$" (as in an API
+// key) is never mangled unless it is written "$$".
+func TestLoadStrictEnvExpansion(t *testing.T) {
+	writeFile := func(t *testing.T, body string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "c.yaml")
+		require.NoError(t, os.WriteFile(p, []byte(body), 0o600))
+		return p
+	}
+	const tmpl = "store:\n  backend: memory\npools:\n  - name: main\n    denomination: 50\napi:\n  api_keys: [%s]\n"
+
+	t.Run("unset variable errors naming it", func(t *testing.T) {
+		p := writeFile(t, fmt.Sprintf(tmpl, `"${FK_TEST_UNSET_VAR}"`))
+		_, err := config.Load(p)
+		require.ErrorContains(t, err, "FK_TEST_UNSET_VAR")
+	})
+
+	t.Run("unset variable with default falls back", func(t *testing.T) {
+		p := writeFile(t, fmt.Sprintf(tmpl, `"${FK_TEST_UNSET_VAR:-fallback}"`))
+		c, err := config.Load(p)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"fallback"}, c.API.APIKeys)
+	})
+
+	t.Run("dollar-dollar is a literal dollar; a bare dollar-word is untouched", func(t *testing.T) {
+		p := writeFile(t, fmt.Sprintf(tmpl, `"s3cr3t$$pecial", "$bareword"`))
+		c, err := config.Load(p)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"s3cr3t$pecial", "$bareword"}, c.API.APIKeys)
+	})
+}
+
+// TestApplyPoolDefaultsForProgrammaticConfig covers the exported helper Go
+// callers use when composing a pool.Config without going through YAML.
+// pool.DefaultPoolConfig assumes an oracle (SpendPolicy: SpendVerify);
+// ApplyPoolDefaults corrects that assumption to SpendTrust once it is told
+// there is no oracle.
+func TestApplyPoolDefaultsForProgrammaticConfig(t *testing.T) {
+	c := config.Default()
+	p := pool.DefaultPoolConfig("main", 50)
+	require.Equal(t, pool.SpendVerify, p.SpendPolicy, "DefaultPoolConfig assumes an oracle")
+	config.ApplyPoolDefaults(&p, c.Oracle.Kind) // c.Oracle.Kind == "none"
+	c.Pools = []pool.Config{p}
+	require.NoError(t, c.Validate())
+	assert.Equal(t, pool.SpendTrust, p.SpendPolicy)
 }
