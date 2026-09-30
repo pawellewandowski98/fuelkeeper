@@ -96,10 +96,10 @@ func TestTxRejectReasonByCode(t *testing.T) {
 		code int
 		want oracle.RejectReason
 	}{
-		{462, oracle.RejectReasonInputsSpent}, // invalid inputs: non-existent or spent
 		{466, oracle.RejectReasonInputsSpent}, // conflicting tx found
 		{460, oracle.RejectReasonTxInvalid},   // not extended format
 		{461, oracle.RejectReasonTxInvalid},   // malformed unlocking scripts
+		{462, oracle.RejectReasonTxInvalid},   // invalid inputs: coinbase-shaped or input-script-size policy, not spent-ness
 		{463, oracle.RejectReasonTxInvalid},   // malformed transaction
 		{464, oracle.RejectReasonTxInvalid},   // invalid outputs
 		{465, oracle.RejectReasonTxInvalid},   // fee too low
@@ -111,7 +111,7 @@ func TestTxRejectReasonByCode(t *testing.T) {
 		{473, oracle.RejectReasonTxInvalid},   // cumulative fee validation failed
 		{474, oracle.RejectReasonTxInvalid},   // transaction size validation failed
 		{475, oracle.RejectReasonTxInvalid},   // mined ancestors not found in BUMPs
-		{476, oracle.RejectReasonTxInvalid},   // not final
+		{476, oracle.RejectReasonUnknown},     // not final: requeueing would race a later rebroadcast
 		{0, oracle.RejectReasonUnknown},       // zero/unclassified
 		{470, oracle.RejectReasonUnknown},     // unassigned in arcade's taxonomy
 		{999, oracle.RejectReasonUnknown},     // unrecognized code
@@ -137,11 +137,18 @@ func TestTxRejectReasonByCode(t *testing.T) {
 	}
 }
 
+// TestTxDoubleSpendAttempted covers DOUBLE_SPEND_ATTEMPTED: a distinct,
+// non-Rejected txStatus. CompetingTxs still comes through (the reaper is
+// expected to check it first for this status), but RejectReason stays
+// Unknown: it is gated on Rejected and this verdict is never Rejected.
 func TestTxDoubleSpendAttempted(t *testing.T) {
 	hash := storetest.NewTxID()
 	txid := hash.String()
+	competitor := storetest.NewTxID().String()
 	srv := fakeArcade(t, map[string]any{
-		txid: map[string]any{"txid": txid, "txStatus": "DOUBLE_SPEND_ATTEMPTED"},
+		txid: map[string]any{
+			"txid": txid, "txStatus": "DOUBLE_SPEND_ATTEMPTED", "competingTxs": []string{competitor},
+		},
 	}, "")
 	defer srv.Close()
 
@@ -155,6 +162,35 @@ func TestTxDoubleSpendAttempted(t *testing.T) {
 	assert.False(t, st.Mined)
 	assert.False(t, st.Rejected)
 	assert.Equal(t, "DOUBLE_SPEND_ATTEMPTED", st.Status)
+	assert.Equal(t, []string{competitor}, st.CompetingTxs)
+	assert.Equal(t, oracle.RejectReasonUnknown, st.RejectReason)
+}
+
+// TestTxRejectReasonGatedOnRejected pins that RejectReason is computed only
+// when arcade's verdict is Rejected. A txStatus that carries a stray
+// nonzero numeric "status" without being REJECTED (nothing in the arcade
+// contract forbids this; arcade.openapi.yaml only documents "status" as
+// populated alongside REJECTED, it doesn't require every other txStatus to
+// omit it) must not have that code run through rejectReasonForCode — 476
+// StatusNotFinal, in particular, is also meaningful on a live, still-
+// pending transaction, so leaking it through here would misreport pending
+// work as reaper-actionable.
+func TestTxRejectReasonGatedOnRejected(t *testing.T) {
+	hash := storetest.NewTxID()
+	txid := hash.String()
+	srv := fakeArcade(t, map[string]any{
+		txid: map[string]any{"txid": txid, "txStatus": "SEEN_ON_NETWORK", "status": 466},
+	}, "")
+	defer srv.Close()
+
+	c, err := arcadeclient.New(srv.URL + "/v1")
+	require.NoError(t, err)
+	o := arcade.New(c)
+
+	st, err := o.Tx(context.Background(), hash)
+	require.NoError(t, err)
+	assert.False(t, st.Rejected)
+	assert.Equal(t, oracle.RejectReasonUnknown, st.RejectReason, "a stray status code on a non-Rejected verdict must not be classified")
 }
 
 func TestTxNotFound(t *testing.T) {

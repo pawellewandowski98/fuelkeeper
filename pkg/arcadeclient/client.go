@@ -65,8 +65,15 @@ type RejectError struct {
 	// TxID is the offending transaction id, when arcade identified one.
 	TxID string `json:"txid"`
 	// CompetingTxs lists txids double-spending the rejected transaction,
-	// when arcade identified any (a best-effort decode: absent when the
-	// body carries none).
+	// when the body names any (a best-effort decode). Arcade's current
+	// ValidationErrorResponse never populates this on its own 4xx bodies
+	// (services/api_server/handlers.go respondSubmitError, ~line 1001):
+	// arcade only ever learns of a double-spend asynchronously, after the
+	// transaction has already been accepted, and reports it later on
+	// REJECTED/ARC-466 or DOUBLE_SPEND_ATTEMPTED from GET /tx/{txid} — see
+	// TxStatus.CompetingTxs. This field exists for the general ARC
+	// contract and other ARC-compatible gateways that do populate it
+	// inline; it is decoded here when present and stays nil otherwise.
 	CompetingTxs []string `json:"competingTxs"`
 	// ExtraInfo is free-form detail, e.g. a rejection reason, when present.
 	ExtraInfo string `json:"extraInfo"`
@@ -77,8 +84,10 @@ func (e *RejectError) Error() string {
 	return fmt.Sprintf("arcadeclient: arcade rejected tx %s: %d %s: %s", e.TxID, e.Status, e.Title, e.Detail)
 }
 
-// DoubleSpend reports whether arcade identified at least one competing
-// transaction for this rejection.
+// DoubleSpend reports whether the 4xx body named at least one competing
+// transaction. See CompetingTxs: arcade itself does not populate this
+// field today (double-spends surface later, via GET /tx/{txid}), so this
+// is forward-compat for gateways that do.
 func (e *RejectError) DoubleSpend() bool { return len(e.CompetingTxs) > 0 }
 
 // BackpressureError reports that arcade's broker is under backpressure
@@ -117,7 +126,11 @@ type TxStatus struct {
 	MerklePath string `json:"merklePath"`
 	// ExtraInfo is free-form detail, e.g. a rejection reason.
 	ExtraInfo string `json:"extraInfo"`
-	// CompetingTxs lists txids double-spending this one.
+	// CompetingTxs lists txids double-spending this one. This is the field
+	// arcade actually populates today: double-spend detection is
+	// asynchronous, surfacing here (not on the earlier POST /tx response)
+	// once arcade has recorded it against a REJECTED/ARC-466 or
+	// DOUBLE_SPEND_ATTEMPTED verdict.
 	CompetingTxs []string `json:"competingTxs"`
 }
 
@@ -151,13 +164,19 @@ type SubmitResponse struct {
 	TxID string `json:"txid"`
 	// Status is the integer HTTP status code (202).
 	Status int `json:"status"`
-	// TxStatus is the transaction's lifecycle state at submission time. A
-	// 2xx body can carry txStatus DOUBLE_SPEND_ATTEMPTED alongside
-	// CompetingTxs when arcade already knows of a competitor at submit
-	// time.
+	// TxStatus is the transaction's lifecycle state at submission time.
+	// Arcade's own submitResponse (services/api_server/handlers.go, the
+	// ~762-767 struct and its ~932-936 idempotent-resubmit encoding) never
+	// sets this to DOUBLE_SPEND_ATTEMPTED: arcade detects a competing
+	// transaction only asynchronously, after acceptance, and reports it
+	// later from GET /tx/{txid} — see TxStatus.TxStatus /
+	// TxStatus.CompetingTxs. The general ARC contract allows a 2xx body to
+	// carry this state inline; decoded here for gateways that do.
 	TxStatus string `json:"txStatus"`
-	// CompetingTxs lists txids double-spending this one, when known at
-	// submission time.
+	// CompetingTxs lists txids double-spending this one, when the body
+	// names any at submission time. Arcade's own submitResponse never
+	// carries this field (see TxStatus's doc); decoded here, and left nil
+	// when absent, for the general ARC contract and other gateways.
 	CompetingTxs []string `json:"competingTxs"`
 	// ExtraInfo is free-form detail, when present.
 	ExtraInfo string `json:"extraInfo"`
@@ -165,8 +184,10 @@ type SubmitResponse struct {
 
 // DoubleSpend reports whether this submission response indicates a
 // double-spend attempt: either the lifecycle state is
-// DOUBLE_SPEND_ATTEMPTED, or arcade already named at least one competing
-// transaction.
+// DOUBLE_SPEND_ATTEMPTED, or the body already named at least one competing
+// transaction. Arcade itself never reports a double-spend this early (see
+// TxStatus's doc); this exists for the general ARC contract and other
+// gateways, so it is decoded when present rather than assumed.
 func (s *SubmitResponse) DoubleSpend() bool {
 	return s.TxStatus == "DOUBLE_SPEND_ATTEMPTED" || len(s.CompetingTxs) > 0
 }

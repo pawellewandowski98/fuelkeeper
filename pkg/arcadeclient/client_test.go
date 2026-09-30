@@ -140,11 +140,14 @@ func TestClient(t *testing.T) {
 	assert.Equal(t, uint64(100), pol.SatPerKB())
 }
 
-// TestPostTxDoubleSpendAttemptedBody covers a 202 SubmitResponse that
-// already knows of a competitor at submission time: txStatus
-// DOUBLE_SPEND_ATTEMPTED alongside competingTxs, per the arcade contract
-// (arcade.openapi.yaml SubmitResponse/TransactionStatus schemas).
-func TestPostTxDoubleSpendAttemptedBody(t *testing.T) {
+// TestPostTxDecodesCompetingTxsWhenPresent covers a 202 SubmitResponse body
+// that names a competitor at submission time: txStatus
+// DOUBLE_SPEND_ATTEMPTED alongside competingTxs. Arcade currently reports
+// double-spends only asynchronously via GET /tx (see SubmitResponse's doc
+// comment in client.go) and never produces this shape itself; this body is
+// permitted by the general ARC contract, so the client decodes it when
+// present, for other ARC-compatible gateways.
+func TestPostTxDecodesCompetingTxsWhenPresent(t *testing.T) {
 	competitor := strings.Repeat("c", 64)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/tx", func(w http.ResponseWriter, _ *http.Request) {
@@ -166,9 +169,14 @@ func TestPostTxDoubleSpendAttemptedBody(t *testing.T) {
 	assert.True(t, sub.DoubleSpend())
 }
 
-// TestRejectErrorCarriesCompetingTxs covers a 4xx RejectError body that
-// names competing transactions (e.g. ARC code 466, conflicting tx found).
-func TestRejectErrorCarriesCompetingTxs(t *testing.T) {
+// TestRejectErrorDecodesCompetingTxsWhenPresent covers a 4xx RejectError
+// body that names competing transactions (e.g. ARC code 466, conflicting tx
+// found). Arcade's current ValidationErrorResponse never includes
+// competingTxs on its own 4xx bodies — double-spend detection happens
+// asynchronously, after acceptance, and is reported later via GET /tx (see
+// RejectError's doc comment in client.go); this body shape is decoded when
+// present for the general ARC contract and other gateways.
+func TestRejectErrorDecodesCompetingTxsWhenPresent(t *testing.T) {
 	competitor := strings.Repeat("c", 64)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/tx", func(w http.ResponseWriter, _ *http.Request) {
@@ -213,6 +221,37 @@ func TestCompetingTxsAbsentLeavesNil(t *testing.T) {
 	require.ErrorAs(t, err, &rej)
 	assert.Nil(t, rej.CompetingTxs)
 	assert.False(t, rej.DoubleSpend())
+}
+
+// TestSubmitResponseDoubleSpendBranches is a white-box-style table test
+// (constructing SubmitResponse values directly, as TestTxStatusPredicates
+// does for TxStatus) covering SubmitResponse.DoubleSpend()'s two
+// independent branches: a DOUBLE_SPEND_ATTEMPTED txStatus with no
+// CompetingTxs, and a non-DOUBLE_SPEND_ATTEMPTED txStatus that still names
+// a competitor. Each is asserted in isolation from the other so a mutation
+// that turned the "||" into "&&" (or dropped either operand) would be
+// caught even though neither arcade itself, nor the combined body in
+// TestPostTxDecodesCompetingTxsWhenPresent, ever exercises one branch
+// without the other.
+func TestSubmitResponseDoubleSpendBranches(t *testing.T) {
+	competitor := strings.Repeat("c", 64)
+	tests := []struct {
+		name         string
+		txStatus     string
+		competingTxs []string
+		want         bool
+	}{
+		{"neither", "RECEIVED", nil, false},
+		{"txStatus only", "DOUBLE_SPEND_ATTEMPTED", nil, true},
+		{"competingTxs only", "RECEIVED", []string{competitor}, true},
+		{"both", "DOUBLE_SPEND_ATTEMPTED", []string{competitor}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sr := &arcadeclient.SubmitResponse{TxStatus: tt.txStatus, CompetingTxs: tt.competingTxs}
+			assert.Equal(t, tt.want, sr.DoubleSpend())
+		})
+	}
 }
 
 func TestNew(t *testing.T) {

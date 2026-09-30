@@ -49,6 +49,20 @@ func (s Status) String() string {
 // fuel output a client's spend hint names is gone (an input was already
 // spent) or untouched (the transaction itself was invalid), or the oracle
 // could not tell. Meaningful only when TxStatus.Rejected is true.
+//
+// RejectReasonTxInvalid is evidence about one submission to one gateway, not
+// a global verdict on the transaction: a gateway-local policy code (e.g.
+// arcade's fee, generic, or frozen-input codes) can reject a transaction
+// that a different gateway, or the same gateway under different policy,
+// would accept. A requeue driven by RejectReasonTxInvalid can therefore
+// still be resubmitted successfully elsewhere. The safety boundary this
+// package guarantees is narrower than "never reject a spendable output": it
+// is that RejectReasonInputsSpent and StatusSpent are never asserted
+// without real evidence the output is gone. Whether requeueing on
+// RejectReasonTxInvalid is safe for a given deployment is the consumer's
+// contract to keep (e.g. only requeueing once, or only after confirming no
+// other path for the same funds is in flight), not something this
+// classification enforces on its own.
 type RejectReason int
 
 // RejectReason values. RejectReasonUnknown means the oracle could not
@@ -58,7 +72,8 @@ const (
 	RejectReasonUnknown RejectReason = iota
 	// RejectReasonTxInvalid means the transaction itself was invalid (bad
 	// format, script, fee, size, or similar policy failure); its inputs are
-	// untouched and the row may be requeued.
+	// untouched and the row may be requeued. See the type doc: this is
+	// gateway-local evidence, not a global verdict.
 	RejectReasonTxInvalid
 	// RejectReasonInputsSpent means an input was already spent — missing,
 	// non-existent, or conflicting with another transaction; the fuel
