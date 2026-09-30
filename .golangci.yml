@@ -2,6 +2,8 @@ version: "2"
 run:
   timeout: 5m
   tests: true
+  build-tags:
+    - postgres
 linters:
   default: standard
   enable:

@@ -381,13 +381,22 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 	return n, nil
 }
 
-// Stats implements store.Store.
+// Stats implements store.Store. Both counts run inside one read-only
+// REPEATABLE READ transaction, so they reflect a single consistent snapshot
+// instead of two independent statements that a concurrent write could
+// straddle.
 func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return store.Stats{}, err
 	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return store.Stats{}, wrap(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op once Commit has succeeded
+
 	var st store.Stats
-	rs, err := s.pool.Query(ctx, `SELECT state, count(*) FROM fuel_rows WHERE pool = $1 GROUP BY state`, pool)
+	rs, err := tx.Query(ctx, `SELECT state, count(*) FROM fuel_rows WHERE pool = $1 GROUP BY state`, pool)
 	if err != nil {
 		return st, wrap(err)
 	}
@@ -415,15 +424,15 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 	if err := rs.Err(); err != nil {
 		return st, wrap(err)
 	}
-	rs, err = s.pool.Query(ctx, `SELECT status, count(*) FROM fuel_shards WHERE pool = $1 GROUP BY status`, pool)
+	rs, err = tx.Query(ctx, `SELECT status, count(*) FROM fuel_shards WHERE pool = $1 GROUP BY status`, pool)
 	if err != nil {
 		return st, wrap(err)
 	}
-	defer rs.Close()
 	for rs.Next() {
 		var status int16
 		var n int64
 		if err := rs.Scan(&status, &n); err != nil {
+			rs.Close()
 			return st, wrap(err)
 		}
 		switch store.ShardStatus(status) { //nolint:gosec // small enum
@@ -437,5 +446,9 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 			st.ShardsInvalid = n
 		}
 	}
-	return st, wrap(rs.Err())
+	rs.Close()
+	if err := rs.Err(); err != nil {
+		return st, wrap(err)
+	}
+	return st, wrap(tx.Commit(ctx))
 }

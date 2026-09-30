@@ -261,7 +261,10 @@ func (s *Store) updateReserved(ctx context.Context, pool string, token store.Tok
 		}
 		return nil
 	})
-	return n, err
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // Release implements store.Store.
@@ -307,7 +310,10 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 		n = int(k)
 		return nil
 	})
-	return n, err
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // ListQuarantined implements store.Store.
@@ -363,7 +369,10 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 		}
 		return nil
 	})
-	return n, err
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // countGroupBy runs a "SELECT <key>, count(*) FROM <table> WHERE pool = ?

@@ -209,7 +209,10 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 	if errors.Is(err, store.ErrNotFound) {
 		return 0, store.ErrNotFound
 	}
-	return n, err
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // retireShardRowSQL is RetireShard's per-row cascade statement: now = ?, pool

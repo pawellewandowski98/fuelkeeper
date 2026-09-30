@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -90,15 +91,23 @@ func commonPragmas(sync Sync) string {
 // DSN builds the writer DSN. _txlock=immediate makes every BeginTx on this
 // connection issue BEGIN IMMEDIATE, so a conflicting writer sees SQLITE_BUSY
 // up front instead of partway through the transaction.
+//
+// path is filepath.Clean'd first: on Linux, Clean already collapses a
+// doubled leading slash ("//foo" -> "/foo") along with any other repeated or
+// redundant separators, so a caller-supplied path that happens to start with
+// "//" (e.g. built by naively joining an empty root with an absolute path)
+// names the intended file instead of being parsed as a SQLite URI with a
+// (unsupported) authority component ("invalid uri authority").
 func DSN(path string, sync Sync) string {
-	return "file:" + dsnPathEscaper.Replace(path) + "?_txlock=immediate&" + commonPragmas(sync)
+	return "file:" + dsnPathEscaper.Replace(filepath.Clean(path)) + "?_txlock=immediate&" + commonPragmas(sync)
 }
 
 // ReaderDSN builds the read-only handle's DSN: the same pragmas as DSN plus
 // query_only(1) (a bug can never route a write through the reader), and no
-// _txlock, since reads never open a write transaction.
+// _txlock, since reads never open a write transaction. See DSN for why path
+// is filepath.Clean'd.
 func ReaderDSN(path string, sync Sync) string {
-	return "file:" + dsnPathEscaper.Replace(path) + "?" + commonPragmas(sync) + "&_pragma=query_only(1)"
+	return "file:" + dsnPathEscaper.Replace(filepath.Clean(path)) + "?" + commonPragmas(sync) + "&_pragma=query_only(1)"
 }
 
 // Store is a SQLite store.Store.
@@ -143,6 +152,7 @@ func Open(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("sqlite: open reader: %w", err)
 	}
 	reader.SetMaxOpenConns(8)
+	reader.SetMaxIdleConns(8) // match MaxOpenConns: don't churn connections under concurrent reads
 	s := &Store{writer: writer, reader: reader, now: time.Now}
 	for _, o := range opts {
 		o(s)

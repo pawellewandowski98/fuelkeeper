@@ -12,7 +12,7 @@ test:
 	$(GO) test -race -count=1 $(PKG)
 
 test-integration:
-	FUELKEEPER_TEST_POSTGRES_DSN="$(PG_DSN)" $(GO) test -race -count=1 -tags=postgres ./pkg/store/postgres/...
+	FUELKEEPER_TEST_POSTGRES_DSN="$(PG_DSN)" $(GO) test -race -count=1 -parallel=8 -tags=postgres ./pkg/store/postgres/...
 
 lint:
 	golangci-lint run

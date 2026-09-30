@@ -99,16 +99,47 @@ type Store struct {
 
 var _ store.Store = (*Store)(nil)
 
-// New opens a pool, applies the schema (idempotently, under an advisory lock) and pings.
-func New(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
+// buildPoolConfig parses cfg.DSN into a *pgxpool.Config and resolves the
+// pool's MaxConns: cfg.MaxConns wins whenever it is set (> 0); otherwise the
+// DSN's own pool_max_conns (if it set one) is kept exactly as
+// pgxpool.ParseConfig parsed it, and only when the DSN never mentioned
+// pool_max_conns does this fall back to defaultMaxConns. This is split out
+// from New so a unit test can exercise all three cases without a database.
+func buildPoolConfig(cfg Config) (*pgxpool.Config, error) {
 	pc, err := pgxpool.ParseConfig(cfg.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
 	}
-	if cfg.MaxConns > 0 {
+	switch {
+	case cfg.MaxConns > 0:
 		pc.MaxConns = cfg.MaxConns
-	} else {
+	case !dsnSetsPoolMaxConns(cfg.DSN):
 		pc.MaxConns = defaultMaxConns
+	}
+	return pc, nil
+}
+
+// dsnSetsPoolMaxConns reports whether dsn itself names pool_max_conns.
+// pgxpool.ParseConfig consumes (and deletes) that runtime parameter from its
+// own returned Config as it resolves MaxConns, so by the time buildPoolConfig
+// has a *pgxpool.Config in hand there is no way to tell "the DSN asked for
+// pgxpool's own default (max(4, NumCPU))" apart from "the DSN said nothing at
+// all"; parsing dsn a second time, before pgxpool.ParseConfig's side effect,
+// recovers that distinction.
+func dsnSetsPoolMaxConns(dsn string) bool {
+	raw, err := pgconn.ParseConfig(dsn)
+	if err != nil {
+		return false
+	}
+	_, ok := raw.RuntimeParams["pool_max_conns"]
+	return ok
+}
+
+// New opens a pool, applies the schema (idempotently, under an advisory lock) and pings.
+func New(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
+	pc, err := buildPoolConfig(cfg)
+	if err != nil {
+		return nil, err
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, pc)
 	if err != nil {
@@ -118,11 +149,34 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 	for _, o := range opts {
 		o(s)
 	}
+	if err := s.checkSynchronousCommit(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	if err := s.migrate(ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// checkSynchronousCommit refuses to start against a server whose
+// synchronous_commit setting is off. G1 (no fuel output is ever handed to two
+// live reservations) depends on an acknowledged commit being durable: with
+// synchronous_commit=off, Postgres can report a transaction as committed
+// before its WAL record reaches disk, so a crash in that window silently
+// forgets a reservation the caller already believes it holds. local,
+// remote_write and remote_apply all still fsync (or wait for a replica to
+// receive/apply) before acknowledging, so only off is rejected.
+func (s *Store) checkSynchronousCommit(ctx context.Context) error {
+	var val string
+	if err := s.pool.QueryRow(ctx, "SHOW synchronous_commit").Scan(&val); err != nil {
+		return fmt.Errorf("postgres: read synchronous_commit: %w", err)
+	}
+	if val == "off" {
+		return fmt.Errorf("%w: postgres: synchronous_commit=off would let a crash forget acknowledged reservations; set it to on for the fuelkeeper role or database", store.ErrInvalidArgument)
+	}
+	return nil
 }
 
 // migrate applies every not-yet-applied schema version inside one transaction

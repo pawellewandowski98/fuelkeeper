@@ -44,11 +44,13 @@ func isolatedStore(t *testing.T, admin *pgxpool.Pool, dsn string, now func() tim
 	if strings.Contains(dsn, "?") {
 		sep = "&"
 	}
-	// MaxConns: 4, not the package default: RunSuite runs 28 subtests in
+	// MaxConns: 2, not the package default: RunSuite runs 32 subtests in
 	// parallel, each opening its own pool, and CI's Postgres service runs with
 	// the default max_connections=100 (only the local docker-compose sets it to
-	// 300), so 28 * MaxConns must stay well under 100.
-	s, err := postgres.New(ctx, postgres.Config{DSN: dsn + sep + "search_path=" + schema, MaxConns: 4}, postgres.WithClock(now))
+	// 300), so 32 * MaxConns must stay well under 100. -parallel 8 (pinned in
+	// the Makefile's test-integration target) additionally bounds how many of
+	// those pools are ever open at once, to 8 * MaxConns = 16 connections.
+	s, err := postgres.New(ctx, postgres.Config{DSN: dsn + sep + "search_path=" + schema, MaxConns: 2}, postgres.WithClock(now))
 	require.NoError(t, err)
 	return s
 }
@@ -62,4 +64,26 @@ func TestConformance(t *testing.T) {
 	storetest.RunSuite(t, func(t *testing.T, now func() time.Time) store.Store {
 		return isolatedStore(t, admin, dsn, now)
 	})
+}
+
+// TestSynchronousCommitOffRejected proves New refuses to open a store whose
+// server-side synchronous_commit is off (G1 depends on an acknowledged commit
+// being durable), and that a normal open against the same server still
+// succeeds. The "options" connection parameter applies a session-scoped
+// "-c synchronous_commit=off" as if passed on the postmaster command line,
+// without touching the role or database's persistent setting.
+func TestSynchronousCommitOffRejected(t *testing.T) {
+	dsn := testDSN(t)
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	offDSN := dsn + sep + "options=-c%20synchronous_commit%3Doff"
+
+	_, err := postgres.New(context.Background(), postgres.Config{DSN: offDSN})
+	require.ErrorIs(t, err, store.ErrInvalidArgument)
+
+	s, err := postgres.New(context.Background(), postgres.Config{DSN: dsn})
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
 }

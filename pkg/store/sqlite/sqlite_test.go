@@ -45,6 +45,18 @@ func TestDSNAndPragmas(t *testing.T) {
 	require.True(t, p.ReaderQueryOnly)
 }
 
+// TestOpen_LeadingDoubleSlashPath proves a path that happens to start with a
+// doubled leading slash (e.g. built by naively joining an empty root with an
+// absolute path) still opens: without filepath.Clean, modernc.org/sqlite's
+// URI parser would read "//..." as naming an authority component and fail
+// with "invalid uri authority".
+func TestOpen_LeadingDoubleSlashPath(t *testing.T) {
+	path := "//" + filepath.Join(t.TempDir(), "x.sqlite")
+	s, err := sqlite.Open(context.Background(), sqlite.Config{Path: path})
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+}
+
 func TestOpen_InvalidSync(t *testing.T) {
 	_, err := sqlite.Open(context.Background(), sqlite.Config{Path: filepath.Join(t.TempDir(), "bad.sqlite"), Sync: "full"})
 	require.ErrorIs(t, err, store.ErrInvalidArgument, "Sync is case-sensitive: lowercase must be rejected")
