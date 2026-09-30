@@ -19,8 +19,8 @@ Status: store core complete (Plan 1). Design: `docs/superpowers/specs/2026-09-29
 | Backend  | Multi-process | Conformance run | Notes |
 |----------|---------------|-----------------|-------|
 | memory   | no            | always          | tests and benchmarks |
-| sqlite   | no            | always          | single writer, `synchronous=FULL` by default, pragmas verified at open (the writer DSN uses `_txlock=immediate` and `synchronous=FULL`) |
-| postgres | yes           | `make test-integration` | `FOR UPDATE SKIP LOCKED` adoption, `unnest` CAS batches, partial indexes |
+| sqlite   | no            | always          | single writer; `_pragma` DSN (`_txlock=immediate` on the writer, `synchronous` FULL by default); journal_mode/busy_timeout/synchronous/journal_size_limit/query_only read back at open |
+| postgres | yes           | `make test-integration` | `FOR UPDATE SKIP LOCKED` adoption, per-row CAS UPDATEs pipelined in one `pgx.Batch` in (txid, vout) order, partial indexes |
 | pebble, mongodb, aerospike | see spec | Plan 4 | |
 
 Every backend must pass `pkg/store/storetest.RunSuite` with `-race`.

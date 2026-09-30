@@ -59,22 +59,30 @@ func TestWrite_FnCancelsContextThenSubsequentWriteSucceeds(t *testing.T) {
 
 // TestReserve_TightDeadlinesNeverApplyPartially hammers Reserve of a
 // 1000-row batch with contexts whose deadlines are so tight the write's
-// BeginTx/Commit routinely races the deadline, at four deadline scales and a
+// BeginTx/Commit routinely races the deadline, at six deadline tiers and a
 // few iterations each. Every attempt must either apply all 1000 ops or none
 // (store.Caps.AtomicBatch is true for this backend): a partial application
 // would mean the write's transaction boundary leaked below the statement
 // level. A final normal Reserve must still succeed, proving the repeated
 // cancellations never poisoned the writer connection.
 //
-// The four deadline scales are derived from a dry-run, uncancelled 1000-op
-// Reserve's measured duration (0.5x, 0.9x, 1.0x, 1.1x of it) rather than
-// fixed microsecond guesses, so cancellation also has a real chance of
-// landing during Commit() and not only in the per-row loop; under -race that
-// duration is roughly 25x its normal cost (modernc.org/sqlite is pure Go and
-// lock-heavy), so iteration counts are kept low to keep this test at a few
-// seconds. The all-or-nothing assertion is checked unconditionally for every
-// attempt, so which branch a given tier exercises is timing-dependent but
-// the expected outcome never is.
+// The six tiers are: an already-expired context (0), a context that expires
+// within microseconds (lands at BeginTx or the first rows), and four tiers
+// scaled off a dry-run, uncancelled 1000-op Reserve's measured duration
+// (0.5x, 0.95x, 1.0x, 1.05x) rather than fixed microsecond guesses, so
+// cancellation also has a real chance of landing during Commit() and not
+// only in the per-row loop; under -race that duration is roughly 25x its
+// normal cost (modernc.org/sqlite is pure Go and lock-heavy), so iteration
+// counts are kept low to keep this test at several seconds (measured ≈4.5s
+// on SQLite under -race). The all-or-nothing assertion is checked
+// unconditionally for every attempt, so which branch a given tier exercises
+// is timing-dependent but the expected outcome never is. Any attempt that
+// does apply the full batch re-mints a fresh set of rows before the next
+// attempt, so the invariant stays testable throughout the run instead of
+// going vacuous once the batch first lands. Reserve's returned error, when
+// non-nil, must be a cancellation error (context.Canceled or
+// context.DeadlineExceeded) or store.ErrUnavailable -- anything else fails
+// the test immediately instead of only at the final not-poisoned check.
 func TestReserve_TightDeadlinesNeverApplyPartially(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(ctx, Config{Path: filepath.Join(t.TempDir(), "cancel-reserve.sqlite")})
@@ -90,19 +98,29 @@ func TestReserve_TightDeadlinesNeverApplyPartially(t *testing.T) {
 	before, err := s.Stats(ctx, "main")
 	require.NoError(t, err)
 
-	timeouts := []time.Duration{baseline / 2, baseline * 9 / 10, baseline, baseline * 11 / 10}
+	timeouts := []time.Duration{0, 50 * time.Microsecond, baseline / 2, baseline * 19 / 20, baseline, baseline * 21 / 20}
 	for _, to := range timeouts {
 		for i := 0; i < 2; i++ {
 			tctx, cancel := context.WithTimeout(ctx, to)
 			tok := store.NewToken()
-			_, _ = s.Reserve(tctx, "main", storetest.ReserveOps(rows, tok, time.Now().Add(time.Hour)))
+			_, rerr := s.Reserve(tctx, "main", storetest.ReserveOps(rows, tok, time.Now().Add(time.Hour)))
 			cancel()
+			if rerr != nil {
+				require.True(t, errors.Is(rerr, context.DeadlineExceeded) || errors.Is(rerr, context.Canceled) || errors.Is(rerr, store.ErrUnavailable),
+					"Reserve under a %s deadline returned a non-cancellation error: %v", to, rerr)
+			}
 
 			st, statErr := s.Stats(context.Background(), "main")
 			require.NoError(t, statErr)
 			delta := st.Reserved - before.Reserved
 			require.True(t, delta == 0 || delta == int64(len(rows)),
 				"Reserve under a %s deadline must apply all-or-nothing, got delta %d", to, delta)
+
+			if delta != 0 {
+				_, rows = storetest.MintShard(t, s, "main", 1000, store.ShardMined)
+				before, err = s.Stats(ctx, "main")
+				require.NoError(t, err)
+			}
 		}
 	}
 

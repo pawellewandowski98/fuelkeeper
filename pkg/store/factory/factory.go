@@ -35,6 +35,9 @@ func New(ctx context.Context, cfg Config, now func() time.Time) (store.Store, er
 	if now == nil {
 		now = time.Now
 	}
+	if cfg.Backend == "" {
+		return nil, fmt.Errorf("%w: store backend is required (memory|sqlite|postgres)", store.ErrInvalidArgument)
+	}
 	switch cfg.Backend {
 	case BackendMemory:
 		return memory.New(memory.WithClock(now)), nil

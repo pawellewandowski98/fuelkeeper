@@ -2,6 +2,7 @@ package storetest
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"os"
 	"strconv"
@@ -654,13 +655,26 @@ func testRetireVsReserveRace(t *testing.T, s store.Store, clk *Clock) {
 // for cancellation to have a real chance of landing during Commit() rather
 // than always firing somewhere in the per-row loop. Rather than hard-code a
 // guess, this dry-runs one uncancelled 1000-op Reserve to measure that
-// backend's actual duration, then derives the tiers from it. Whichever
-// branch a given tier exercises, the all-or-nothing invariant below is
-// checked unconditionally, so the assertions stay deterministic even though
-// timing decides which branch runs. Iteration counts are kept low (this runs
-// per tier, per backend, under -race, and modernc.org/sqlite's measured
-// duration inflates roughly 25x under the race detector) so the whole
-// subtest stays at a few seconds on memory, sqlite and postgres.
+// backend's actual duration, then derives six tiers from it: an
+// already-expired context (0), a context that expires within microseconds
+// (lands at BeginTx or the first rows), and four tiers scaled off the
+// baseline (0.5x, 0.95x, 1.0x, 1.05x) spanning the rest of the per-row loop
+// and the window around Commit. Whichever branch a given tier exercises, the
+// all-or-nothing invariant below is checked unconditionally, so the
+// assertions stay deterministic even though timing decides which branch
+// runs. Any attempt that does apply the full batch re-mints a fresh set of
+// rows before the next attempt, so the invariant stays testable throughout
+// the run instead of going vacuous once the batch first lands (every later
+// attempt on the same already-applied rows would otherwise trivially report
+// delta == len(rows) without exercising the cancel path at all). Reserve's
+// returned error, when non-nil, must be a cancellation error
+// (context.Canceled or context.DeadlineExceeded) or store.ErrUnavailable --
+// anything else fails the test immediately instead of only at the final
+// not-poisoned check. Iteration counts are kept low (this runs per tier, per
+// backend, under -race, and modernc.org/sqlite's measured duration inflates
+// roughly 25x under the race detector) so the whole subtest stays at several
+// seconds on memory, sqlite and postgres (measured ≈4.5s per test on SQLite
+// under -race).
 func testReserveAllOrNothingOnCancel(t *testing.T, s store.Store, clk *Clock) {
 	if !s.Capabilities().AtomicBatch {
 		t.Skip("backend does not declare AtomicBatch")
@@ -676,19 +690,29 @@ func testReserveAllOrNothingOnCancel(t *testing.T, s store.Store, clk *Clock) {
 	before, err := s.Stats(ctx, "main")
 	require.NoError(t, err)
 
-	timeouts := []time.Duration{baseline / 2, baseline * 9 / 10, baseline, baseline * 11 / 10}
+	timeouts := []time.Duration{0, 50 * time.Microsecond, baseline / 2, baseline * 19 / 20, baseline, baseline * 21 / 20}
 	for _, to := range timeouts {
 		for i := 0; i < 2; i++ {
 			tctx, cancel := context.WithTimeout(ctx, to)
 			tok := store.NewToken()
-			_, _ = s.Reserve(tctx, "main", ReserveOps(rows, tok, clk.Now().Add(time.Hour)))
+			_, rerr := s.Reserve(tctx, "main", ReserveOps(rows, tok, clk.Now().Add(time.Hour)))
 			cancel()
+			if rerr != nil {
+				require.True(t, errors.Is(rerr, context.DeadlineExceeded) || errors.Is(rerr, context.Canceled) || errors.Is(rerr, store.ErrUnavailable),
+					"Reserve under a %s deadline returned a non-cancellation error: %v", to, rerr)
+			}
 
 			st, statErr := s.Stats(ctx, "main")
 			require.NoError(t, statErr)
 			delta := st.Reserved - before.Reserved
 			require.True(t, delta == 0 || delta == int64(len(rows)),
 				"Reserve under a %s deadline must apply all-or-nothing, got delta %d more reserved than before", to, delta)
+
+			if delta != 0 {
+				_, rows = MintShard(t, s, "main", 1000, store.ShardMined)
+				before, err = s.Stats(ctx, "main")
+				require.NoError(t, err)
+			}
 		}
 	}
 
