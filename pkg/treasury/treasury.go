@@ -72,3 +72,47 @@ type Treasury interface {
 	// the oracle into the compact mined BEEF (split tx + BUMP).
 	MinedBEEF(ctx context.Context, txid chainhash.Hash, unminedBEEF, merklePath []byte) ([]byte, error)
 }
+
+// FundingInfo is what a payer needs to build a BRC-29 payment to the treasury.
+type FundingInfo struct {
+	// IdentityKeyHex is the treasury wallet's compressed identity public key (66 hex chars).
+	IdentityKeyHex string
+	// DerivationPrefixB64 is a fresh, verifiable nonce the payer uses as the BRC-29 derivation prefix.
+	DerivationPrefixB64 string
+	// Network is the treasury's network (main | test | ttn | tstn).
+	Network string
+}
+
+// FundRequest is a payer's completed payment.
+type FundRequest struct {
+	// AtomicBEEF is the payment transaction with its ancestry (BRC-95).
+	AtomicBEEF []byte
+	// OutputIndex is the payment output's index; -1 asks for auto-detection by
+	// matching the BRC-29 script (available only where the wiring supports it).
+	OutputIndex int
+	// DerivationPrefixB64 is the prefix handed out by FundingInfo.
+	DerivationPrefixB64 string
+	// DerivationSuffixB64 is the payer-chosen BRC-29 derivation suffix.
+	DerivationSuffixB64 string
+	// SenderIdentityKeyHex is the payer's identity public key (hex).
+	SenderIdentityKeyHex string
+}
+
+// FundResult reports what was internalized.
+type FundResult struct {
+	// TxID is the payment transaction id (hex).
+	TxID string
+	// Satoshis is the value of the internalized output.
+	Satoshis uint64
+}
+
+// ErrBadFunding is returned for a malformed or unverifiable funding request.
+var ErrBadFunding = errors.New("treasury: bad funding request")
+
+// Funder is implemented by treasuries that accept BRC-29 payments.
+type Funder interface {
+	// FundingInfo returns the treasury identity key and a fresh derivation prefix.
+	FundingInfo(ctx context.Context) (FundingInfo, error)
+	// Internalize accepts a completed payment into the treasury wallet.
+	Internalize(ctx context.Context, req FundRequest) (FundResult, error)
+}
