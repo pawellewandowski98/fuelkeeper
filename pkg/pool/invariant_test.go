@@ -25,10 +25,15 @@ import (
 
 // live tracks, per outpoint, the reservation the "network of clients" believes
 // is live: token + expiry. A reservation stops being live when the client
-// releases it, spends it, or its expiry passes on the manual clock.
+// releases it, spends it, or its expiry passes on the manual clock. It also
+// double-checks the store side of every claim: st/poolName let claim ask the
+// store directly, not just the in-memory bookkeeping, whether an outpoint it
+// was just handed is really reserved under that token.
 type live struct {
-	mu   sync.Mutex
-	held map[store.Outpoint]liveRes
+	mu       sync.Mutex
+	held     map[store.Outpoint]liveRes
+	st       store.Store
+	poolName string
 }
 
 type liveRes struct {
@@ -36,14 +41,48 @@ type liveRes struct {
 	exp time.Time
 }
 
-func (l *live) claim(t *testing.T, now time.Time, tok store.Token, exp time.Time, ops []store.Outpoint) {
+// storeGetRowsChunk is the largest batch claim passes to GetRows per call, at
+// or below every backend's Caps.MaxBatch (memory's is 1000).
+const storeGetRowsChunk = 1000
+
+func (l *live) claim(ctx context.Context, t *testing.T, now time.Time, tok store.Token, exp time.Time, ops []store.Outpoint) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	for _, op := range ops {
 		if prev, ok := l.held[op]; ok && prev.tok != tok && now.Before(prev.exp) {
 			t.Errorf("G1 violated: %s handed to %s while live under %s until %s (now %s)", op, tok, prev.tok, prev.exp, now)
 		}
 		l.held[op] = liveRes{tok: tok, exp: exp}
+	}
+	l.mu.Unlock()
+
+	// Verify the store side too: Reserve must not report an outpoint it did
+	// not durably record. Skip once the reservation is already past its own
+	// expiry by our own clock reading: a delayed goroutine may find the
+	// reaper already quarantined it, which is not a violation of anything.
+	if !now.Before(exp) {
+		return
+	}
+	for i := 0; i < len(ops); i += storeGetRowsChunk {
+		end := min(i+storeGetRowsChunk, len(ops))
+		batch := ops[i:end]
+		rows, err := l.st.GetRows(ctx, l.poolName, batch)
+		if err != nil {
+			t.Errorf("G1 store check: GetRows: %v", err)
+			continue
+		}
+		byOp := make(map[store.Outpoint]store.Row, len(rows))
+		for _, r := range rows {
+			byOp[r.Outpoint] = r
+		}
+		for _, op := range batch {
+			r, ok := byOp[op]
+			switch {
+			case !ok:
+				t.Errorf("G1 store check: %s missing from GetRows right after Reserve returned it under %s", op, tok)
+			case r.State != store.StateReserved || r.ReservedBy != tok:
+				t.Errorf("G1 store check: %s state=%s reservedBy=%s, want reserved by %s", op, r.State, r.ReservedBy, tok)
+			}
+		}
 	}
 }
 
@@ -125,9 +164,9 @@ func stressMul() int {
 func TestInvariantsMultiInstance(t *testing.T) {
 	ctx := context.Background()
 	rounds := 300 * stressMul()
-	seed := int64(42)
+	seed := time.Now().UnixNano()
 	if v, err := strconv.ParseInt(os.Getenv("FUELKEEPER_SEED"), 10, 64); err == nil {
-		seed = v
+		seed = v // e.g. FUELKEEPER_SEED=42 to replay a specific run
 	}
 	t.Logf("seed=%d rounds=%d", seed, rounds)
 	rng := rand.New(rand.NewSource(seed)) //nolint:gosec // deterministic simulation
@@ -141,9 +180,11 @@ func TestInvariantsMultiInstance(t *testing.T) {
 	pc.MaxTTL = time.Minute
 	require.NoError(t, pc.Validate())
 
-	// Seed 6 mined shards × 40 rows = 240 rows; the oracle knows them all as unspent.
+	// Seed 6×stressMul() mined shards × 40 rows; the oracle knows them all as
+	// unspent. Supply scales with stress so a higher FUELKEEPER_STRESS still
+	// has fuel to hand out after a few hundred rounds (see the re-mint below).
 	total := 0
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 6*stressMul(); i++ {
 		_, rows := storetest.MintShard(t, st, "main", 40, store.ShardMined)
 		total += len(rows)
 		for _, r := range rows {
@@ -169,15 +210,26 @@ func TestInvariantsMultiInstance(t *testing.T) {
 		in.p.EnsureRows(ctx) // let managers adopt before the storm
 	}
 
-	lv := &live{held: map[store.Outpoint]liveRes{}}
+	lv := &live{held: map[store.Outpoint]liveRes{}, st: st, poolName: pc.Name}
 	type held struct {
 		tok store.Token
 		ops []store.Outpoint
 	}
 	var mine []held
-	var nReserve, nRelease, nSpend, nAbandon, nTick, nCrash int
+	var nReserve, nRelease, nSpend, nAbandon, nTick, nCrash, nMint int
 
 	for round := 0; round < rounds; round++ {
+		if round > 0 && round%100 == 0 {
+			// Keep the pool fed: without this, a high FUELKEEPER_STRESS
+			// multiplier can burn through the fixed initial supply well
+			// before the run ends.
+			_, rows := storetest.MintShard(t, st, "main", 40, store.ShardMined)
+			total += len(rows)
+			for _, r := range rows {
+				orc.SetUnspent(r.Outpoint)
+			}
+			nMint++
+		}
 		action := rng.Intn(100)
 		in := instances[rng.Intn(len(instances))]
 		switch {
@@ -188,7 +240,7 @@ func TestInvariantsMultiInstance(t *testing.T) {
 			}
 			nReserve++
 			ops := outpointsOf(res.Outputs)
-			lv.claim(t, clk.Now(), res.Token, res.ExpiresAt, ops)
+			lv.claim(ctx, t, clk.Now(), res.Token, res.ExpiresAt, ops)
 			mine = append(mine, held{tok: res.Token, ops: ops})
 		case action < 70 && len(mine) > 0: // release
 			i := rng.Intn(len(mine))
@@ -229,7 +281,7 @@ func TestInvariantsMultiInstance(t *testing.T) {
 			nCrash++
 		}
 	}
-	t.Logf("reserve=%d release=%d spend=%d abandon=%d tick=%d crash=%d", nReserve, nRelease, nSpend, nAbandon, nTick, nCrash)
+	t.Logf("reserve=%d release=%d spend=%d abandon=%d tick=%d crash=%d mint=%d", nReserve, nRelease, nSpend, nAbandon, nTick, nCrash, nMint)
 
 	// Drain: release everything still held, advance past every TTL and lease, reap until stable.
 	for _, h := range mine {
@@ -250,6 +302,7 @@ func TestInvariantsMultiInstance(t *testing.T) {
 	require.Equal(t, int64(0), stats.Quarantined, "every quarantined row resolved (oracle knew every outpoint)")
 	require.Equal(t, int64(0), stats.Invalid)
 	require.Positive(t, stats.Spent, "the simulation spent something")
+	require.Positive(t, stats.Available, "the simulation left fuel available (supply scales with stress)")
 	t.Logf("final: available=%d spent=%d", stats.Available, stats.Spent)
 }
 
@@ -272,7 +325,7 @@ func TestInvariantsConcurrentClients(t *testing.T) {
 	require.NoError(t, pc.Validate())
 
 	total := 0
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 6*stressMul(); i++ {
 		_, rows := storetest.MintShard(t, st, "main", 40, store.ShardMined)
 		total += len(rows)
 		for _, r := range rows {
@@ -298,7 +351,7 @@ func TestInvariantsConcurrentClients(t *testing.T) {
 		in.p.EnsureRows(ctx) // let managers adopt before the storm
 	}
 
-	lv := &live{held: map[store.Outpoint]liveRes{}}
+	lv := &live{held: map[store.Outpoint]liveRes{}, st: st, poolName: pc.Name}
 
 	// Ticker goroutine: the sole owner of the manual clock and the reaper.
 	// Being a single goroutine looping over one ticker channel guarantees
@@ -345,7 +398,7 @@ func TestInvariantsConcurrentClients(t *testing.T) {
 						continue // exhausted / insufficient / backpressure are legitimate under load
 					}
 					ops := outpointsOf(res.Outputs)
-					lv.claim(t, clk.Now(), res.Token, res.ExpiresAt, ops)
+					lv.claim(ctx, t, clk.Now(), res.Token, res.ExpiresAt, ops)
 					mine = append(mine, held{tok: res.Token, ops: ops})
 				case action < 75 && len(mine) > 0: // release
 					i := rng.Intn(len(mine))
@@ -399,5 +452,6 @@ func TestInvariantsConcurrentClients(t *testing.T) {
 	require.Equal(t, int64(0), stats.Quarantined, "every quarantined row resolved (oracle knew every outpoint)")
 	require.Equal(t, int64(0), stats.Invalid)
 	require.Positive(t, stats.Spent, "the simulation spent something")
+	require.Positive(t, stats.Available, "the simulation left fuel available (supply scales with stress)")
 	t.Logf("final: available=%d spent=%d", stats.Available, stats.Spent)
 }
