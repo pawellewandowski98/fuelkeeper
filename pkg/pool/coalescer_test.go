@@ -257,6 +257,93 @@ func TestCoalescerRejectsBadBatches(t *testing.T) {
 	assert.ErrorIs(t, res.Err, pool.ErrBadRequest)
 }
 
+// TestCoalescerSubmitRejectsMixedTokens covers the rule that one Submit call
+// is one request under one token: mixing tokens within a single batch would
+// make "reserved under this request's token" ambiguous.
+func TestCoalescerSubmitRejectsMixedTokens(t *testing.T) {
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	_, rows := storetest.MintShard(t, st, "main", 4, store.ShardMined)
+	c := startCoalescer(t, st, pool.CoalescerConfig{Slots: 1, MaxBatch: 64})
+
+	ops := storetest.ReserveOps(rows[:2], store.NewToken(), clk.Now().Add(time.Minute))
+	ops[1].Token = store.NewToken() // a different token than ops[0]
+	res := c.Submit(context.Background(), ops)
+	require.ErrorIs(t, res.Err, pool.ErrBadRequest, "ops in one batch must share one token")
+	assert.True(t, res.Unflushed)
+
+	got := storetest.RowsByOutpoint(t, st, "main", storetest.Ops(rows[:2]))
+	for _, r := range rows[:2] {
+		assert.Equal(t, store.StateAvailable, got[r.Outpoint].State, "a rejected batch never touches the store")
+	}
+}
+
+// TestCoalescerDrainRacingCancelStaysUnflushed is a regression test for a race
+// where a request sitting in the pending queue, cancelled at the same moment
+// Run's context is cancelled (shutdown), could be delivered with
+// Unflushed=false even though the store never saw it: drain empties pending
+// under Coalescer.mu, so a racing withdraw could find the request already
+// gone from the slice and fall through to the "taken by a flush" path. The
+// fix threads a drained flag through the same mutex so withdraw always knows
+// whether drain (not a flush) is the one that took the request.
+func TestCoalescerDrainRacingCancelStaysUnflushed(t *testing.T) {
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	_, rows := storetest.MintShard(t, st, "main", 2000, store.ShardMined)
+	f := storetest.NewFaulty(st)
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	f.BeforeReserve = func([]store.ReserveOp) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+	}
+
+	const iterations = 1000
+	for i := 0; i < iterations; i++ {
+		c := pool.NewCoalescer(f, "main", pool.CoalescerConfig{Slots: 1, MaxBatch: 64})
+		runCtx, stop := context.WithCancel(context.Background())
+		runDone := make(chan struct{})
+		go func() { defer close(runDone); _ = c.Run(runCtx) }()
+
+		a := rows[2*i : 2*i+1]
+		b := rows[2*i+1 : 2*i+2]
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = c.Submit(context.Background(), storetest.ReserveOps(a, store.NewToken(), clk.Now().Add(time.Minute)))
+		}()
+		<-entered // request A's flush has started and holds the only slot
+
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		resCh := make(chan pool.Result, 1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resCh <- c.Submit(ctx2, storetest.ReserveOps(b, store.NewToken(), clk.Now().Add(time.Minute)))
+		}()
+		require.Eventually(t, func() bool { return c.PendingOps() == 1 }, time.Second, time.Millisecond, "iteration %d: request B queued", i)
+
+		var raceWG sync.WaitGroup
+		raceWG.Add(2)
+		go func() { defer raceWG.Done(); stop() }()
+		go func() { defer raceWG.Done(); cancel2() }()
+		raceWG.Wait()
+
+		res := <-resCh
+		require.True(t, res.Unflushed, "iteration %d: request B never reached the store", i)
+		require.ErrorIs(t, res.Err, context.Canceled, "iteration %d", i)
+
+		release <- struct{}{} // let request A's flush (and Run) finish for this iteration
+		<-runDone
+		wg.Wait()
+	}
+}
+
 // TestCoalescerDuplicateAcrossRequests covers the defensive case where two
 // different requests in the same flush batch name the same outpoint (the
 // allocator's known set is supposed to make this impossible, but the

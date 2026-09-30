@@ -17,7 +17,9 @@ type CoalescerConfig struct {
 	MaxBatch       int           // ops per flush (<= store Caps.MaxBatch)
 	Window         time.Duration // optional accumulation window when a slot is free (0 = none)
 	MaxInflightOps int           // backpressure threshold; 0 = 4*Slots*MaxBatch
-	Retries        int           // retries after the first attempt on ErrUnavailable; default 2
+	// Retries is how many additional attempts follow the first on ErrUnavailable.
+	// 0 means the default (2); negative means no retries (the first attempt is final).
+	Retries        int
 	RetryBackoff   time.Duration // first backoff; doubles; default 20ms
 	FlushTimeout   time.Duration // per-attempt store timeout; default 5s
 	CompensateTime time.Duration // budget for compensating releases; default 2s
@@ -33,6 +35,10 @@ func (c CoalescerConfig) withDefaults() CoalescerConfig {
 	if c.MaxInflightOps <= 0 {
 		c.MaxInflightOps = 4 * c.Slots * c.MaxBatch
 	}
+	// A single max-size request must never be rejected by construction: whatever
+	// MaxInflightOps ends up being (defaulted or explicit), it can't be smaller
+	// than one full batch.
+	c.MaxInflightOps = max(c.MaxInflightOps, c.MaxBatch)
 	if c.Retries < 0 {
 		c.Retries = 0
 	} else if c.Retries == 0 {
@@ -69,6 +75,13 @@ type request struct {
 	state  atomic.Int32
 	done   chan struct{}
 	result Result
+	// drained is set under Coalescer.mu by drain, before it clears pending, to
+	// tell a racing withdraw that this request was pulled out by shutdown (and
+	// will be delivered as Unflushed) rather than by a flush. Without this flag
+	// withdraw can miss a request that drain already removed from pending and
+	// wrongly fall through to the "taken by a flush" path, reporting
+	// Unflushed=false for a request the store never saw.
+	drained bool
 }
 
 // Coalescer groups concurrent reserve requests into batched, idempotent
@@ -84,7 +97,6 @@ type Coalescer struct {
 	inflight   atomic.Int64 // ops in pending + in flight
 	kick       chan struct{}
 	slots      chan struct{}
-	runCtx     context.Context //nolint:containedctx // dispatcher context for detached flush contexts
 	stopped    atomic.Bool
 }
 
@@ -92,12 +104,11 @@ type Coalescer struct {
 func NewCoalescer(st store.Store, pool string, cfg CoalescerConfig) *Coalescer {
 	cfg = cfg.withDefaults()
 	return &Coalescer{
-		st:     st,
-		pool:   pool,
-		cfg:    cfg,
-		kick:   make(chan struct{}, 1),
-		slots:  make(chan struct{}, cfg.Slots),
-		runCtx: context.Background(),
+		st:    st,
+		pool:  pool,
+		cfg:   cfg,
+		kick:  make(chan struct{}, 1),
+		slots: make(chan struct{}, cfg.Slots),
 	}
 }
 
@@ -120,12 +131,18 @@ func (c *Coalescer) Submit(ctx context.Context, ops []store.ReserveOp) Result {
 	if err := store.ValidateReserveOps(ops, c.cfg.MaxBatch); err != nil {
 		return Result{Unflushed: true, Err: fmt.Errorf("%w: %w", ErrBadRequest, err)}
 	}
+	tok := ops[0].Token
+	for _, op := range ops[1:] {
+		if op.Token != tok {
+			return Result{Unflushed: true, Err: fmt.Errorf("%w: reserve batch ops must share one token", ErrBadRequest)}
+		}
+	}
 	if c.stopped.Load() {
 		return Result{Unflushed: true, Err: ErrUnavailable}
 	}
 	req := &request{ops: ops, done: make(chan struct{})}
-	if !c.enqueue(req) {
-		return Result{Unflushed: true, Err: ErrBackpressure}
+	if err := c.enqueue(req); err != nil {
+		return Result{Unflushed: true, Err: err}
 	}
 	select {
 	case <-req.done:
@@ -144,17 +161,20 @@ func (c *Coalescer) Submit(ctx context.Context, ops []store.ReserveOp) Result {
 	return Result{Err: ctx.Err()}
 }
 
-func (c *Coalescer) enqueue(req *request) bool {
+// enqueue appends req to the pending queue, or reports why it could not:
+// ErrBackpressure when the inflight cap is exceeded, ErrUnavailable when the
+// coalescer has stopped.
+func (c *Coalescer) enqueue(req *request) error {
 	n := int64(len(req.ops))
 	if c.inflight.Add(n) > int64(c.cfg.MaxInflightOps) {
 		c.inflight.Add(-n)
-		return false
+		return ErrBackpressure
 	}
 	c.mu.Lock()
 	if c.stopped.Load() { // drain already ran; do not strand this request
 		c.mu.Unlock()
 		c.inflight.Add(-n)
-		return false
+		return ErrUnavailable
 	}
 	c.pending = append(c.pending, req)
 	c.pendingOps += len(req.ops)
@@ -163,13 +183,19 @@ func (c *Coalescer) enqueue(req *request) bool {
 	case c.kick <- struct{}{}:
 	default:
 	}
-	return true
+	return nil
 }
 
-// withdraw removes a request that has not been taken by a flush yet.
+// withdraw removes a request that has not been taken by a flush yet. It
+// reports true both when it physically removes req from pending and when
+// drain already claimed req (req.drained): either way the caller never
+// reached the store and the request is (or will be) delivered as Unflushed.
 func (c *Coalescer) withdraw(req *request) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if req.drained {
+		return true
+	}
 	for i, p := range c.pending {
 		if p == req {
 			c.pending = append(c.pending[:i], c.pending[i+1:]...)
@@ -207,9 +233,10 @@ func (c *Coalescer) hasPending() bool {
 }
 
 // Run dispatches flushes until ctx is done, then fails queued requests as
-// Unflushed. In-flight flushes settle on their own detached contexts.
+// Unflushed. In-flight flushes settle on their own context, detached from ctx
+// once and for all here, so they are unaffected by ctx being cancelled later.
 func (c *Coalescer) Run(ctx context.Context) error {
-	c.runCtx = ctx
+	base := context.WithoutCancel(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -224,7 +251,9 @@ func (c *Coalescer) Run(ctx context.Context) error {
 				c.drain(ctx.Err())
 				return nil
 			}
-			if c.cfg.Window > 0 {
+			// Skip the accumulation window once a batch is already full size:
+			// waiting can only delay a flush that has nothing left to gain from it.
+			if c.cfg.Window > 0 && c.PendingOps() < c.cfg.MaxBatch {
 				timer := time.NewTimer(c.cfg.Window)
 				select {
 				case <-timer.C:
@@ -232,12 +261,20 @@ func (c *Coalescer) Run(ctx context.Context) error {
 					timer.Stop()
 				}
 			}
+			if cerr := ctx.Err(); cerr != nil {
+				// Cancelled while waiting on the window (or the outer select raced
+				// slot-acquisition against ctx.Done and happened to pick the slot):
+				// give the slot back and shut down without dispatching a new flush.
+				<-c.slots
+				c.drain(cerr)
+				return nil //nolint:nilerr // Run's contract is to always return nil; drain delivers cerr to callers
+			}
 			batch := c.takeBatch()
 			if len(batch) == 0 {
 				<-c.slots
 				continue
 			}
-			go c.flush(batch)
+			go c.flush(base, batch)
 		}
 	}
 }
@@ -248,6 +285,9 @@ func (c *Coalescer) drain(err error) {
 	pending := c.pending
 	c.pending = nil
 	c.pendingOps = 0
+	for _, req := range pending {
+		req.drained = true
+	}
 	c.mu.Unlock()
 	for _, req := range pending {
 		c.inflight.Add(-int64(len(req.ops)))
@@ -257,6 +297,8 @@ func (c *Coalescer) drain(err error) {
 
 // flush sends one batch of requests to the store as a single Reserve call,
 // retrying in-doubt failures idempotently and compensating as a last resort.
+// base is a context already detached from Run's ctx (see Run), so a flush in
+// progress when the coalescer is asked to shut down still gets to finish.
 //
 // Requests are guaranteed by the allocator's known set never to name the same
 // outpoint twice, but flush defends against it anyway: if two requests in the
@@ -264,7 +306,7 @@ func (c *Coalescer) drain(err error) {
 // to the store; every later request that named it is reported Missed without
 // ever reaching the store, so at most one request can ever believe it owns a
 // given outpoint out of a single flush.
-func (c *Coalescer) flush(batch []*request) {
+func (c *Coalescer) flush(base context.Context, batch []*request) {
 	defer func() {
 		<-c.slots
 		select {
@@ -295,7 +337,6 @@ func (c *Coalescer) flush(batch []*request) {
 		}
 	}
 
-	base := context.WithoutCancel(c.runCtx)
 	var applied []store.ReserveOp
 	var err error
 	backoff := c.cfg.RetryBackoff
@@ -315,9 +356,12 @@ func (c *Coalescer) flush(batch []*request) {
 		}
 	}
 	if err != nil {
-		// Outcome unknown: compensate by token. Release on a never-applied row is a no-op.
+		// Outcome unknown: compensate once over the deduplicated ops actually sent,
+		// not once per request, so N requests sharing a flush don't each pay their
+		// own CompensateTime budget while still holding the slot. Release on a
+		// never-applied row is a no-op.
+		c.releaseApplied(ops)
 		for _, r := range batch {
-			c.releaseApplied(r.ops)
 			c.deliver(r, Result{Err: fmt.Errorf("%w: %w", ErrUnavailable, err)})
 		}
 		return
@@ -334,6 +378,8 @@ func (c *Coalescer) flush(batch []*request) {
 				res.Missed = append(res.Missed, op.Outpoint)
 				continue
 			}
+			// Trust only an applied op reported under our own token: a backend
+			// that lies about the token must never cause us to hand out a row.
 			if a, ok := appliedBy[op.Outpoint]; ok && a.Token == op.Token {
 				res.Applied = append(res.Applied, a)
 			} else {

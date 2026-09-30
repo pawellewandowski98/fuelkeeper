@@ -21,6 +21,11 @@ var ErrInjected = errors.New("storetest: injected failure")
 //     store.ErrUnavailable (commit succeeded, response lost).
 //   - InDoubtEvery(k): every k-th Reserve (by call count) behaves the same way.
 //   - BeforeReserve / AfterReserve hooks run around every Reserve (for pausing).
+//
+// BeforeReserve and AfterReserve are plain fields, not synchronized: set them
+// once, before the wrapper is handed to anything that might call Reserve
+// concurrently (e.g. before starting a Coalescer's Run). Assigning them
+// concurrently with an in-flight Reserve call is a data race.
 type Faulty struct {
 	store.Store
 	mu            sync.Mutex
