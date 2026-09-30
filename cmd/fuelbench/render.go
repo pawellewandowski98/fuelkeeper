@@ -57,8 +57,8 @@ func renderTable(results []result) string {
 			strconv.Itoa(r.Workers),
 			strconv.Itoa(r.Count),
 			r.Mode,
-			fmt.Sprintf("%.1f", r.ReservesPerSec),
-			fmt.Sprintf("%.1f", r.OutputsPerSec),
+			fmt.Sprintf("%.0f", r.ReservesPerSec),
+			fmt.Sprintf("%.0f", r.OutputsPerSec),
 			microsToMillis(r.P50Micros),
 			microsToMillis(r.P95Micros),
 			microsToMillis(r.P99Micros),
@@ -69,10 +69,10 @@ func renderTable(results []result) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// microsToMillis formats a microsecond latency as milliseconds with one
-// decimal place.
+// microsToMillis formats a microsecond latency as milliseconds with two
+// decimal places.
 func microsToMillis(micros int64) string {
-	return fmt.Sprintf("%.1f", float64(micros)/1000)
+	return fmt.Sprintf("%.2f", float64(micros)/1000)
 }
 
 // errsString formats an error-code -> count map as "code=n code=n", sorted

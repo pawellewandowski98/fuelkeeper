@@ -55,32 +55,80 @@ type options struct {
 	backend  string // report only; not used to reach the server
 }
 
-// validate checks options before run dials anything.
+// validate checks options before run dials anything. Every failure is a
+// usageError (see exitCode): a bad flag value is a usage mistake, the same
+// as an unparseable flag itself, not a runtime failure.
 func (o options) validate() error {
 	if len(o.urls) == 0 {
-		return errors.New("fuelbench: at least one --url is required")
+		return usageErrorf("fuelbench: at least one --url is required")
 	}
 	if o.workers <= 0 {
-		return errors.New("fuelbench: workers must be > 0")
+		return usageErrorf("fuelbench: workers must be > 0")
 	}
 	if o.count <= 0 {
-		return errors.New("fuelbench: count must be > 0")
+		return usageErrorf("fuelbench: count must be > 0")
 	}
 	if o.duration <= 0 {
-		return errors.New("fuelbench: duration must be > 0")
+		return usageErrorf("fuelbench: duration must be > 0")
 	}
 	if o.pool == "" {
-		return errors.New("fuelbench: pool is required")
+		return usageErrorf("fuelbench: pool is required")
 	}
 	switch o.mode {
 	case "spend", "release", "hold":
 	default:
-		return fmt.Errorf("fuelbench: mode must be spend, release or hold (got %q)", o.mode)
+		return usageErrorf("fuelbench: mode must be spend, release or hold (got %q)", o.mode)
 	}
 	if o.rateLim < 0 {
-		return errors.New("fuelbench: rate must be >= 0")
+		return usageErrorf("fuelbench: rate must be >= 0")
 	}
 	return nil
+}
+
+// usageError marks an error as a command-line usage mistake -- a bad flag, a
+// missing or invalid option -- as opposed to a runtime failure (a server
+// that would not respond, a run that failed once under way). This mirrors
+// cmd/fuelkeeper/main.go's convention exactly: exitCode uses it to choose
+// between the two conventional non-zero exit codes, 2 for usage and 1 for
+// everything else.
+type usageError struct{ err error }
+
+// Error implements error.
+func (e *usageError) Error() string { return e.err.Error() }
+
+// Unwrap lets errors.Is/errors.As see through to the wrapped error (in
+// particular, errors.Is(err, flag.ErrHelp) for a wrapped -h/--help).
+func (e *usageError) Unwrap() error { return e.err }
+
+// usageErrorf builds a usageError from a format string.
+func usageErrorf(format string, args ...any) error {
+	return &usageError{err: fmt.Errorf(format, args...)}
+}
+
+// wrapUsageError marks err (e.g. a flag.FlagSet.Parse failure) as a
+// usageError; a nil err stays nil.
+func wrapUsageError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &usageError{err: err}
+}
+
+// exitCode maps an error to the process exit code, mirroring
+// cmd/fuelkeeper/main.go: 0 for success and for -h/--help (flag.ErrHelp,
+// however deeply wrapped -- checked before the usageError case, since
+// wrapUsageError wraps fs.Parse's own flag.ErrHelp too), 2 for a usage
+// mistake, 1 for anything else.
+func exitCode(err error) int {
+	var uerr *usageError
+	switch {
+	case err == nil, errors.Is(err, flag.ErrHelp):
+		return 0
+	case errors.As(err, &uerr):
+		return 2
+	default:
+		return 1
+	}
 }
 
 // result is one run's outcome, in the shape written to --out and read back
@@ -321,6 +369,9 @@ func runWorker(
 			recordErr(errs, err)
 			continue
 		}
+		// Only the reserve round trip is timed: spend/release below is a
+		// separate, mode-dependent call and would skew percentiles that are
+		// meant to describe reserve latency specifically.
 		hist.record(time.Since(reqStart).Microseconds())
 		reserves.Add(1)
 		outputs.Add(int64(len(res.Outputs)))
@@ -364,12 +415,26 @@ func splitURLs(s string) []string {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "render" {
-		if err := renderCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-		return
+	os.Exit(runMain(os.Args[1:]))
+}
+
+// reportAndExit prints err to stderr (skipped when exitCode(err) is 0 --
+// e.g. -h/--help, whose usage text fs.Parse already printed itself) and
+// returns the exit code to use.
+func reportAndExit(err error) int {
+	code := exitCode(err)
+	if code != 0 {
+		fmt.Fprintln(os.Stderr, "error:", err)
+	}
+	return code
+}
+
+// runMain is main's logic with the exit code returned rather than calling
+// os.Exit directly, so exit-code classification (see exitCode) is testable
+// without a subprocess. args is os.Args[1:].
+func runMain(args []string) int {
+	if len(args) > 0 && args[0] == "render" {
+		return reportAndExit(renderCmd(args[1:]))
 	}
 
 	fs := flag.NewFlagSet("fuelbench", flag.ContinueOnError)
@@ -384,8 +449,8 @@ func main() {
 	label := fs.String("label", "", "label recorded in the result, for comparing runs")
 	backend := fs.String("backend", "", "backend name recorded in the result (report only)")
 	out := fs.String("out", "", "write the JSON result to this file")
-	if err := fs.Parse(os.Args[1:]); err != nil {
-		os.Exit(2)
+	if err := fs.Parse(args); err != nil {
+		return reportAndExit(wrapUsageError(err))
 	}
 
 	o := options{
@@ -405,21 +470,21 @@ func main() {
 	defer stop()
 
 	res, err := run(ctx, o)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+	if code := reportAndExit(err); code != 0 {
+		return code
 	}
 
 	data, err := json.MarshalIndent(res, "", "  ")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: encode result:", err)
-		os.Exit(1)
+		return 1
 	}
 	if *out != "" {
 		if err := os.WriteFile(*out, data, 0o644); err != nil { //nolint:gosec // a results file is meant to be readable
 			fmt.Fprintln(os.Stderr, "error: write", *out, ":", err)
-			os.Exit(1)
+			return 1
 		}
 	}
 	fmt.Println(string(data))
+	return 0
 }

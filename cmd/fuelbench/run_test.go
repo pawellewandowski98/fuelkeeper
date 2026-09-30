@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -36,7 +37,7 @@ import (
 // rescan (default every 5s, long past a short benchmark test's duration), so
 // a "well-stocked" pool needs every one of its shards ownable up front, not
 // just enough to clear the default cap.
-func newBenchEnv(t *testing.T, instanceID string, shards, rowsPerShard int) *httptest.Server {
+func newBenchEnv(t *testing.T, instanceID string, shards, rowsPerShard int) (*httptest.Server, store.Store) {
 	t.Helper()
 	clk := storetest.NewClock(storetest.Start)
 	st := memory.New(memory.WithClock(clk.Now))
@@ -58,7 +59,7 @@ func newBenchEnv(t *testing.T, instanceID string, shards, rowsPerShard int) *htt
 	go func() { defer close(done); _ = p.Run(ctx) }()
 	srv := httptest.NewServer(api.NewHandler(api.Deps{Pools: []api.PoolService{p}, Store: st}))
 	t.Cleanup(func() { srv.Close(); cancel(); <-done })
-	return srv
+	return srv, st
 }
 
 func TestRunAgainstMemoryStore(t *testing.T) {
@@ -69,7 +70,7 @@ func TestRunAgainstMemoryStore(t *testing.T) {
 	// in the tens of thousands of reserves/s, so a "well-stocked" pool for
 	// this duration needs far more than the shard manager's default 8-shard,
 	// 5,000-row low-water buffer.
-	srv := newBenchEnv(t, "bench-test", 600, 900)
+	srv, _ := newBenchEnv(t, "bench-test", 600, 900)
 
 	res, err := run(context.Background(), options{urls: []string{srv.URL}, pool: "main", workers: 8, count: 5, duration: 2 * time.Second, mode: "spend"})
 	require.NoError(t, err)
@@ -93,7 +94,7 @@ func TestRunAgainstMemoryStore(t *testing.T) {
 // release mode for long enough that, if released rows never returned to the
 // pool, the pool would exhaust: since release returns them, no errors occur.
 func TestRunReleaseModeNeverExhausts(t *testing.T) {
-	srv := newBenchEnv(t, "bench-release", 1, 10)
+	srv, _ := newBenchEnv(t, "bench-release", 1, 10)
 
 	res, err := run(context.Background(), options{urls: []string{srv.URL}, pool: "main", workers: 4, count: 2, duration: 500 * time.Millisecond, mode: "release"})
 	require.NoError(t, err)
@@ -102,29 +103,34 @@ func TestRunReleaseModeNeverExhausts(t *testing.T) {
 }
 
 // TestRunSpendModeExhaustsPermanently is the mutation guard for "run skips
-// the spend call": against the same tiny pool, spend mode permanently
-// consumes rows (spend_policy: trust), so the pool exhausts and later
-// reserves fail -- unlike release mode above, which never does. If spend
-// were skipped, this pool would behave exactly like the release case and
-// this assertion would fail.
+// the spend call". A 10-row pool with count: 2 offers exactly 5 successful
+// reserves; against the same tiny pool as TestRunReleaseModeNeverExhausts,
+// spend mode must not just "run out" (a bug that merely held rows, like hold
+// mode, would exhaust it too, over this same short duration, since the
+// manual clock never advances past MinTTL) -- it must leave the store with
+// every row genuinely StateSpent, not sitting in an open reservation. If
+// run's spend call were skipped, Stats.Reserved would be 10 and Stats.Spent
+// would be 0 instead.
 func TestRunSpendModeExhaustsPermanently(t *testing.T) {
-	srv := newBenchEnv(t, "bench-spend-exhaust", 1, 10)
+	srv, st := newBenchEnv(t, "bench-spend-exhaust", 1, 10)
 
 	res, err := run(context.Background(), options{urls: []string{srv.URL}, pool: "main", workers: 4, count: 2, duration: 500 * time.Millisecond, mode: "spend"})
 	require.NoError(t, err)
+	assert.Equal(t, int64(5), res.Reserves, "10 rows at count: 2 must yield exactly 5 successful reserves")
 	assert.NotEmpty(t, res.Errors, "spend mode against a 10-row pool must permanently consume it and start erroring")
-	var total int64
-	for _, n := range res.Errors {
-		total += n
-	}
-	assert.Positive(t, total)
+
+	stats, err := st.Stats(context.Background(), "main")
+	require.NoError(t, err)
+	assert.Equal(t, int64(10), stats.Spent, "every row must have been reported spent, not merely held in an open reservation")
+	assert.Zero(t, stats.Reserved, "no row should still be sitting in an open reservation")
+	assert.Zero(t, stats.Available, "no row should remain available")
 }
 
 // TestRunHoldModeExhausts holds every reservation (no spend/release) against
 // a small pool: it must exhaust, producing exhausted/insufficient error
 // counts, without panicking, and must still stop at duration.
 func TestRunHoldModeExhausts(t *testing.T) {
-	srv := newBenchEnv(t, "bench-hold", 1, 6)
+	srv, _ := newBenchEnv(t, "bench-hold", 1, 6)
 
 	start := time.Now()
 	res, err := run(context.Background(), options{urls: []string{srv.URL}, pool: "main", workers: 4, count: 2, duration: 500 * time.Millisecond, mode: "hold"})
@@ -146,7 +152,7 @@ func TestRunHoldModeExhausts(t *testing.T) {
 // reserves/s locally, rateLim: 50 over 1s must produce roughly <= 60
 // reserves.
 func TestRunRateLimit(t *testing.T) {
-	srv := newBenchEnv(t, "bench-rate", 5, 500)
+	srv, _ := newBenchEnv(t, "bench-rate", 5, 500)
 
 	res, err := run(context.Background(), options{urls: []string{srv.URL}, pool: "main", workers: 8, count: 1, duration: time.Second, mode: "release", rateLim: 50})
 	require.NoError(t, err)
@@ -208,30 +214,83 @@ func TestRunValidatesOptions(t *testing.T) {
 		o.urls = nil
 		_, err := run(context.Background(), o)
 		require.Error(t, err)
+		assert.Equal(t, 2, exitCode(err), "a bad option is a usage mistake, not a runtime failure")
 	})
 	t.Run("zero workers", func(t *testing.T) {
 		o := base
 		o.workers = 0
 		_, err := run(context.Background(), o)
 		require.Error(t, err)
+		assert.Equal(t, 2, exitCode(err))
 	})
 	t.Run("zero count", func(t *testing.T) {
 		o := base
 		o.count = 0
 		_, err := run(context.Background(), o)
 		require.Error(t, err)
+		assert.Equal(t, 2, exitCode(err))
 	})
 	t.Run("bad mode", func(t *testing.T) {
 		o := base
 		o.mode = "bogus"
 		_, err := run(context.Background(), o)
 		require.Error(t, err)
+		assert.Equal(t, 2, exitCode(err))
 	})
 	t.Run("zero duration", func(t *testing.T) {
 		o := base
 		o.duration = 0
 		_, err := run(context.Background(), o)
 		require.Error(t, err)
+		assert.Equal(t, 2, exitCode(err))
+	})
+	t.Run("negative rate", func(t *testing.T) {
+		o := base
+		o.rateLim = -1
+		_, err := run(context.Background(), o)
+		require.Error(t, err)
+		assert.Equal(t, 2, exitCode(err))
+	})
+	t.Run("empty pool", func(t *testing.T) {
+		o := base
+		o.pool = ""
+		_, err := run(context.Background(), o)
+		require.Error(t, err)
+		assert.Equal(t, 2, exitCode(err))
+	})
+}
+
+// TestExitCodeClasses pins exitCode's three classes to cmd/fuelkeeper/main.go's
+// convention: 0 for success and -h/--help (flag.ErrHelp, however deeply
+// wrapped), 2 for a usage mistake, 1 for anything else.
+func TestExitCodeClasses(t *testing.T) {
+	assert.Equal(t, 0, exitCode(nil))
+	assert.Equal(t, 0, exitCode(flag.ErrHelp))
+	assert.Equal(t, 0, exitCode(wrapUsageError(flag.ErrHelp)), "fs.Parse wraps -h's flag.ErrHelp; it must still exit 0")
+	assert.Equal(t, 2, exitCode(usageErrorf("bad flag")))
+	assert.Equal(t, 2, exitCode(wrapUsageError(errors.New("boom"))))
+	assert.Equal(t, 1, exitCode(errors.New("some runtime failure")))
+}
+
+// TestRunMainExitCodes exercises runMain end to end for each exit-code class,
+// using only inputs that fail before any network call (a bad flag, a bad
+// option, or a missing render file), so the test stays fast and
+// deterministic.
+func TestRunMainExitCodes(t *testing.T) {
+	t.Run("help exits 0", func(t *testing.T) {
+		assert.Equal(t, 0, runMain([]string{"-h"}))
+	})
+	t.Run("unknown flag exits 2", func(t *testing.T) {
+		assert.Equal(t, 2, runMain([]string{"--nope"}))
+	})
+	t.Run("bad option value exits 2", func(t *testing.T) {
+		assert.Equal(t, 2, runMain([]string{"--url", "http://x", "--workers", "0"}))
+	})
+	t.Run("missing url exits 2", func(t *testing.T) {
+		assert.Equal(t, 2, runMain([]string{"--duration", "1ms"}))
+	})
+	t.Run("render missing file exits 1", func(t *testing.T) {
+		assert.Equal(t, 1, runMain([]string{"render", filepath.Join(t.TempDir(), "nope.json")}))
 	})
 }
 
@@ -272,7 +331,10 @@ func TestRenderTableNoErrorsShowsDash(t *testing.T) {
 func TestRunRenderCmdTwoFiles(t *testing.T) {
 	dir := t.TempDir()
 	r1 := result{Label: "run1", Backend: "memory", Instances: 1, Workers: 8, Count: 5, Mode: "spend", ReservesPerSec: 100, OutputsPerSec: 500, P50Micros: 1000, P95Micros: 2000, P99Micros: 3000}
-	r2 := result{Label: "run2", Backend: "sqlite", Instances: 2, Workers: 16, Count: 1, Mode: "release", ReservesPerSec: 200, OutputsPerSec: 200, P50Micros: 500, P95Micros: 900, P99Micros: 1200, Errors: map[string]int64{"backpressure": 3}}
+	// >= 2 error codes so the golden comparison actually pins sort.Strings'
+	// ordering: a single-key map can't distinguish a sorted render from an
+	// unsorted (map-iteration-order-dependent) one.
+	r2 := result{Label: "run2", Backend: "sqlite", Instances: 2, Workers: 16, Count: 1, Mode: "release", ReservesPerSec: 200, OutputsPerSec: 200, P50Micros: 500, P95Micros: 900, P99Micros: 1200, Errors: map[string]int64{"exhausted": 1, "backpressure": 3}}
 
 	f1 := filepath.Join(dir, "a.json")
 	f2 := filepath.Join(dir, "b.json")
@@ -290,7 +352,7 @@ func TestRunRenderCmdTwoFiles(t *testing.T) {
 	assert.Equal(t, want, buf.String())
 	assert.Contains(t, buf.String(), "run1")
 	assert.Contains(t, buf.String(), "run2")
-	assert.Contains(t, buf.String(), "backpressure=3")
+	assert.Contains(t, buf.String(), "backpressure=3 exhausted=1", "errors must render sorted by code, deterministically")
 }
 
 func TestRunRenderCmdRequiresFiles(t *testing.T) {
