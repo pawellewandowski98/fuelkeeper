@@ -487,15 +487,3 @@ func TestRunRequiresArcadeInRawMode(t *testing.T) {
 	var uerr *usageError
 	require.ErrorAs(t, err, &uerr)
 }
-
-// TestRunToolboxModeNotImplemented checks that toolbox mode surfaces the
-// stub's error (Plan 6 Task 5 will replace it) while still returning a
-// report shell.
-func TestRunToolboxModeNotImplemented(t *testing.T) {
-	o := options{mode: "toolbox", url: "http://127.0.0.1:1", pool: "main", workers: 1, batch: 1, duration: time.Second}
-	rep, err := run(context.Background(), o)
-	require.Error(t, err)
-	require.NotNil(t, rep)
-	assert.Equal(t, "toolbox mode: not implemented yet", err.Error())
-	assert.Equal(t, 1, exitCode(err))
-}
