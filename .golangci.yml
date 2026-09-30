@@ -5,6 +5,7 @@ run:
   build-tags:
     - postgres
     - mongodb
+    - aerospike
 linters:
   default: standard
   enable:

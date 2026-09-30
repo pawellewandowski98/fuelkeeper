@@ -23,3 +23,23 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
+
+  aerospike:
+    image: aerospike/aerospike-server:8.1.2.4
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+      - "3002:3002"
+    volumes:
+      # Mounted outside /etc/aerospike/: the stock entrypoint.sh always renders
+      # its own bundled aerospike.template.conf over /etc/aerospike/aerospike.conf
+      # before exec'ing asd, which would silently clobber (or, mounted read-only,
+      # fail to overwrite) a config placed at that path. Pointing asd at this file
+      # directly via --config-file below bypasses that templating step entirely.
+      - ./aerospike.conf:/etc/aerospike-fuelkeeper/aerospike.conf:ro,Z
+    command: ["asd", "--config-file", "/etc/aerospike-fuelkeeper/aerospike.conf"]
+    healthcheck:
+      test: ["CMD", "asinfo", "-v", "status"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
