@@ -58,7 +58,7 @@ func (m *Mock) Forget(op store.Outpoint) {
 func (m *Mock) SetTx(txid chainhash.Hash, st TxStatus) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.txs[txid] = st
+	m.txs[txid] = copyTxStatus(st)
 }
 
 // SetDown makes every call fail with ErrUnavailable.
@@ -106,5 +106,17 @@ func (m *Mock) Tx(_ context.Context, txid chainhash.Hash) (TxStatus, error) {
 	if m.down {
 		return TxStatus{}, ErrUnavailable
 	}
-	return m.txs[txid], nil
+	return copyTxStatus(m.txs[txid]), nil
+}
+
+// copyTxStatus returns a copy of st whose slice fields do not alias st's,
+// so a caller mutating a returned/stored slice cannot change later answers.
+func copyTxStatus(st TxStatus) TxStatus {
+	if st.MerklePath != nil {
+		st.MerklePath = append([]byte(nil), st.MerklePath...)
+	}
+	if st.CompetingTxs != nil {
+		st.CompetingTxs = append([]string(nil), st.CompetingTxs...)
+	}
+	return st
 }
