@@ -144,6 +144,12 @@ func TestToolboxClassifiesCreateErrors(t *testing.T) {
 			pkgerrors.NewProcessActionError(nil, nil).WithTx(someTxID, nil).Wrap(wdk.ErrNotEnoughFunds),
 			"reject", outcomeSpend, someTxID,
 		},
+		"reject with txid wrapping a deadline": {
+			// The process error is checked first: a posted tx with a known
+			// txid is a spend even when the deadline also expired.
+			fmt.Errorf("create action failed: %w", pkgerrors.NewProcessActionError(nil, nil).WithTx(someTxID, nil).Wrap(context.DeadlineExceeded)),
+			"reject", outcomeSpend, someTxID,
+		},
 		"action deadline": {
 			fmt.Errorf("create action failed: failed to process created action: %w", context.DeadlineExceeded),
 			"timeout", outcomeHold, "",
