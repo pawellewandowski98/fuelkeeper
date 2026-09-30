@@ -3,9 +3,13 @@ package pool_test
 import (
 	"context"
 	"log/slog"
+	"math/rand"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -250,4 +254,284 @@ func TestShardManagerRunRenewsAndReleasesOnStop(t *testing.T) {
 	got, err := st.GetShard(context.Background(), "main", sh.TxID)
 	require.NoError(t, err)
 	assert.Empty(t, got.Owner, "shards released on shutdown")
+}
+
+// blockingListAvailable wraps a store.Store and blocks the first
+// ListAvailable call on a channel, closing started right before blocking so a
+// test can synchronize with "the call has been reached" before unblocking it.
+type blockingListAvailable struct {
+	store.Store
+	once    sync.Once
+	started chan struct{}
+	block   chan struct{}
+}
+
+func (w *blockingListAvailable) ListAvailable(ctx context.Context, pool string, txid chainhash.Hash, fromVout uint32, limit int) ([]store.Row, error) {
+	w.once.Do(func() {
+		close(w.started)
+		<-w.block
+	})
+	return w.Store.ListAvailable(ctx, pool, txid, fromVout, limit)
+}
+
+// TestShardManagerEnsureRowsWaitsForConcurrentLoad reproduces the production
+// race behind a flaky TestPoolReserveSkipsRowsLostToCAS run: the background
+// Run loop's FeedOnce can acquire the only adoptable shard and be mid-loadRows
+// when a concurrent EnsureRows (from a Reserve call) finds Available()==0 and
+// its own AdoptOnce sees nothing free (the shard is already ours). Without
+// serialization EnsureRows returned false immediately, a spurious exhaustion.
+// adoptSem fixes this: EnsureRows blocks for FeedOnce's turn to finish instead.
+func TestShardManagerEnsureRowsWaitsForConcurrentLoad(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	storetest.MintShard(t, base, "main", 3, store.ShardMined)
+	wrapped := &blockingListAvailable{Store: base, started: make(chan struct{}), block: make(chan struct{})}
+	pc := pool.DefaultPoolConfig("main", 50)
+	m, alloc := newMgr(t, wrapped, clk, testInstanceConfig(), pc)
+
+	go func() { _ = m.FeedOnce(ctx) }()
+	select {
+	case <-wrapped.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background FeedOnce never reached ListAvailable")
+	}
+	assert.Equal(t, 0, alloc.Available(), "shard owned but its rows are not loaded yet")
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		close(wrapped.block)
+	}()
+	assert.True(t, m.EnsureRows(ctx), "EnsureRows should wait for the in-progress load instead of reporting exhaustion")
+	assert.Equal(t, 3, alloc.Available())
+
+	// With nothing adoptable at all, EnsureRows returns false promptly (well
+	// under AdoptTimeout), not after spinning for the whole budget.
+	emptySt := memory.New(memory.WithClock(clk.Now))
+	m2, _ := newMgr(t, emptySt, clk, testInstanceConfig(), pc)
+	start := time.Now()
+	assert.False(t, m2.EnsureRows(ctx))
+	assert.Less(t, time.Since(start), 50*time.Millisecond)
+}
+
+// latencyAcquireStore adds random latency to AcquireShard, widening the
+// window in which concurrent adopters could race if they were not serialized.
+type latencyAcquireStore struct {
+	store.Store
+	minDelay, maxDelay time.Duration
+}
+
+func (w *latencyAcquireStore) AcquireShard(ctx context.Context, pool, holder string, now, until time.Time, statuses []store.ShardStatus, exclude []chainhash.Hash) (*store.Shard, error) {
+	d := w.minDelay
+	if w.maxDelay > w.minDelay {
+		d += time.Duration(rand.Int63n(int64(w.maxDelay - w.minDelay))) //nolint:gosec // test jitter, not a security context
+	}
+	select {
+	case <-time.After(d):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return w.Store.AcquireShard(ctx, pool, holder, now, until, statuses, exclude)
+}
+
+// TestShardManagerEnsureRowsConcurrentBoundedByMaxShards drives 16 concurrent
+// EnsureRows calls against a store with latency on AcquireShard (widening the
+// check-then-act window a missing lock would race on) and asserts the
+// instance never ends up owning more than MaxShards shards, in the allocator
+// or in the store.
+func TestShardManagerEnsureRowsConcurrentBoundedByMaxShards(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig("main", 50)
+	for i := 0; i < 6; i++ {
+		storetest.MintShard(t, base, "main", 3, store.ShardMined)
+		clk.Advance(time.Millisecond)
+	}
+	wrapped := &latencyAcquireStore{Store: base, minDelay: 5 * time.Millisecond, maxDelay: 20 * time.Millisecond}
+	cfg := testInstanceConfig() // MaxShards=2
+	m, alloc := newMgr(t, wrapped, clk, cfg, pc)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.EnsureRows(ctx)
+		}()
+	}
+	wg.Wait()
+
+	assert.LessOrEqual(t, len(alloc.Shards()), cfg.MaxShards, "allocator must not hoard past MaxShards")
+	holder := m.Holder()
+	owned, err := base.ListShards(ctx, "main", store.ShardFilter{Owner: &holder})
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(owned), cfg.MaxShards, "store must not show more leased shards than MaxShards")
+}
+
+// releaseCounterStore counts ReleaseShard calls.
+type releaseCounterStore struct {
+	store.Store
+	releases atomic.Int32
+}
+
+func (w *releaseCounterStore) ReleaseShard(ctx context.Context, pool string, txid chainhash.Hash, holder string) error {
+	w.releases.Add(1)
+	return w.Store.ReleaseShard(ctx, pool, txid, holder)
+}
+
+// TestShardManagerAdoptOnceReacquiresOwnExpiredLease covers re-acquiring a
+// shard this instance already tracks: its own lease lapsed without being
+// renewed, then AcquireShard hands it right back since nobody else took it.
+// AddShard would otherwise silently no-op on the duplicate txid, loadRows
+// would report 0 new rows, and the old code would wrongly drop-and-release a
+// shard whose rows are still sitting in the allocator.
+func TestShardManagerAdoptOnceReacquiresOwnExpiredLease(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	wrapped := &releaseCounterStore{Store: base}
+	pc := pool.DefaultPoolConfig("main", 50)
+	sh, _ := storetest.MintShard(t, base, "main", 3, store.ShardMined)
+	cfg := testInstanceConfig()
+	m, alloc := newMgr(t, wrapped, clk, cfg, pc)
+
+	adopted, err := m.AdoptOnce(ctx)
+	require.NoError(t, err)
+	require.True(t, adopted)
+	require.Equal(t, 3, alloc.Available())
+
+	clk.Advance(cfg.LeaseTTL + time.Second) // lease lapses; nobody renews it
+
+	adopted, err = m.AdoptOnce(ctx)
+	require.NoError(t, err)
+	assert.True(t, adopted, "re-acquiring our own shard keeps it")
+	assert.True(t, alloc.Has(sh.TxID))
+	assert.Equal(t, 3, alloc.Available(), "rows were neither reloaded nor dropped")
+	assert.Equal(t, int32(0), wrapped.releases.Load(), "no ReleaseShard call for a shard we still hold")
+
+	got, err := base.GetShard(ctx, "main", sh.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, m.Holder(), got.Owner, "still ours")
+	assert.True(t, got.LeaseUntil.UTC().Equal(clk.Now().Add(cfg.LeaseTTL)), "lease refreshed")
+}
+
+// TestShardManagerRunDropsStolenShardOnCASMissBeforeRenewTick pins that
+// rescanFlagged (triggered by NoteCASMiss through Run's hunger channel) drops
+// a stolen shard immediately via RenewShard, without waiting for the next
+// renew tick: LeaseTTL and RescanInterval are both set to 1h so neither
+// ticker can fire during the test.
+func TestShardManagerRunDropsStolenShardOnCASMissBeforeRenewTick(t *testing.T) {
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig("main", 50)
+	sh, _ := storetest.MintShard(t, st, "main", 2, store.ShardMined)
+	cfg := testInstanceConfig()
+	cfg.LeaseTTL = time.Hour
+	cfg.RescanInterval = time.Hour
+	m, alloc := newMgr(t, st, clk, cfg, pc)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx) }()
+	require.Eventually(t, func() bool { return alloc.Has(sh.TxID) }, 2*time.Second, 5*time.Millisecond)
+
+	// Force the shard free from under us and let another holder take it,
+	// simulating a stolen lease (the renew/rescan tickers never fire here).
+	require.NoError(t, st.ReleaseShard(context.Background(), "main", sh.TxID, m.Holder()))
+	got, err := st.AcquireShard(context.Background(), "main", "other/1", clk.Now(), clk.Now().Add(time.Minute), []store.ShardStatus{store.ShardMined}, nil)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	m.NoteCASMiss(sh.TxID)
+	require.Eventually(t, func() bool { return !alloc.Has(sh.TxID) }, 2*time.Second, 5*time.Millisecond,
+		"Run drops a stolen shard via rescanFlagged, not waiting for the renew tick")
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+// flakyRenewStore forces RenewShard to fail while armed.
+type flakyRenewStore struct {
+	store.Store
+	failRenew bool
+}
+
+func (w *flakyRenewStore) RenewShard(ctx context.Context, pool string, txid chainhash.Hash, holder string, until time.Time) (store.ShardHead, error) {
+	if w.failRenew {
+		return store.ShardHead{}, store.ErrUnavailable
+	}
+	return w.Store.RenewShard(ctx, pool, txid, holder, until)
+}
+
+// TestShardManagerRenewOnceDropsShardWithStaleLeaseOnPersistentError pins the
+// "expired for more than one full TTL" staleness guard: a single transient
+// RenewShard failure is tolerated, but once the lease has been stale for over
+// one TTL, RenewOnce drops the shard locally without releasing it (it is not
+// ours to release; another holder may already have it).
+func TestShardManagerRenewOnceDropsShardWithStaleLeaseOnPersistentError(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig("main", 50)
+	sh, _ := storetest.MintShard(t, base, "main", 2, store.ShardMined)
+	wrapped := &flakyRenewStore{Store: base}
+	cfg := testInstanceConfig()
+	m, alloc := newMgr(t, wrapped, clk, cfg, pc)
+	require.NoError(t, m.FeedOnce(ctx))
+	require.True(t, alloc.Has(sh.TxID))
+
+	wrapped.failRenew = true
+	clk.Advance(cfg.LeaseTTL) // now == leaseUntil: expired, but not yet stale by a full extra TTL
+	require.Error(t, m.RenewOnce(ctx))
+	assert.True(t, alloc.Has(sh.TxID), "kept across a single transient renew failure")
+
+	clk.Advance(cfg.LeaseTTL + time.Second) // now exceeds leaseUntil by more than one full TTL
+	require.Error(t, m.RenewOnce(ctx))
+	assert.False(t, alloc.Has(sh.TxID), "dropped once the lease has been stale for over one TTL")
+
+	got, err := base.GetShard(ctx, "main", sh.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, m.Holder(), got.Owner, "not released: RenewOnce must not call ReleaseShard for a merely-lost shard")
+}
+
+// TestShardManagerAdoptOnceReleasesEmptyShard pins that a shard whose rows
+// were all reserved before adoption is dropped and released rather than kept
+// as a permanently empty owned shard.
+func TestShardManagerAdoptOnceReleasesEmptyShard(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig("main", 50)
+	sh, rows := storetest.MintShard(t, st, "main", 3, store.ShardMined)
+	storetest.MustReserve(t, st, "main", rows, store.NewToken(), clk.Now().Add(time.Minute))
+	m, alloc := newMgr(t, st, clk, testInstanceConfig(), pc)
+
+	adopted, err := m.AdoptOnce(ctx)
+	require.NoError(t, err)
+	assert.False(t, adopted)
+	assert.False(t, alloc.Has(sh.TxID))
+	got, err := st.GetShard(ctx, "main", sh.TxID)
+	require.NoError(t, err)
+	assert.Empty(t, got.Owner)
+}
+
+// TestShardManagerRenewOnceDropsUnservableShardOnStatusChange pins the
+// status-change drop path in RenewOnce through UpdateShard (not RetireShard,
+// which clears the owner and would instead exercise the ErrNotOwner path).
+func TestShardManagerRenewOnceDropsUnservableShardOnStatusChange(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig("main", 50) // mined_only
+	sh, _ := storetest.MintShard(t, st, "main", 2, store.ShardMined)
+	m, alloc := newMgr(t, st, clk, testInstanceConfig(), pc)
+	require.NoError(t, m.FeedOnce(ctx))
+	require.True(t, alloc.Has(sh.TxID))
+
+	require.NoError(t, st.UpdateShard(ctx, "main", sh.TxID, store.ShardUnmined, nil))
+	require.NoError(t, m.RenewOnce(ctx))
+	assert.False(t, alloc.Has(sh.TxID), "no longer mined; mined_only pool must drop it")
+	got, err := st.GetShard(ctx, "main", sh.TxID)
+	require.NoError(t, err)
+	assert.Empty(t, got.Owner, "released back to the pool")
 }

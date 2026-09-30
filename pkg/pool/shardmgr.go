@@ -13,10 +13,11 @@ import (
 )
 
 const (
-	listPage        = 1000
-	emptyExclusion  = 60 * time.Second // how long a drained shard is excluded from re-adoption
-	emptyRescansMax = 2                // consecutive empty rescans before dropping a shard
-	adoptAttempts   = 5                // per hunger event
+	listPage         = 1000
+	emptyExclusion   = 60 * time.Second // how long a drained shard is excluded from re-adoption
+	emptyRescansMax  = 2                // consecutive empty rescans before dropping a shard
+	adoptAttempts    = 5                // per hunger event
+	maxRecentlyEmpty = 256              // caps the exclusion set AcquireShard is called with
 )
 
 type ownedState struct {
@@ -42,7 +43,10 @@ type ShardManager struct {
 	mu            sync.Mutex
 	owned         map[chainhash.Hash]*ownedState
 	recentlyEmpty map[chainhash.Hash]time.Time
+	recentOrder   []chainhash.Hash // insertion order of recentlyEmpty, for eviction at maxRecentlyEmpty
+	closed        bool
 	hungry        chan struct{}
+	adoptSem      chan struct{} // capacity 1; serializes adopt+load across FeedOnce and EnsureRows
 }
 
 // NewShardManager builds a manager with a fresh holder id.
@@ -59,6 +63,7 @@ func NewShardManager(st store.Store, pc Config, cfg InstanceConfig, alloc *Alloc
 		owned:         map[chainhash.Hash]*ownedState{},
 		recentlyEmpty: map[chainhash.Hash]time.Time{},
 		hungry:        make(chan struct{}, 1),
+		adoptSem:      make(chan struct{}, 1),
 	}
 }
 
@@ -84,8 +89,16 @@ func (m *ShardManager) isHungry() bool {
 // Hunger is re-checked after every adoption (owned < MaxShards and available
 // rows below LowWaterRows): an instance stops pulling shards the moment it is
 // no longer hungry, one shard at a time, so a single instance cannot hoard
-// shards up to MaxShards when another instance may also need one.
+// shards up to MaxShards when another instance may also need one. It shares
+// adoptSem with EnsureRows so the two never adopt concurrently; it blocks on
+// ctx (no separate timeout) to get its turn.
 func (m *ShardManager) FeedOnce(ctx context.Context) error {
+	select {
+	case m.adoptSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-m.adoptSem }()
 	for i := 0; i < adoptAttempts && m.isHungry(); i++ {
 		adopted, err := m.AdoptOnce(ctx)
 		if err != nil {
@@ -99,49 +112,91 @@ func (m *ShardManager) FeedOnce(ctx context.Context) error {
 }
 
 // EnsureRows is the bounded synchronous path Reserve uses when the FIFO is
-// empty: it tries to adopt until rows are available, AdoptTimeout passes, or
-// nothing is adoptable. Returns true if rows are now available.
+// empty. It serializes with FeedOnce (and other concurrent EnsureRows calls)
+// on adoptSem, bounded by AdoptTimeout: a concurrent in-progress adoption
+// (typically the background Run loop's own hunger-driven pull) is waited for
+// instead of causing a spurious exhaustion, and concurrent callers cannot
+// together push the owned shard count past MaxShards. Returns true if rows
+// are available once it returns.
 func (m *ShardManager) EnsureRows(ctx context.Context) bool {
 	if m.alloc.Available() > 0 {
 		return true
 	}
 	ctx, cancel := context.WithTimeout(ctx, m.cfg.AdoptTimeout)
 	defer cancel()
-	for i := 0; i < adoptAttempts; i++ {
+	select {
+	case m.adoptSem <- struct{}{}:
+	case <-ctx.Done():
+		return m.alloc.Available() > 0
+	}
+	defer func() { <-m.adoptSem }()
+	for i := 0; i < adoptAttempts && m.alloc.Available() == 0; i++ {
 		m.mu.Lock()
 		full := len(m.owned) >= m.cfg.MaxShards
 		m.mu.Unlock()
 		if full {
-			return m.alloc.Available() > 0
+			break
 		}
-		adopted, err := m.AdoptOnce(ctx)
-		if err != nil || !adopted {
-			return m.alloc.Available() > 0
-		}
-		if m.alloc.Available() > 0 {
-			return true
+		if ok, err := m.AdoptOnce(ctx); err != nil || !ok {
+			break
 		}
 	}
 	return m.alloc.Available() > 0
 }
 
+// excludeList returns the currently-excluded (recently drained) shard ids and
+// lazily expires entries older than emptyExclusion, keeping recentOrder in
+// sync with recentlyEmpty.
 func (m *ShardManager) excludeList(now time.Time) []chainhash.Hash {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var ex []chainhash.Hash
-	for txid, at := range m.recentlyEmpty {
+	kept := m.recentOrder[:0]
+	for _, txid := range m.recentOrder {
+		at, ok := m.recentlyEmpty[txid]
+		if !ok {
+			continue
+		}
 		if now.Sub(at) > emptyExclusion {
 			delete(m.recentlyEmpty, txid)
 			continue
 		}
+		kept = append(kept, txid)
 		ex = append(ex, txid)
 	}
+	m.recentOrder = kept
 	return ex
 }
 
-// AdoptOnce tries to acquire one adoptable shard and load its rows. It returns
-// false when nothing was adoptable (or the adopted shard turned out empty and
-// was released again).
+// markRecentlyEmpty records txid as drained just now, evicting the oldest
+// exclusion entry once the set would exceed maxRecentlyEmpty. Callers must
+// hold m.mu.
+func (m *ShardManager) markRecentlyEmpty(txid chainhash.Hash, at time.Time) {
+	if _, exists := m.recentlyEmpty[txid]; !exists {
+		m.recentOrder = append(m.recentOrder, txid)
+	}
+	m.recentlyEmpty[txid] = at
+	for len(m.recentlyEmpty) > maxRecentlyEmpty && len(m.recentOrder) > 0 {
+		oldest := m.recentOrder[0]
+		m.recentOrder = m.recentOrder[1:]
+		delete(m.recentlyEmpty, oldest)
+	}
+}
+
+// AdoptOnce tries to acquire one adoptable shard and load its rows.
+//
+// AcquireShard may hand back a shard this instance already tracks in owned:
+// our own lease lapsed (e.g. renewals failed for over a TTL but under two)
+// and then became free again before any other holder took it. That case is
+// detected under mu before touching the allocator: the shard's lease/head are
+// refreshed in place and rows are neither reloaded nor dropped, since
+// Allocator.AddShard would otherwise no-op on the duplicate txid and the
+// zero-rows-loaded path below would wrongly treat a shard we already have
+// rows for as empty and release it.
+//
+// It returns false when nothing was adoptable, the manager is shutting down
+// (the shard is released immediately without ever being tracked), or the
+// adopted shard turned out empty and was released again.
 func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 	now := m.clock.Now()
 	until := now.Add(m.cfg.LeaseTTL)
@@ -152,10 +207,26 @@ func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 	if sh == nil {
 		return false, nil
 	}
-	m.alloc.AddShard(OwnedShard{TxID: sh.TxID, Status: sh.Status, Version: sh.Version, CreatedAt: sh.CreatedAt})
+
 	m.mu.Lock()
-	m.owned[sh.TxID] = &ownedState{head: store.ShardHead{Status: sh.Status, Version: sh.Version}, leaseUntil: until}
-	m.mu.Unlock()
+	switch {
+	case m.closed:
+		m.mu.Unlock()
+		m.releaseLease(ctx, sh.TxID)
+		return false, nil
+	case m.owned[sh.TxID] != nil:
+		st := m.owned[sh.TxID]
+		st.leaseUntil = until
+		st.head = store.ShardHead{Status: sh.Status, Version: sh.Version}
+		m.mu.Unlock()
+		m.alloc.UpdateHead(sh.TxID, sh.Status, sh.Version)
+		return true, nil
+	default:
+		m.owned[sh.TxID] = &ownedState{head: store.ShardHead{Status: sh.Status, Version: sh.Version}, leaseUntil: until}
+		m.mu.Unlock()
+	}
+
+	m.alloc.AddShard(OwnedShard{TxID: sh.TxID, Status: sh.Status, Version: sh.Version, CreatedAt: sh.CreatedAt})
 	loaded, err := m.loadRows(ctx, sh.TxID)
 	if err != nil {
 		return true, err // keep the shard; rescan will retry
@@ -185,6 +256,18 @@ func (m *ShardManager) loadRows(ctx context.Context, txid chainhash.Hash) (int, 
 	}
 }
 
+// releaseLease clears our lease on txid, bounded independently of ctx's own
+// remaining budget so an expired Reserve/adopt context cannot leave a lease
+// dangling past the point we decided to give it up.
+func (m *ShardManager) releaseLease(ctx context.Context, txid chainhash.Hash) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	defer cancel()
+	err := m.st.ReleaseShard(rctx, m.pc.Name, txid, m.holder)
+	if err != nil && !errors.Is(err, store.ErrNotFound) && !errors.Is(err, store.ErrNotOwner) {
+		m.log.Warn("release shard", "txid", txid.String(), "err", err)
+	}
+}
+
 // drop forgets a shard locally and, when release is true, releases its lease
 // and excludes it from re-adoption for emptyExclusion.
 func (m *ShardManager) drop(ctx context.Context, txid chainhash.Hash, release bool) {
@@ -192,14 +275,11 @@ func (m *ShardManager) drop(ctx context.Context, txid chainhash.Hash, release bo
 	m.mu.Lock()
 	delete(m.owned, txid)
 	if release {
-		m.recentlyEmpty[txid] = m.clock.Now()
+		m.markRecentlyEmpty(txid, m.clock.Now())
 	}
 	m.mu.Unlock()
 	if release {
-		err := m.st.ReleaseShard(ctx, m.pc.Name, txid, m.holder)
-		if err != nil && !errors.Is(err, store.ErrNotFound) && !errors.Is(err, store.ErrNotOwner) {
-			m.log.Warn("release shard", "txid", txid.String(), "err", err)
-		}
+		m.releaseLease(ctx, txid)
 	}
 }
 
@@ -302,8 +382,10 @@ func (m *ShardManager) RescanOnce(ctx context.Context) error {
 	return firstErr
 }
 
-// rescanFlagged reloads rows only for shards flagged by NoteCASMiss, ahead of
-// their regular RescanInterval turn.
+// rescanFlagged renews and reloads only shards flagged by NoteCASMiss, ahead
+// of their regular RescanInterval turn. A renew failure with ErrNotOwner or
+// ErrNotFound means another holder already has the shard: it is dropped at
+// once instead of waiting for the next RenewOnce tick.
 func (m *ShardManager) rescanFlagged(ctx context.Context) error {
 	m.mu.Lock()
 	var flagged []chainhash.Hash
@@ -313,8 +395,38 @@ func (m *ShardManager) rescanFlagged(ctx context.Context) error {
 		}
 	}
 	m.mu.Unlock()
+	if len(flagged) == 0 {
+		return nil
+	}
+	now := m.clock.Now()
+	until := now.Add(m.cfg.LeaseTTL)
 	var firstErr error
 	for _, txid := range flagged {
+		head, err := m.st.RenewShard(ctx, m.pc.Name, txid, m.holder, until)
+		switch {
+		case errors.Is(err, store.ErrNotOwner), errors.Is(err, store.ErrNotFound):
+			m.log.Info("lost shard lease", "txid", txid.String())
+			m.drop(ctx, txid, false)
+			continue
+		case err != nil:
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if !m.servable(head.Status) {
+			m.log.Info("shard no longer servable", "txid", txid.String(), "status", head.Status.String())
+			m.drop(ctx, txid, true)
+			continue
+		}
+		m.mu.Lock()
+		if st := m.owned[txid]; st != nil {
+			st.leaseUntil = until
+			st.head = head
+		}
+		m.mu.Unlock()
+		m.alloc.UpdateHead(txid, head.Status, head.Version)
+
 		if _, err := m.loadRows(ctx, txid); err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -354,8 +466,13 @@ func (m *ShardManager) NoteReleased(rows []store.Row) {
 	}
 }
 
-// ReleaseAll releases every owned shard (graceful shutdown).
+// ReleaseAll releases every owned shard (graceful shutdown) and marks the
+// manager closed so any AdoptOnce racing this call releases whatever it
+// acquires instead of leaking a lease past shutdown.
 func (m *ShardManager) ReleaseAll(ctx context.Context) error {
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
 	var firstErr error
 	for _, txid := range m.ownedIDs() {
 		m.alloc.RemoveShard(txid)
