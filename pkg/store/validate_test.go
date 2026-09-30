@@ -92,24 +92,24 @@ func TestValidateReserveOps(t *testing.T) {
 	require.ErrorIs(t, store.ValidateReserveOps([]store.ReserveOp{noExp}, 10), store.ErrInvalidArgument)
 }
 
-const maxBatch = 1000
+const testMaxBatch = 1000
 
 func TestValidateReserveOpsAtMaxBatch(t *testing.T) {
 	tok := store.NewToken()
 	exp := time.Now().Add(time.Minute)
-	ops := make([]store.ReserveOp, maxBatch)
+	ops := make([]store.ReserveOp, testMaxBatch)
 	for i := range ops {
 		ops[i] = store.ReserveOp{Outpoint: store.Outpoint{TxID: hashN(1), Vout: uint32(i)}, Token: tok, ExpiresAt: exp}
 	}
-	require.NoError(t, store.ValidateReserveOps(ops, maxBatch))
+	require.NoError(t, store.ValidateReserveOps(ops, testMaxBatch))
 }
 
 func TestValidateOutpointsAtMaxBatch(t *testing.T) {
-	ops := make([]store.Outpoint, maxBatch)
+	ops := make([]store.Outpoint, testMaxBatch)
 	for i := range ops {
 		ops[i] = store.Outpoint{TxID: hashN(1), Vout: uint32(i)}
 	}
-	require.NoError(t, store.ValidateOutpoints(ops, maxBatch))
+	require.NoError(t, store.ValidateOutpoints(ops, testMaxBatch))
 }
 
 func TestValidateOutpointsAndMisc(t *testing.T) {

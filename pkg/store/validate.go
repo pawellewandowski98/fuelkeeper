@@ -9,14 +9,14 @@ import (
 
 const maxPoolNameLen = 64
 
-func invalid(format string, args ...any) error {
+func invalidf(format string, args ...any) error {
 	return fmt.Errorf("%w: "+format, append([]any{ErrInvalidArgument}, args...)...)
 }
 
 // ValidatePool checks a pool name: non-empty, at most 64 bytes.
 func ValidatePool(pool string) error {
 	if pool == "" || len(pool) > maxPoolNameLen {
-		return invalid("pool name must be 1..%d bytes", maxPoolNameLen)
+		return invalidf("pool name must be 1..%d bytes", maxPoolNameLen)
 	}
 	return nil
 }
@@ -24,7 +24,7 @@ func ValidatePool(pool string) error {
 // ValidateHolder checks an instance holder id.
 func ValidateHolder(holder string) error {
 	if holder == "" || len(holder) > 128 {
-		return invalid("holder must be 1..128 bytes")
+		return invalidf("holder must be 1..128 bytes")
 	}
 	return nil
 }
@@ -32,7 +32,7 @@ func ValidateHolder(holder string) error {
 // ValidateLimit checks a positive page size.
 func ValidateLimit(limit int) error {
 	if limit <= 0 {
-		return invalid("limit must be > 0")
+		return invalidf("limit must be > 0")
 	}
 	return nil
 }
@@ -40,7 +40,7 @@ func ValidateLimit(limit int) error {
 // ValidateLeaseName checks a lease/job name (TryAcquireOrRenew, ReleaseLease).
 func ValidateLeaseName(name string) error {
 	if name == "" || len(name) > 128 {
-		return invalid("lease name must be 1..128 bytes")
+		return invalidf("lease name must be 1..128 bytes")
 	}
 	return nil
 }
@@ -54,7 +54,7 @@ func ValidateLease(name, holder string, ttl time.Duration) error {
 		return err
 	}
 	if ttl <= 0 {
-		return invalid("lease ttl must be > 0")
+		return invalidf("lease ttl must be > 0")
 	}
 	return nil
 }
@@ -63,7 +63,7 @@ func ValidateLease(name, holder string, ttl time.Duration) error {
 // strictly after now, so a freshly granted lease is immediately held.
 func ValidateAcquireUntil(until, now time.Time) error {
 	if !until.After(now) {
-		return invalid("acquire until must be after now")
+		return invalidf("acquire until must be after now")
 	}
 	return nil
 }
@@ -72,7 +72,7 @@ func ValidateAcquireUntil(until, now time.Time) error {
 // non-zero (a zero time would be indistinguishable from "unowned").
 func ValidateRenewUntil(until time.Time) error {
 	if until.IsZero() {
-		return invalid("renew until must not be zero")
+		return invalidf("renew until must not be zero")
 	}
 	return nil
 }
@@ -81,7 +81,7 @@ func ValidateRenewUntil(until time.Time) error {
 // every entry known.
 func ValidateShardStatuses(statuses []ShardStatus) error {
 	if len(statuses) == 0 {
-		return invalid("at least one shard status is required")
+		return invalidf("at least one shard status is required")
 	}
 	return validateKnownShardStatuses(statuses)
 }
@@ -89,7 +89,7 @@ func ValidateShardStatuses(statuses []ShardStatus) error {
 func validateKnownShardStatuses(statuses []ShardStatus) error {
 	for _, s := range statuses {
 		if s > ShardInvalid {
-			return invalid("unknown shard status %d", s)
+			return invalidf("unknown shard status %d", s)
 		}
 	}
 	return nil
@@ -99,7 +99,7 @@ func validateKnownShardStatuses(statuses []ShardStatus) error {
 // "no limit") and, when present, only known statuses (nil/empty Statuses means "all").
 func ValidateListShardsFilter(f ShardFilter) error {
 	if f.Limit < 0 {
-		return invalid("limit must be >= 0")
+		return invalidf("limit must be >= 0")
 	}
 	return validateKnownShardStatuses(f.Statuses)
 }
@@ -108,7 +108,7 @@ func ValidateListShardsFilter(f ShardFilter) error {
 // reachable through RetireShard.
 func ValidateUpdateStatus(s ShardStatus) error {
 	if s == ShardInvalid || s > ShardInvalid {
-		return invalid("UpdateShard cannot set status %s", s)
+		return invalidf("UpdateShard cannot set status %s", s)
 	}
 	return nil
 }
@@ -119,35 +119,35 @@ func ValidatePutShard(shard Shard, rows []Row) error {
 		return err
 	}
 	if shard.Size <= 0 || shard.Size != len(rows) {
-		return invalid("shard size %d must equal len(rows) %d and be > 0", shard.Size, len(rows))
+		return invalidf("shard size %d must equal len(rows) %d and be > 0", shard.Size, len(rows))
 	}
 	if shard.Denomination == 0 {
-		return invalid("shard denomination must be > 0")
+		return invalidf("shard denomination must be > 0")
 	}
 	if shard.Status != ShardUnmined && shard.Status != ShardMined {
-		return invalid("new shard status must be unmined or mined, got %s", shard.Status)
+		return invalidf("new shard status must be unmined or mined, got %s", shard.Status)
 	}
 	if shard.LockMode > LockP2PKH {
-		return invalid("unknown lock mode %d", shard.LockMode)
+		return invalidf("unknown lock mode %d", shard.LockMode)
 	}
 	seen := make(map[uint32]struct{}, len(rows))
 	for i := range rows {
 		r := &rows[i]
 		if r.Pool != shard.Pool {
-			return invalid("row %d pool %q != shard pool %q", i, r.Pool, shard.Pool)
+			return invalidf("row %d pool %q != shard pool %q", i, r.Pool, shard.Pool)
 		}
 		if r.TxID != shard.TxID {
-			return invalid("row %d txid != shard txid", i)
+			return invalidf("row %d txid != shard txid", i)
 		}
 		if _, dup := seen[r.Vout]; dup {
-			return invalid("duplicate vout %d", r.Vout)
+			return invalidf("duplicate vout %d", r.Vout)
 		}
 		seen[r.Vout] = struct{}{}
 		if r.Satoshis == 0 {
-			return invalid("row %d satoshis must be > 0", i)
+			return invalidf("row %d satoshis must be > 0", i)
 		}
 		if len(r.LockingScript) == 0 || len(r.UnlockingScript) == 0 {
-			return invalid("row %d needs locking and unlocking scripts", i)
+			return invalidf("row %d needs locking and unlocking scripts", i)
 		}
 	}
 	return nil
@@ -157,18 +157,18 @@ func ValidatePutShard(shard Shard, rows []Row) error {
 // non-zero tokens, non-zero expiry.
 func ValidateReserveOps(ops []ReserveOp, maxBatch int) error {
 	if len(ops) == 0 || len(ops) > maxBatch {
-		return invalid("reserve batch must have 1..%d ops, got %d", maxBatch, len(ops))
+		return invalidf("reserve batch must have 1..%d ops, got %d", maxBatch, len(ops))
 	}
 	seen := make(map[Outpoint]struct{}, len(ops))
 	for i, op := range ops {
 		if op.Token.IsZero() {
-			return invalid("op %d has a zero token", i)
+			return invalidf("op %d has a zero token", i)
 		}
 		if op.ExpiresAt.IsZero() {
-			return invalid("op %d has no expiry", i)
+			return invalidf("op %d has no expiry", i)
 		}
 		if _, dup := seen[op.Outpoint]; dup {
-			return invalid("duplicate outpoint %s in batch", op.Outpoint)
+			return invalidf("duplicate outpoint %s in batch", op.Outpoint)
 		}
 		seen[op.Outpoint] = struct{}{}
 	}
@@ -178,12 +178,12 @@ func ValidateReserveOps(ops []ReserveOp, maxBatch int) error {
 // ValidateOutpoints checks a Release/Spend/Resolve/GetRows batch.
 func ValidateOutpoints(ops []Outpoint, maxBatch int) error {
 	if len(ops) == 0 || len(ops) > maxBatch {
-		return invalid("batch must have 1..%d outpoints, got %d", maxBatch, len(ops))
+		return invalidf("batch must have 1..%d outpoints, got %d", maxBatch, len(ops))
 	}
 	seen := make(map[Outpoint]struct{}, len(ops))
 	for _, op := range ops {
 		if _, dup := seen[op]; dup {
-			return invalid("duplicate outpoint %s in batch", op)
+			return invalidf("duplicate outpoint %s in batch", op)
 		}
 		seen[op] = struct{}{}
 	}
@@ -197,10 +197,10 @@ func ValidateResolve(to State, spentBy *chainhash.Hash) error {
 		return nil
 	case StateSpent:
 		if spentBy == nil {
-			return invalid("resolve to spent requires spentBy")
+			return invalidf("resolve to spent requires spentBy")
 		}
 		return nil
 	default:
-		return invalid("resolve target must be available or spent, got %s", to)
+		return invalidf("resolve target must be available or spent, got %s", to)
 	}
 }
