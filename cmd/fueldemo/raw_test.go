@@ -582,37 +582,42 @@ func TestWorkerBackpressureHoldsOneReleasesRest(t *testing.T) {
 	}, time.Second, 5*time.Millisecond, "the attempted output stays held; the rest of the batch is released")
 }
 
-// TestWorkerBackpressureReleasesRestBeforeSleeping pins the ordering fix for
-// the batch-abandon path: the untried rest of the batch must be released
-// right away, not merely queued for release after the Retry-After wait.
-// With RetryAfter set to a full second, it uses client.WithObserver (the
-// same deterministic hook pkg/client/settle_test.go's countingClient uses)
-// to record when the /release call is actually seen by the server, and
-// checks that timestamp lands a comfortable margin before the sleep could
-// have elapsed: the pre-fix code, which only appended the untried outputs
-// to a slice released after sleepBounded returned, would instead show the
-// release arriving at roughly start+1s.
-func TestWorkerBackpressureReleasesRestBeforeSleeping(t *testing.T) {
-	srv, _, _ := newRawTestEnv(t, 1, 5)
+// releaseWatcher observes, via client.WithObserver, the first time a
+// worker's /release call reaches the server. The release-before-sleep
+// pinning tests below use it to prove the untried rest of an abandoned
+// batch is released right away, not merely queued for release after the
+// worker's Retry-After/outage-backoff sleep.
+type releaseWatcher struct {
+	mu     sync.Mutex
+	seenAt time.Time
+}
 
-	var mu sync.Mutex
-	var releaseSeenAt time.Time
-	fk, err := client.New(srv.URL, client.WithObserver(func(method, path string, _ int, _ time.Duration, _ error) {
-		if method == http.MethodPost && strings.HasSuffix(path, "/release") {
-			mu.Lock()
-			if releaseSeenAt.IsZero() {
-				releaseSeenAt = time.Now()
-			}
-			mu.Unlock()
-		}
-	}))
-	require.NoError(t, err)
+// observe is a client.Observer.
+func (w *releaseWatcher) observe(method, path string, _ int, _ time.Duration, _ error) {
+	if method != http.MethodPost || !strings.HasSuffix(path, "/release") {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.seenAt.IsZero() {
+		w.seenAt = time.Now()
+	}
+}
 
-	const retryAfter = time.Second
-	fake := &fakeSubmitter{err: &arcadeclient.BackpressureError{RetryAfter: int(retryAfter / time.Second)}}
-	rep := newReport("raw", "test", 1)
-	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
+// seen returns when the first /release call was observed, or the zero Time
+// if none has been yet.
+func (w *releaseWatcher) seen() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.seenAt
+}
 
+// runOneAbandonedCycle runs r.worker for exactly one reserve/process cycle
+// (stopping deterministically via afterCycle, as elsewhere in this file)
+// and returns the time just before it started -- the reference point the
+// release-before-sleep tests measure the observed /release call against.
+func runOneAbandonedCycle(t *testing.T, r *rawRunner) time.Time {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var cycles atomic.Int32
@@ -630,13 +635,90 @@ func TestWorkerBackpressureReleasesRestBeforeSleeping(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("worker did not stop within 5s of its first cycle completing")
 	}
+	return start
+}
 
-	mu.Lock()
-	seenAt := releaseSeenAt
-	mu.Unlock()
+// TestWorkerBackpressureReleasesRestBeforeSleeping pins the ordering fix for
+// the batch-abandon path: the untried rest of the batch must be released
+// right away, not merely queued for release after the Retry-After wait.
+// With RetryAfter set to a full second, it checks that the observed
+// /release call lands a comfortable margin before the sleep could have
+// elapsed: the pre-fix code, which only appended the untried outputs to a
+// slice released after sleepBounded returned, would instead show the
+// release arriving at roughly start+1s.
+func TestWorkerBackpressureReleasesRestBeforeSleeping(t *testing.T) {
+	srv, _, _ := newRawTestEnv(t, 1, 5)
+	w := &releaseWatcher{}
+	fk, err := client.New(srv.URL, client.WithObserver(w.observe))
+	require.NoError(t, err)
+
+	const retryAfter = time.Second
+	fake := &fakeSubmitter{err: &arcadeclient.BackpressureError{RetryAfter: int(retryAfter / time.Second)}}
+	rep := newReport("raw", "test", 1)
+	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
+
+	start := runOneAbandonedCycle(t, r)
+
+	seenAt := w.seen()
 	require.False(t, seenAt.IsZero(), "the release call must have happened")
 	assert.Less(t, seenAt.Sub(start), retryAfter/2,
 		"the untried outputs must be released before the Retry-After sleep starts, not after it returns")
+}
+
+// TestWorkerDialFailureReleasesRestBeforeSleeping is
+// TestWorkerBackpressureReleasesRestBeforeSleeping's sibling for the
+// dial-failure branch: a dial failure abandons the batch and backs off
+// (see worker's doc comment and TestWorkerDialFailureReleasesAndBacksOff)
+// exactly like backpressure does, and the same ordering bug -- release
+// queued but not actually sent until after the sleep -- is possible there
+// independently, since the fix lives in each switch case separately.
+// worker(ctx, 0)'s first outage backoff is reserveRetryPause (id 0 adds no
+// jitter), so the observed /release call must land comfortably inside that
+// window, not after it.
+func TestWorkerDialFailureReleasesRestBeforeSleeping(t *testing.T) {
+	srv, _, _ := newRawTestEnv(t, 1, 5)
+	w := &releaseWatcher{}
+	fk, err := client.New(srv.URL, client.WithObserver(w.observe))
+	require.NoError(t, err)
+
+	dialErr := fmt.Errorf("arcadeclient: POST /tx: %w", &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED})
+	fake := &fakeSubmitter{err: dialErr}
+	rep := newReport("raw", "test", 1)
+	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
+
+	start := runOneAbandonedCycle(t, r)
+
+	seenAt := w.seen()
+	require.False(t, seenAt.IsZero(), "the release call must have happened")
+	assert.Less(t, seenAt.Sub(start), reserveRetryPause/2,
+		"the untried outputs must be released before the outage-backoff sleep starts, not after it returns")
+}
+
+// TestWorkerUncertainFailureReleasesRestBeforeSleeping is
+// TestWorkerBackpressureReleasesRestBeforeSleeping's sibling for the
+// generic "uncertain" default branch (a 5xx here, exercising the same
+// switch case as TestWorkerHoldsOnUncertainSubmission's "5xx unexpected
+// status"): it abandons the batch and backs off independently of the
+// backpressure and dial-failure cases, so the release-before-sleep fix
+// needed pinning there too. See
+// TestWorkerDialFailureReleasesRestBeforeSleeping's doc comment for the
+// reserveRetryPause reasoning.
+func TestWorkerUncertainFailureReleasesRestBeforeSleeping(t *testing.T) {
+	srv, _, _ := newRawTestEnv(t, 1, 5)
+	w := &releaseWatcher{}
+	fk, err := client.New(srv.URL, client.WithObserver(w.observe))
+	require.NoError(t, err)
+
+	fake := &fakeSubmitter{err: &arcadeclient.UnexpectedStatusError{Method: "POST", Path: "/tx", Code: 500}}
+	rep := newReport("raw", "test", 1)
+	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
+
+	start := runOneAbandonedCycle(t, r)
+
+	seenAt := w.seen()
+	require.False(t, seenAt.IsZero(), "the release call must have happened")
+	assert.Less(t, seenAt.Sub(start), reserveRetryPause/2,
+		"the untried outputs must be released before the outage-backoff sleep starts, not after it returns")
 }
 
 // p2pkhLockingScript returns a syntactically plausible (not cryptographically
