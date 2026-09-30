@@ -5,6 +5,15 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Aerospike is deliberately NOT a CI service here. Production fuelkeeper
+    # deployments require an Aerospike Enterprise namespace configured with
+    # strong-consistency true (see pkg/store/aerospike's package doc); the
+    # free Community Edition this repo's deploy/docker-compose.yaml uses
+    # cannot run in that mode, so a green run against it in CI would not be
+    # evidence of anything a production namespace actually needs. The
+    # aerospike backend's conformance suite instead runs locally against that
+    # compose service: `make docker-up && make test-integration` (which
+    # covers postgres, mongodb and aerospike together).
     services:
       postgres:
         image: postgres:16-alpine
@@ -19,13 +28,33 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval \"db.adminCommand('ping').ok\""
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       - run: make test
-      - run: make test-integration
+      # Mirrors the postgres/mongodb lines of `make test-integration`
+      # (Makefile) without its aerospike line: this job has no aerospike
+      # service (see the comment on `services` above).
+      - name: test-integration (postgres, mongodb)
+        env:
+          FUELKEEPER_TEST_POSTGRES_DSN: postgres://fuelkeeper:fuelkeeper@localhost:15432/fuelkeeper?sslmode=disable
+          FUELKEEPER_TEST_MONGODB_URI: mongodb://localhost:27017
+        run: |
+          go test -race -count=1 -parallel=8 -tags=postgres ./pkg/store/postgres/...
+          go test -race -count=1 -parallel=8 -tags=mongodb ./pkg/store/mongodb/...
+          go test -race -count=1 -parallel=8 -tags=postgres ./pkg/store/factory/...
+          go test -race -count=1 -parallel=8 -tags=mongodb ./pkg/store/factory/...
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2
