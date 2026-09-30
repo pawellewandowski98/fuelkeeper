@@ -46,6 +46,24 @@ func TestTokenRoundTrip(t *testing.T) {
 	assert.NotEqual(t, store.NewToken(), store.NewToken()) //nolint:testifylint // two independently random tokens; not a same-variable comparison
 }
 
+func TestOutpointVoutBoundaries(t *testing.T) {
+	h, err := chainhash.NewHashFromHex("6f9d4c4e0a2b1c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5")
+	require.NoError(t, err)
+
+	zero := store.Outpoint{TxID: *h, Vout: 0}
+	parsed, err := store.ParseOutpoint(zero.String())
+	require.NoError(t, err)
+	assert.Equal(t, zero, parsed)
+
+	maxVout := store.Outpoint{TxID: *h, Vout: 4294967295}
+	parsed, err = store.ParseOutpoint(maxVout.String())
+	require.NoError(t, err)
+	assert.Equal(t, maxVout, parsed)
+
+	_, err = store.ParseOutpoint(h.String() + ":4294967296")
+	require.ErrorIs(t, err, store.ErrInvalidArgument)
+}
+
 func TestEnumStrings(t *testing.T) {
 	assert.Equal(t, "available", store.StateAvailable.String())
 	assert.Equal(t, "reserved", store.StateReserved.String())

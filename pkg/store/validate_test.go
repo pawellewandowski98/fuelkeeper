@@ -92,6 +92,26 @@ func TestValidateReserveOps(t *testing.T) {
 	require.ErrorIs(t, store.ValidateReserveOps([]store.ReserveOp{noExp}, 10), store.ErrInvalidArgument)
 }
 
+const maxBatch = 1000
+
+func TestValidateReserveOpsAtMaxBatch(t *testing.T) {
+	tok := store.NewToken()
+	exp := time.Now().Add(time.Minute)
+	ops := make([]store.ReserveOp, maxBatch)
+	for i := range ops {
+		ops[i] = store.ReserveOp{Outpoint: store.Outpoint{TxID: hashN(1), Vout: uint32(i)}, Token: tok, ExpiresAt: exp}
+	}
+	require.NoError(t, store.ValidateReserveOps(ops, maxBatch))
+}
+
+func TestValidateOutpointsAtMaxBatch(t *testing.T) {
+	ops := make([]store.Outpoint, maxBatch)
+	for i := range ops {
+		ops[i] = store.Outpoint{TxID: hashN(1), Vout: uint32(i)}
+	}
+	require.NoError(t, store.ValidateOutpoints(ops, maxBatch))
+}
+
 func TestValidateOutpointsAndMisc(t *testing.T) {
 	ops := []store.Outpoint{{TxID: hashN(1), Vout: 0}, {TxID: hashN(1), Vout: 1}} //nolint:prealloc // fixed 2-element literal; the append() below builds a throwaway slice, not a grown copy of ops
 	require.NoError(t, store.ValidateOutpoints(ops, 10))

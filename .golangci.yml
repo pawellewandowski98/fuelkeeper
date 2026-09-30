@@ -18,6 +18,11 @@ linters:
     - unconvert
     - unparam
   settings:
+    govet:
+      settings:
+        printf:
+          funcs:
+            - github.com/bsv-blockchain/fuelkeeper/pkg/store.invalid
     gosec:
       excludes:
         - G404 # math/rand is fine for jitter and test data
