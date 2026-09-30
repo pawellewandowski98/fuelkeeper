@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
@@ -74,6 +75,8 @@ type fakeWallet struct {
 	sendStatus map[chainhash.Hash]sdk.ActionResultStatus // default unproven
 	omitResult bool                                      // SendWith returns no result for the txid
 	unknown    map[chainhash.Hash]bool                   // SendWith: no known-tx record
+	sendGate   chan struct{}                             // if set, SendWith blocks until closed
+	sendEnter  chan struct{}                             // signalled as each SendWith call starts
 	abortFail  map[chainhash.Hash]error
 	actions    []sdk.Action
 	pageCap    int
@@ -104,6 +107,14 @@ func (f *fakeWallet) CreateAction(_ context.Context, args sdk.CreateActionArgs, 
 	defer f.mu.Unlock()
 	f.creates = append(f.creates, args)
 	if args.Options != nil && len(args.Options.SendWith) > 0 {
+		if gate, enter := f.sendGate, f.sendEnter; gate != nil {
+			f.sendWith = append(f.sendWith, append([]chainhash.Hash(nil), args.Options.SendWith...))
+			f.mu.Unlock()
+			enter <- struct{}{}
+			<-gate
+			f.mu.Lock()
+			return &sdk.CreateActionResult{SendWithResults: []sdk.SendWithResult{{Txid: args.Options.SendWith[0], Status: sdk.ActionResultStatusUnproven}}}, nil
+		}
 		return f.sendWithLocked(args.Options.SendWith)
 	}
 	if f.fail != nil {
@@ -560,11 +571,12 @@ func TestSendIsWalletFirst(t *testing.T) {
 	require.NoError(t, c2.Send(ctx, txid, b.Shard.BEEF))
 	assert.Len(t, w.sendWithCalls(), 3)
 
-	// A re-post failure is transient.
+	// Once the wallet reports the split accepted, a failed re-post is only
+	// logged, even one claiming a rejection: the oracle is the authority.
+	bc.err = fmt.Errorf("arcade says: %w", treasury.ErrRejected)
+	require.NoError(t, c.Send(ctx, txid, b.Shard.BEEF))
 	bc.err = errors.New("arcade down")
-	err = c.Send(ctx, txid, b.Shard.BEEF)
-	require.Error(t, err)
-	require.NotErrorIs(t, err, treasury.ErrRejected)
+	require.NoError(t, c.Send(ctx, txid, b.Shard.BEEF))
 	bc.err = nil
 
 	// Not posted by the wallet: transient, and never posted around it.
@@ -589,6 +601,39 @@ func TestSendIsWalletFirst(t *testing.T) {
 	assert.Len(t, bc.calls(), before+1)
 	require.ErrorIs(t, c.Send(ctx, txid, nil), treasury.ErrUnknownTx)
 	require.ErrorIs(t, newCore(t, w, nil).Send(ctx, txid, b.Shard.BEEF), treasury.ErrUnknownTx, "no broadcaster")
+	delete(w.unknown, txid)
+
+	// A "not found" error naming a different txid is not "no record of ours".
+	posts := len(bc.calls())
+	w.sendFail = fmt.Errorf("create action failed: failed to process created action: known tx status for txID %s not found", storetest.NewTxID())
+	err = c.Send(ctx, txid, b.Shard.BEEF)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, treasury.ErrUnknownTx)
+	assert.Len(t, bc.calls(), posts, "never posted around the wallet")
+	w.sendFail = nil
+}
+
+func TestConcurrentSendsShareOneWalletCall(t *testing.T) {
+	ctx := context.Background()
+	w := newFakeWallet(t)
+	c := newCore(t, w, nil)
+	b, err := c.Build(ctx, puzzleReq(1))
+	require.NoError(t, err)
+
+	w.mu.Lock()
+	w.sendGate, w.sendEnter = make(chan struct{}), make(chan struct{}, 2)
+	w.mu.Unlock()
+	errs := make(chan error, 2)
+	go func() { errs <- c.Send(ctx, b.Shard.TxID, nil) }()
+	<-w.sendEnter // the first Send is inside the wallet
+	go func() { errs <- c.Send(ctx, b.Shard.TxID, nil) }()
+	// Give the second Send time to reach the flight; without the
+	// singleflight it would enter the wallet here (sendEnter has room).
+	time.Sleep(100 * time.Millisecond)
+	close(w.sendGate)
+	require.NoError(t, <-errs)
+	require.NoError(t, <-errs)
+	assert.Len(t, w.sendWithCalls(), 1, "two concurrent Sends of one txid make one wallet call")
 }
 
 func processErr(reviewTxid chainhash.Hash, st wdk.ReviewActionResultStatus, cause error) error {
@@ -658,36 +703,82 @@ func TestReconcile(t *testing.T) {
 	ctx := context.Background()
 	w := newFakeWallet(t)
 	c := newCore(t, w, &fakeBroadcaster{})
-	knownOK, unknownOK, knownFail, unknownFail, mined := storetest.NewTxID(), storetest.NewTxID(), storetest.NewTxID(), storetest.NewTxID(), storetest.NewTxID()
-	w.actions = []sdk.Action{
-		{Txid: knownOK, Status: sdk.ActionStatusNoSend},
-		{Txid: mined, Status: sdk.ActionStatusUnproven},
-		{Txid: unknownOK, Status: sdk.ActionStatusNoSend},
-		{Txid: knownFail, Status: sdk.ActionStatusNoSend},
-		{Txid: unknownFail, Status: sdk.ActionStatusNoSend},
+	ids := map[string]chainhash.Hash{}
+	for _, n := range []string{"knownOK", "unknownOK", "knownFail", "unknownFail", "mined", "lookupFails", "late", "gone", "recordedLate"} {
+		ids[n] = storetest.NewTxID()
 	}
-	w.pageCap = 2 // the wallet pages, whatever the requested limit
-	w.sendStatus[knownFail] = sdk.ActionResultStatusFailed
-	w.abortFail[unknownFail] = errors.New("not abortable")
-	known := map[chainhash.Hash]bool{knownOK: true, knownFail: true, mined: true}
+	nosend := func(names ...string) []sdk.Action {
+		out := make([]sdk.Action, 0, len(names))
+		for _, n := range names {
+			out = append(out, sdk.Action{Txid: ids[n], Status: sdk.ActionStatusNoSend})
+		}
+		return out
+	}
+	w.actions = append(nosend("knownOK", "unknownOK", "knownFail", "unknownFail", "lookupFails", "gone", "recordedLate"),
+		sdk.Action{Txid: ids["mined"], Status: sdk.ActionStatusUnproven})
+	w.pageCap = 3 // the wallet pages, whatever the requested limit
+	w.sendStatus[ids["knownFail"]] = sdk.ActionResultStatusFailed
+	w.abortFail[ids["unknownFail"]] = errors.New("not abortable")
 
-	rep, err := c.Reconcile(ctx, func(h chainhash.Hash) bool { return known[h] })
+	known := map[chainhash.Hash]bool{ids["knownOK"]: true, ids["knownFail"]: true, ids["mined"]: true}
+	var slept []time.Duration
+	c.SetSleep(func(_ context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		// During the grace: "gone" was sent by its owner, "late" was built by
+		// another minter, and "recordedLate" got its PutShard.
+		w.mu.Lock()
+		w.actions = append(nosend("knownOK", "unknownOK", "knownFail", "unknownFail", "lookupFails", "late", "recordedLate"),
+			sdk.Action{Txid: ids["mined"], Status: sdk.ActionStatusUnproven})
+		w.mu.Unlock()
+		known[ids["recordedLate"]] = true
+		return nil
+	})
+	var lookups []chainhash.Hash
+	rep, err := c.Reconcile(ctx, func(_ context.Context, h chainhash.Hash) (bool, error) {
+		lookups = append(lookups, h)
+		if h == ids["lookupFails"] {
+			return false, errors.New("store unavailable")
+		}
+		return known[h], nil
+	})
 	require.NoError(t, err)
-	assert.Equal(t, []chainhash.Hash{knownOK}, rep.Resent)
-	assert.Equal(t, []chainhash.Hash{unknownOK}, rep.Aborted)
-	require.Len(t, rep.Errors, 2)
-	assert.Contains(t, rep.Errors, knownFail)
-	assert.Contains(t, rep.Errors, unknownFail)
+	assert.Equal(t, []time.Duration{2 * time.Minute}, slept, "one grace wait of Config.ReconcileGrace")
+	assert.Equal(t, []chainhash.Hash{ids["knownOK"], ids["recordedLate"]}, rep.Resent)
+	assert.Equal(t, []chainhash.Hash{ids["unknownOK"]}, rep.Aborted)
+	assert.Equal(t, []chainhash.Hash{ids["late"]}, rep.Deferred, "seen once: reported, not aborted")
+	require.Len(t, rep.Errors, 3)
+	assert.Contains(t, rep.Errors, ids["knownFail"])
+	assert.Contains(t, rep.Errors, ids["unknownFail"])
+	require.ErrorContains(t, rep.Errors[ids["lookupFails"]], "store unavailable")
 
-	assert.Equal(t, [][]chainhash.Hash{{knownOK}, {knownFail}}, w.sendWithCalls(), "only known no-send splits are sent; the mined one is left alone")
-	assert.Equal(t, []string{unknownOK.String(), unknownFail.String()}, w.abortRefs())
-	require.Len(t, w.listArgs, 3, "paged through all five actions two at a time")
+	assert.Equal(t, []string{ids["unknownOK"].String(), ids["unknownFail"].String()}, w.abortRefs(),
+		"only splits unknown in a fresh lookup and seen in both listings are aborted; a failed lookup never is")
+	assert.Equal(t, [][]chainhash.Hash{{ids["knownOK"]}, {ids["knownFail"]}, {ids["recordedLate"]}}, w.sendWithCalls())
+	assert.NotContains(t, lookups, ids["gone"], "a split gone by the second listing is left alone")
+	assert.NotContains(t, lookups, ids["mined"], "only no-send splits are looked up")
+	require.Len(t, w.listArgs, 6, "two listings of eight actions, three per page")
 	for _, a := range w.listArgs {
 		assert.Equal(t, []string{"fuel-split"}, a.Labels)
 	}
 
+	// Nothing no-send: no grace wait.
+	w.actions = nil
+	slept = nil
+	rep, err = c.Reconcile(ctx, func(context.Context, chainhash.Hash) (bool, error) { return false, nil })
+	require.NoError(t, err)
+	assert.Empty(t, slept)
+	assert.Empty(t, rep.Aborted)
+
+	// A context ending during the grace aborts nothing.
+	w.actions = nosend("unknownOK")
+	aborts := len(w.abortRefs())
+	c.SetSleep(func(context.Context, time.Duration) error { return context.Canceled })
+	_, err = c.Reconcile(ctx, func(context.Context, chainhash.Hash) (bool, error) { return false, nil })
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Len(t, w.abortRefs(), aborts)
+
 	w.listErr = errors.New("storage down")
-	_, err = c.Reconcile(ctx, func(chainhash.Hash) bool { return true })
+	_, err = c.Reconcile(ctx, func(context.Context, chainhash.Hash) (bool, error) { return true, nil })
 	require.ErrorContains(t, err, "storage down")
 }
 
@@ -771,6 +862,17 @@ func TestFundingHandshake(t *testing.T) {
 		_, err := c.Internalize(ctx, r)
 		return err
 	}
+	err = bad(func(r *treasury.FundRequest) { r.DerivationPrefixB64 = "b3RoZXI=" })
+	require.ErrorIs(t, err, treasury.ErrBadFunding)
+	require.ErrorContains(t, err, "unknown derivation prefix")
+	err = bad(func(r *treasury.FundRequest) {
+		r.AtomicBEEF = append(append([]byte(nil), r.AtomicBEEF...), make([]byte, 4<<20)...)
+	})
+	require.ErrorIs(t, err, treasury.ErrBadFunding)
+	require.ErrorContains(t, err, "max 4194304", "the size cap rejects it before any parsing")
+	err = bad(func(r *treasury.FundRequest) { r.AtomicBEEF = make([]byte, 4<<20) })
+	require.ErrorIs(t, err, treasury.ErrBadFunding)
+	require.NotContains(t, err.Error(), "max 4194304", "exactly 4 MiB is within the cap")
 	for name, mut := range map[string]func(r *treasury.FundRequest){
 		"unknown nonce":        func(r *treasury.FundRequest) { r.DerivationPrefixB64 = "b3RoZXI=" },
 		"url-base64 nonce":     func(r *treasury.FundRequest) { r.DerivationPrefixB64 = "-_-_" },
@@ -885,6 +987,7 @@ func TestLeafCostAndChunkValue(t *testing.T) {
 		"low water 0":     {func(c *toolbox.Config) { c.Chunking.LowWaterPercent = 0 }, "low_water_percent"},
 		"low water 101":   {func(c *toolbox.Config) { c.Chunking.LowWaterPercent = 101 }, "low_water_percent"},
 		"interval 0":      {func(c *toolbox.Config) { c.Chunking.Interval = 0 }, "interval"},
+		"grace 0":         {func(c *toolbox.Config) { c.ReconcileGrace = 0 }, "reconcile_grace"},
 		"fanout 0":        {func(c *toolbox.Config) { c.Chunking.FanoutOutputsPerTx = 0 }, "fanout_outputs_per_tx"},
 		"target chunks 0": {func(c *toolbox.Config) { c.Chunking.TargetChunks = 0 }, "target_chunks"},
 		"postgres bad port": {func(c *toolbox.Config) {

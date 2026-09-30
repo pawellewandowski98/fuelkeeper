@@ -190,7 +190,10 @@ func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 		// in a single tick.
 		deficit -= int64(pc.SplitSize)
 		pending++
-		if err := m.tr.Send(ctx, b.Shard.TxID, b.Shard.BEEF); err != nil {
+		// This is always the first send of a split the treasury just built, so
+		// no BEEF: the treasury's wallet posts it, and a BEEF would only make
+		// the treasury re-post what its wallet just posted.
+		if err := m.tr.Send(ctx, b.Shard.TxID, nil); err != nil {
 			if errors.Is(err, treasury.ErrRejected) {
 				minterSplits.WithLabelValues(pc.Name, "rejected").Inc()
 				if _, rerr := m.st.RetireShard(ctx, pc.Name, b.Shard.TxID); rerr != nil {

@@ -1,6 +1,9 @@
 package toolbox
 
 import (
+	"context"
+	"time"
+
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
@@ -25,3 +28,6 @@ func SetValidatePutShard(fn func(store.Shard, []store.Row) error) (restore func(
 	validatePutShard = fn
 	return func() { validatePutShard = old }
 }
+
+// SetSleep replaces the wait Reconcile uses for its grace period.
+func (c *Core) SetSleep(fn func(ctx context.Context, d time.Duration) error) { c.sleep = fn }

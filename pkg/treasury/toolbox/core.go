@@ -66,6 +66,7 @@ type Core struct {
 	kd     *sdk.KeyDeriver
 	cfg    Config
 	log    *slog.Logger
+	sleep  func(ctx context.Context, d time.Duration) error
 
 	// sends collapses concurrent Sends of one txid (the minter and the
 	// watcher can race) into one wallet call; every caller gets its result.
@@ -84,7 +85,7 @@ func NewCore(w WalletAPI, bc Broadcaster, keeper ChunkKeeper, nonces Nonces, kd 
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Core{w: w, bc: bc, keeper: keeper, nonces: nonces, kd: kd, cfg: cfg, log: log}
+	return &Core{w: w, bc: bc, keeper: keeper, nonces: nonces, kd: kd, cfg: cfg, log: log, sleep: sleepCtx}
 }
 
 // Build creates and signs a split with the wallet (NoSend) and returns its
@@ -92,9 +93,12 @@ func NewCore(w WalletAPI, bc Broadcaster, keeper ChunkKeeper, nonces Nonces, kd 
 // so its inputs return to the wallet and it can never be broadcast. The rows'
 // unlocking scripts are bearer secrets and are never logged.
 //
-// The pool name is used verbatim in the "pool:<name>" label; the toolbox
-// does not normalise labels, and pool names are unique, so labels of
-// different pools never collide. The label is informational only.
+// The toolbox trims and lowercases labels
+// (wallet/internal/mapping/mapping_create_action_args.go:32 via
+// mapping_internalize_action.go:24 and wdk/primitives/strings.go:81-82), so
+// pools whose names differ only in case ("Main", "main") share the
+// "pool:main" label. The label is informational only; nothing (Reconcile
+// included) selects splits by it.
 func (c *Core) Build(ctx context.Context, req treasury.MintRequest) (*treasury.BuiltShard, error) {
 	if err := req.Validate(); err != nil {
 		return nil, err
@@ -282,7 +286,8 @@ func isInsufficientFunds(err error) bool {
 //     (:547-602); the wallet reports "unproven" once the network took it;
 //   - a split the wallet already posted comes back "unproven" without a post
 //     (:469-477, :654-693); Send then re-posts beef through the Broadcaster,
-//     which is the watcher's rebroadcast;
+//     which is the watcher's rebroadcast (a re-post failure is logged, and
+//     Send still succeeds: the split is accepted);
 //   - "sending", "failed" or no result for txid is transient, and the split
 //     is never posted around the wallet: the claim gate can legitimately
 //     refuse (:558-573), e.g. after an abort released the inputs, and a post
@@ -316,9 +321,12 @@ func (c *Core) send(ctx context.Context, txid chainhash.Hash, beef []byte) error
 	status, found := sendWithStatus(res, txid)
 	switch {
 	case found && status == sdk.ActionResultStatusUnproven:
+		// The network accepted the split: that is final for Send. A failed
+		// re-post is only logged, whatever it wraps, so it can neither retire
+		// an accepted split nor count as a failed send.
 		if len(beef) > 0 && c.bc != nil {
 			if err := c.bc.PostBEEF(ctx, beef, txid.String()); err != nil {
-				return fmt.Errorf("treasury: rebroadcast split: %w", err)
+				c.log.Warn("re-post of accepted split failed", "txid", txid.String(), "err", err)
 			}
 		}
 		c.log.Info("fuel split sent", "txid", txid.String())
@@ -397,50 +405,102 @@ func classifySendError(ctx context.Context, err error, txid chainhash.Hash) erro
 type ReconcileReport struct {
 	// Resent are no-send splits the store knows, handed to Send.
 	Resent []chainhash.Hash
-	// Aborted are no-send splits the store does not know, aborted.
+	// Aborted are no-send splits the store did not know in either pass.
 	Aborted []chainhash.Hash
-	// Errors holds the per-split failures (the split is in neither list).
+	// Deferred are unknown no-send splits seen only in the second listing:
+	// possibly a Build whose PutShard is still in flight, so left alone.
+	Deferred []chainhash.Hash
+	// Errors holds the per-split failures (the split is in no other list),
+	// including a failed store lookup, which never leads to an abort.
 	Errors map[chainhash.Hash]error
 }
 
 // Reconcile finds splits the wallet holds as no-send (built but never sent:
-// a crash between Build, PutShard and Send) and settles each one. A split
-// known to the store (known(txid)) is sent with Send(ctx, txid, nil): a
-// no-send split is claimed and posted by the wallet itself, so no BEEF is
-// needed. An unknown split is aborted: its puzzle seed lived only in the
-// crashed process's memory, so it must never reach the chain.
+// a crash between Build, PutShard and Send) and settles each one. It lists
+// them twice, Config.ReconcileGrace apart (longer than any Build to PutShard
+// window), and then asks known(ctx, txid) afresh for each split of the
+// second listing:
 //
-// Reconcile must run before the minter starts: a split built concurrently is
-// no-send and unknown to the store until its PutShard, and would be aborted.
-// Per-split failures are collected in the report; only a listing failure
-// returns an error.
-func (c *Core) Reconcile(ctx context.Context, known func(chainhash.Hash) bool) (ReconcileReport, error) {
+//   - known: sent with Send(ctx, txid, nil). A no-send split is claimed and
+//     posted by the wallet itself, so no BEEF is needed.
+//   - unknown and seen in both listings: aborted. Its puzzle seed lived only
+//     in the crashed process's memory, so it must never reach the chain.
+//     Abort parks it as invalidTx in the wallet
+//     (internal/storage/repo/known_tx.go:81-88), which is irreversible.
+//   - unknown and seen only in the second listing: Deferred, not touched.
+//   - known returned an error: recorded in Errors and never aborted, since a
+//     transient store error must not destroy a recorded split.
+//
+// The grace covers a minter in another instance (overlapping runs are
+// allowed during a lease hand-over) that built a split and has not yet
+// recorded it. Task 5 should run Reconcile as the first step inside the
+// minter's lease, or at startup, and always with the grace. Only a listing
+// failure (or ctx ending during the grace) returns an error.
+func (c *Core) Reconcile(ctx context.Context, known func(context.Context, chainhash.Hash) (bool, error)) (ReconcileReport, error) {
 	rep := ReconcileReport{Errors: map[chainhash.Hash]error{}}
-	pending, err := c.noSendSplits(ctx)
+	first, err := c.noSendSplits(ctx)
 	if err != nil {
 		return rep, err
 	}
-	for _, txid := range pending {
-		if known(txid) {
+	if len(first) == 0 {
+		return rep, nil
+	}
+	seen := make(map[chainhash.Hash]bool, len(first))
+	for _, txid := range first {
+		seen[txid] = true
+	}
+	if err := c.sleep(ctx, c.cfg.ReconcileGrace); err != nil {
+		return rep, fmt.Errorf("treasury: reconcile grace: %w", err)
+	}
+	second, err := c.noSendSplits(ctx)
+	if err != nil {
+		return rep, err
+	}
+	for _, txid := range second {
+		isKnown, err := known(ctx, txid)
+		switch {
+		case err != nil:
+			rep.Errors[txid] = fmt.Errorf("treasury: look up split: %w", err)
+		case isKnown:
 			if err := c.Send(ctx, txid, nil); err != nil {
 				rep.Errors[txid] = err
 				continue
 			}
 			rep.Resent = append(rep.Resent, txid)
-			continue
-		}
-		res, err := c.w.AbortAction(ctx, sdk.AbortActionArgs{Reference: []byte(txid.String())}, c.cfg.Originator)
-		switch {
-		case err != nil:
-			rep.Errors[txid] = fmt.Errorf("treasury: abort unrecorded split: %w", err)
-		case res == nil || !res.Aborted:
-			rep.Errors[txid] = errors.New("treasury: abort unrecorded split: wallet did not abort")
+		case !seen[txid]:
+			rep.Deferred = append(rep.Deferred, txid)
 		default:
-			rep.Aborted = append(rep.Aborted, txid)
+			c.abortUnrecorded(ctx, txid, &rep)
 		}
 	}
-	c.log.Info("treasury reconciled", "resent", len(rep.Resent), "aborted", len(rep.Aborted), "errors", len(rep.Errors))
+	c.log.Info("treasury reconciled", "resent", len(rep.Resent), "aborted", len(rep.Aborted),
+		"deferred", len(rep.Deferred), "errors", len(rep.Errors))
 	return rep, nil
+}
+
+// abortUnrecorded aborts a split no store record will ever point at.
+func (c *Core) abortUnrecorded(ctx context.Context, txid chainhash.Hash, rep *ReconcileReport) {
+	res, err := c.w.AbortAction(ctx, sdk.AbortActionArgs{Reference: []byte(txid.String())}, c.cfg.Originator)
+	switch {
+	case err != nil:
+		rep.Errors[txid] = fmt.Errorf("treasury: abort unrecorded split: %w", err)
+	case res == nil || !res.Aborted:
+		rep.Errors[txid] = errors.New("treasury: abort unrecorded split: wallet did not abort")
+	default:
+		rep.Aborted = append(rep.Aborted, txid)
+	}
+}
+
+// sleepCtx waits d or until ctx is done.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // noSendSplits lists every split action in status nosend. The whole listing

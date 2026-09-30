@@ -23,7 +23,9 @@ type WalletAPI interface {
 // surprise later.
 var _ WalletAPI = (*wallet.Wallet)(nil)
 
-// Broadcaster re-posts an already-built transaction.
+// Broadcaster re-posts an already-built transaction. It must never return
+// an error wrapping treasury.ErrRejected: the oracle, not a re-post, is the
+// authority on whether a split was rejected. The core only logs its errors.
 type Broadcaster interface {
 	PostBEEF(ctx context.Context, beef []byte, txid string) error
 }

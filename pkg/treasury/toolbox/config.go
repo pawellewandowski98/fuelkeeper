@@ -46,6 +46,9 @@ type Config struct {
 	Storage StorageConfig `yaml:"storage"`
 	// Chunking tunes the toolbox's chunk keeper.
 	Chunking ChunkConfig `yaml:"chunking"`
+	// ReconcileGrace separates Reconcile's two listings of no-send splits; it
+	// must exceed the longest Build to PutShard window. Default 2m.
+	ReconcileGrace time.Duration `yaml:"reconcile_grace"`
 }
 
 // StorageConfig selects the toolbox wallet storage.
@@ -89,9 +92,10 @@ type ChunkConfig struct {
 // DefaultConfig returns the defaults for network net.
 func DefaultConfig(net string) Config {
 	return Config{
-		Network:    net,
-		Originator: "fuelkeeper",
-		Storage:    StorageConfig{Engine: "sqlite", SQLite: "treasury.sqlite"},
+		Network:        net,
+		Originator:     "fuelkeeper",
+		ReconcileGrace: 2 * time.Minute,
+		Storage:        StorageConfig{Engine: "sqlite", SQLite: "treasury.sqlite"},
 		Chunking: ChunkConfig{
 			FanoutOutputsPerTx: 100,
 			TargetChunks:       50,
@@ -135,6 +139,9 @@ func (c *Config) Validate(pools []pool.Config) error {
 	}
 	if err := c.Chunking.validate(); err != nil {
 		return err
+	}
+	if c.ReconcileGrace <= 0 {
+		return errors.New("treasury.toolbox.reconcile_grace must be > 0")
 	}
 	if len(pools) == 0 {
 		return errors.New("treasury.toolbox: at least one pool is required")
