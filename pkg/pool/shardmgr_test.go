@@ -975,3 +975,93 @@ func TestRunWaitsForBackgroundLeaseReleases(t *testing.T) {
 		assert.Empty(t, got.Owner, "every lease cleared by the time Run returns")
 	}
 }
+
+// spendOut reserves and terminally spends (spend_policy=trust) every row of
+// each shard, leaving the shards mined with no row that can ever become
+// available again.
+func spendOut(t *testing.T, st store.Store, clk *storetest.Clock, poolName string, rows [][]store.Row) {
+	t.Helper()
+	for _, rs := range rows {
+		tok := store.NewToken()
+		storetest.MustReserve(t, st, poolName, rs, tok, clk.Now().Add(time.Hour))
+		n, err := st.Spend(context.Background(), poolName, tok, storetest.Ops(rs), storetest.NewTxID(), true)
+		require.NoError(t, err)
+		require.Equal(t, len(rs), n)
+	}
+}
+
+// TestAdoptionReachesLiveShardBehindSpentOutShards pins the fix for the
+// permanent adoption stall seen under sustained load: fully spent shards stay
+// mined, so AcquireShard (oldest first) keeps handing them out ahead of every
+// shard that still has rows. The only thing that kept them out was the
+// bounded (256-entry) recently-empty exclusion list; once more than that many
+// spent-out shards preceded the live ones, each adoption of an evicted one
+// evicted the next, and the instance cycled through dead shards forever
+// while the store held plenty of available rows.
+func TestAdoptionReachesLiveShardBehindSpentOutShards(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "spent-prefix"
+	const dead = 300 // more than the exclusion list can hold
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, rows := mintN(t, st, clk, poolName, dead, 2)
+	spendOut(t, st, clk, poolName, rows[1:])
+	// Shard 0 is drained but not spent out: one row is still reserved and can
+	// come back, so it must be dropped as before, never retired.
+	storetest.MustReserve(t, st, poolName, rows[0], store.NewToken(), clk.Now().Add(time.Hour))
+	live, _ := storetest.MintShard(t, st, poolName, 5, store.ShardMined)
+	m, alloc := newMgr(t, st, clk, testInstanceConfig(), pc)
+
+	found := false
+	for i := 0; i < 3*dead && !found; i++ {
+		found = m.EnsureRows(ctx)
+	}
+	require.True(t, found, "adoption must get past spent-out shards to the live one")
+	assert.True(t, alloc.Has(live.TxID))
+	assert.Equal(t, 5, alloc.Available())
+
+	got, err := st.GetShard(ctx, poolName, shards[0].TxID)
+	require.NoError(t, err)
+	assert.Equal(t, store.ShardMined, got.Status, "a shard with a non-terminal row is not retired")
+	for _, sh := range shards[1:] {
+		got, err := st.GetShard(ctx, poolName, sh.TxID)
+		require.NoError(t, err)
+		require.Equal(t, store.ShardRetired, got.Status, "spent-out shard %s retired", sh.TxID)
+		assert.Empty(t, got.Owner)
+	}
+}
+
+// TestPoolServesEveryRowPastSpentOutShardsUnderConcurrentLoad is the
+// request-path shape of the same stall: concurrent reserve+spend workers
+// drain more shards than the exclusion list holds while the background
+// FeedOnce and every Reserve's EnsureRows race to adopt. Every row of the
+// pool must still be served.
+func TestPoolServesEveryRowPastSpentOutShardsUnderConcurrentLoad(t *testing.T) {
+	const shardsN, perShard, workers = 320, 2, 8
+	f := newFixture(t, func(c *pool.Config) { c.SpendPolicy = pool.SpendTrust })
+	mintN(t, f.st, f.clk, "main", shardsN, perShard)
+
+	var served, attempts atomic.Int64
+	const total = shardsN * perShard
+	const maxAttempts = 50 * total
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx := context.Background()
+			for served.Load() < total && attempts.Add(1) <= maxAttempts {
+				res, err := f.p.Reserve(ctx, pool.ReserveRequest{Count: 1})
+				if err != nil {
+					continue
+				}
+				_, err = f.p.Spend(ctx, res.Token, outpointsOf(res.Outputs), storetest.NewTxID())
+				assert.NoError(t, err)
+				served.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	assert.Equal(t, int64(total), served.Load(), "every row served (attempts: %d)", attempts.Load())
+}

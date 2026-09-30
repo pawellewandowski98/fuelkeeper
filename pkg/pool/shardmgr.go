@@ -386,7 +386,10 @@ func (m *ShardManager) markRecentlyEmpty(txid chainhash.Hash, at time.Time) {
 //
 // It returns false when nothing was adoptable, the manager is shutting down
 // (the shard is released immediately without ever being tracked), or the
-// adopted shard turned out empty and was released again.
+// adopted shard turned out empty and was released again: excluded from
+// re-adoption for emptyExclusion (drop reason "empty"), or, when every one of
+// its rows is terminal, retired in the store instead (drop reason "retired";
+// see retireIfSpentOut).
 func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 	now := m.clock.Now()
 	until := now.Add(m.cfg.LeaseTTL)
@@ -434,12 +437,85 @@ func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 	}
 	if loaded == 0 {
 		// Adopted but immediately empty: not counted as a real adoption.
+		if m.retireIfSpentOut(ctx, sh) {
+			// Out of the serve set for good: AcquireShard never returns it
+			// again, so it needs no exclusion entry (which would only evict
+			// one that is still useful).
+			m.drop(ctx, sh.TxID, false, "retired")
+			m.releaseLease(ctx, sh.TxID)
+			return false, nil
+		}
 		m.drop(ctx, sh.TxID, true, "empty")
 		return false, nil
 	}
 	m.adoptionsOK.Inc()
 	m.log.Debug("adopted shard", "txid", sh.TxID.String(), "rows", loaded)
 	return true, nil
+}
+
+// retireIfSpentOut marks a mined shard retired (store.ShardRetired: all rows
+// terminal) when every one of its rows is spent or invalid, and reports
+// whether the shard is now terminal. Nothing else ever retires a shard whose
+// fuel has been consumed, and AcquireShard hands out the oldest adoptable
+// shard first, so without this spent-out shards stay mined forever and pile
+// up ahead of every shard that still has rows. The recently-empty exclusion
+// list is the only other thing that keeps adoption away from them, and it is
+// bounded (maxRecentlyEmpty): once more spent-out shards precede the live
+// ones than it holds, each adoption of an evicted one evicts the next and
+// the instance cycles through dead shards forever.
+//
+// Terminal row states never change, so the check cannot race a row coming
+// back. Rows are looked up at vouts 0..Size-1 (how every treasury lays a
+// split out); if fewer than Size rows are found there the shard is left
+// alone, as it is on any store error, when a row is not terminal (reserved
+// or quarantined rows may still return to available) or when the shard is
+// not mined (serve_policy=any may adopt unmined shards, whose status the
+// watcher still owns).
+func (m *ShardManager) retireIfSpentOut(ctx context.Context, sh *store.Shard) bool {
+	if sh.Status != store.ShardMined || sh.Size <= 0 {
+		return false
+	}
+	batch := m.st.Capabilities().MaxBatch
+	if batch <= 0 {
+		batch = sh.Size
+	}
+	found := 0
+	ops := make([]store.Outpoint, 0, min(batch, sh.Size))
+	for from := 0; from < sh.Size; from += batch {
+		ops = ops[:0]
+		for v := from; v < min(from+batch, sh.Size); v++ {
+			ops = append(ops, store.Outpoint{TxID: sh.TxID, Vout: uint32(v)}) //nolint:gosec // v < Size, a small int
+		}
+		rows, err := m.st.GetRows(ctx, m.pc.Name, ops)
+		if err != nil {
+			if ctx.Err() == nil {
+				m.log.Warn("check spent-out shard", "txid", sh.TxID.String(), "err", err)
+			}
+			return false
+		}
+		for _, r := range rows {
+			if !r.State.Terminal() {
+				return false
+			}
+		}
+		found += len(rows)
+	}
+	if found != sh.Size {
+		return false
+	}
+	err := m.st.UpdateShard(ctx, m.pc.Name, sh.TxID, store.ShardRetired, nil)
+	switch {
+	case err == nil:
+		m.log.Debug("retired spent-out shard", "txid", sh.TxID.String())
+		return true
+	case errors.Is(err, store.ErrTerminalShard): // retired or invalidated meanwhile
+		return true
+	default:
+		if ctx.Err() == nil {
+			m.log.Warn("retire spent-out shard", "txid", sh.TxID.String(), "err", err)
+		}
+		return false
+	}
 }
 
 // loadRows pages ListAvailable into the allocator and returns how many rows
