@@ -1,8 +1,18 @@
 // Package postgres implements store.Store on PostgreSQL using pgx.
 //
-// Every mutation is a single statement whose WHERE clause re-asserts the row's
-// current state, so concurrent writers serialise on the row and the loser simply
-// matches zero rows. Batches use unnest() to pair per-op values positionally.
+// Every batch mutation (Reserve, Release, Spend, Resolve, and RetireShard's
+// row cascade) issues one single-row, primary-key point UPDATE per op,
+// pipelined as one pgx.Batch inside a single transaction, always in ascending
+// (txid, vout) order (see lessOutpoint in rows.go). A combined multi-row
+// "UPDATE ... FROM unnest(...)" statement lets Postgres's planner pick
+// whatever row-lock order it likes; two concurrent batches that touch
+// overlapping rows in different orders can then deadlock (each waiting on a
+// row the other already holds). Sequencing every batch's own per-row updates
+// into the same global lock-acquisition order rules that out: no two
+// transactions can ever be waiting on each other in a cycle. Every other
+// mutation is a single-row statement whose WHERE clause re-asserts the row's
+// current state (and, where relevant, its owner), so a concurrent loser
+// simply matches zero rows.
 package postgres
 
 import (
@@ -10,6 +20,9 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,17 +33,56 @@ import (
 )
 
 //go:embed schema.sql
-var schemaSQL string
+var schemaV1 string
 
-// advisoryLockKey serialises schema application across replicas.
+// migrations holds each schema version's DDL, in order: migrations[0] is
+// version 1 (the current, and so far only, schema). Only versions greater
+// than the highest already-applied version (tracked in fuel_schema_version)
+// run, and every one of them runs inside the same advisory-locked transaction
+// as its own version-tracking insert, so a crash mid-migration never leaves a
+// version recorded as applied when it partially isn't (or vice versa).
+//
+// A future migration that adds an index to a table already large in
+// production must NOT go in this slice as-is: Postgres forbids
+// CREATE INDEX CONCURRENTLY inside a transaction block, and a plain
+// CREATE INDEX here would hold a long lock on that table for the length of
+// the migration. Ship the index as a separate, untracked "online" step
+// (CREATE INDEX CONCURRENTLY, run standalone, outside migrate) applied
+// manually before the version bump that starts relying on it; the tracked
+// migration itself should then only contain whatever bookkeeping/constraint
+// change depends on the index already existing.
+var migrations = []string{schemaV1}
+
+// versionTableDDL creates the schema-version bookkeeping table itself; it is
+// not part of migrations because it must exist before we can even ask which
+// migrations have already run.
+const versionTableDDL = `
+CREATE TABLE IF NOT EXISTS fuel_schema_version (
+  version    INTEGER PRIMARY KEY,
+  applied_at TIMESTAMPTZ NOT NULL
+);`
+
+// advisoryLockKey serialises schema migration across replicas racing New at
+// the same time.
 const advisoryLockKey int64 = 0x6675656c6b656570 // "fuelkeep"
 
 const maxBatch = 1000
 
+// maxConcurrentFlushes is Capabilities().MaxConcurrentFlushes: how many
+// Reserve-shaped calls may usefully run in parallel against this backend.
+const maxConcurrentFlushes = 8
+
+// defaultMaxConns is used when Config.MaxConns is 0: enough headroom above
+// maxConcurrentFlushes for the pool's own background/admin connections
+// (migrate, Stats, ListShards, the reaper's Quarantine/ListQuarantined loop,
+// ...) without assuming the caller wants to dominate a shared Postgres
+// instance's connection budget.
+const defaultMaxConns = maxConcurrentFlushes + 4
+
 // Config configures New.
 type Config struct {
 	DSN      string
-	MaxConns int32 // 0 = pgxpool default
+	MaxConns int32 // 0 = defaultMaxConns (maxConcurrentFlushes + 4)
 }
 
 // Option configures New.
@@ -55,6 +107,8 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 	}
 	if cfg.MaxConns > 0 {
 		pc.MaxConns = cfg.MaxConns
+	} else {
+		pc.MaxConns = defaultMaxConns
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, pc)
 	if err != nil {
@@ -71,18 +125,41 @@ func New(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 	return s, nil
 }
 
+// migrate applies every not-yet-applied schema version inside one transaction
+// holding a transaction-scoped advisory lock (pg_advisory_xact_lock), so the
+// lock always releases when the transaction ends (commit, rollback, or the
+// connection dying) instead of leaking forever the way a session-scoped
+// pg_advisory_lock would if the process died between acquiring it and its
+// paired unlock call.
 func (s *Store) migrate(ctx context.Context) error {
-	conn, err := s.pool.Acquire(ctx)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("postgres: acquire for migrate: %w", err)
+		return fmt.Errorf("postgres: begin migrate: %w", err)
 	}
-	defer conn.Release()
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", advisoryLockKey); err != nil {
+	defer func() { _ = tx.Rollback(ctx) }() // no-op once Commit has succeeded
+
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLockKey); err != nil {
 		return fmt.Errorf("postgres: advisory lock: %w", err)
 	}
-	defer func() { _, _ = conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", advisoryLockKey) }()
-	if _, err := conn.Exec(ctx, schemaSQL); err != nil {
-		return fmt.Errorf("postgres: apply schema: %w", err)
+	if _, err := tx.Exec(ctx, versionTableDDL); err != nil {
+		return fmt.Errorf("postgres: create schema version table: %w", err)
+	}
+	var applied int
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM fuel_schema_version`).Scan(&applied); err != nil {
+		return fmt.Errorf("postgres: read schema version: %w", err)
+	}
+	now := time.Now()
+	for i := applied; i < len(migrations); i++ {
+		version := i + 1
+		if _, err := tx.Exec(ctx, migrations[i]); err != nil {
+			return fmt.Errorf("postgres: apply schema v%d: %w", version, err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO fuel_schema_version (version, applied_at) VALUES ($1, $2)`, version, now); err != nil {
+			return fmt.Errorf("postgres: record schema v%d: %w", version, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit migrate: %w", err)
 	}
 	return nil
 }
@@ -92,38 +169,84 @@ func (s *Store) Ping(ctx context.Context) error { return wrap(s.pool.Ping(ctx)) 
 
 // Capabilities reports Postgres limits.
 func (s *Store) Capabilities() store.Caps {
-	return store.Caps{MaxConcurrentFlushes: 8, MaxBatch: maxBatch, AtomicBatch: true, MultiProcess: true}
+	return store.Caps{MaxConcurrentFlushes: maxConcurrentFlushes, MaxBatch: maxBatch, AtomicBatch: true, MultiProcess: true}
 }
 
-// Close closes the pool. Idempotent.
+// Close closes the pool. pgxpool.Pool.Close is itself idempotent (guarded by
+// a sync.Once), so Close just delegates to it directly: any store method
+// called after Close returns the pool's own "closed pool" error (wrapped as
+// store.ErrUnavailable by wrap), never a nil-pointer panic from a manually
+// nilled-out field.
 func (s *Store) Close() error {
-	if s.pool != nil {
-		s.pool.Close()
-		s.pool = nil
-	}
+	s.pool.Close()
 	return nil
 }
 
-// Pool exposes the underlying pool for tests and diagnostics.
-func (s *Store) Pool() *pgxpool.Pool { return s.pool }
-
-// wrap maps transient database errors to store.ErrUnavailable and passes the rest through.
+// wrap maps transient database errors to store.ErrUnavailable and passes the
+// rest through unchanged.
 func wrap(err error) error {
 	if err == nil {
 		return nil
 	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		switch pgErr.Code {
-		case "40001", "40P01", "55P03", "57014", "08000", "08003", "08006", "53300":
-			return fmt.Errorf("%w: %w", store.ErrUnavailable, err)
-		}
-		return err
-	}
-	if pgconn.SafeToRetry(err) || errors.Is(err, context.DeadlineExceeded) {
+	if isTransient(err) {
 		return fmt.Errorf("%w: %w", store.ErrUnavailable, err)
 	}
 	return err
+}
+
+// isTransient reports whether err represents a failure a caller may safely
+// retry: connection loss or admin/crash shutdown, serialization or deadlock
+// aborts, lock or statement timeouts, a read-only-transaction rejection
+// (failover to a replica mid-transaction), or any error whose actual
+// server-side effect is unknown (a broken connection, or a failed commit).
+// Every write in this package is either idempotent (Reserve) or a checked CAS
+// that reports how many rows it actually changed (Release/Spend/Resolve/
+// RetireShard/...), so retrying on an "unknown outcome" error is always safe:
+// a write that did land is simply reported as already applied (Reserve) or
+// matches zero rows the second time (everything else).
+func isTransient(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case strings.HasPrefix(pgErr.Code, "08"): // Class 08 — Connection Exception
+			return true
+		case strings.HasPrefix(pgErr.Code, "53"): // Class 53 — Insufficient Resources
+			return true
+		}
+		switch pgErr.Code {
+		case "57P01", // admin_shutdown
+			"57P02", // crash_shutdown
+			"57P03", // cannot_connect_now
+			"57014", // query_canceled (statement_timeout, pg_cancel_backend, ...)
+			"40001", // serialization_failure
+			"40P01", // deadlock_detected
+			"55P03", // lock_not_available (lock_timeout, SKIP LOCKED contention aside)
+			"25006": // read_only_sql_transaction (this connection failed over to a replica)
+			return true
+		}
+		return false // a well-formed, non-transient database error: e.g. 23505 unique_violation
+	}
+	var connectErr *pgconn.ConnectError
+	if errors.As(err, &connectErr) {
+		return true
+	}
+	if pgconn.Timeout(err) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if errors.Is(err, pgx.ErrTxCommitRollback) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return false
 }
 
 // tx runs fn in a transaction.
@@ -136,7 +259,16 @@ func (s *Store) tx(ctx context.Context, fn func(pgx.Tx) error) error {
 		_ = tx.Rollback(ctx)
 		return wrap(err)
 	}
-	return wrap(tx.Commit(ctx))
+	if err := tx.Commit(ctx); err != nil {
+		// The commit's server-side outcome is unknown: a connection failure here
+		// could mean the transaction committed just before the connection broke, or
+		// never reached the server at all. Every write in this package is safe to
+		// retry regardless (see isTransient), so a commit failure is always
+		// store.ErrUnavailable, independent of the specific error code wrap would
+		// otherwise classify it under.
+		return fmt.Errorf("%w: %w", store.ErrUnavailable, err)
+	}
+	return nil
 }
 
 // ---- helpers shared by shards.go / rows.go ----
@@ -148,7 +280,7 @@ func utc(t *time.Time) time.Time {
 	return t.UTC()
 }
 
-func hashBytes(hs []store.Outpoint) ([][]byte, []int32) {
+func outpointArrays(hs []store.Outpoint) ([][]byte, []int32) {
 	txids := make([][]byte, len(hs))
 	vouts := make([]int32, len(hs))
 	for i, op := range hs {
@@ -156,4 +288,24 @@ func hashBytes(hs []store.Outpoint) ([][]byte, []int32) {
 		vouts[i] = int32(op.Vout) //nolint:gosec // vout is bounded by tx output count
 	}
 	return txids, vouts
+}
+
+// execBatch sends batch on tx and executes and consumes its n queued
+// statements in the order they were queued (see lessOutpoint in rows.go for
+// why that order matters), returning the sum of RowsAffected across all of
+// them. Every caller queues plain Exec-style statements (no RETURNING);
+// Reserve queues QueryRow-style statements instead, since it needs each row's
+// returned expires_at, so it drives its own batch loop.
+func execBatch(ctx context.Context, tx pgx.Tx, batch *pgx.Batch, n int) (int, error) {
+	br := tx.SendBatch(ctx, batch)
+	total := 0
+	for i := 0; i < n; i++ {
+		tag, err := br.Exec()
+		if err != nil {
+			_ = br.Close()
+			return 0, err
+		}
+		total += int(tag.RowsAffected())
+	}
+	return total, br.Close()
 }

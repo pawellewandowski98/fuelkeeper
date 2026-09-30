@@ -117,7 +117,7 @@ func (s *Store) GetRows(ctx context.Context, pool string, ops []store.Outpoint) 
 	if err := store.ValidateOutpoints(ops, maxBatch); err != nil {
 		return nil, err
 	}
-	txids, vouts := hashBytes(ops)
+	txids, vouts := outpointArrays(ops)
 	return s.queryRows(ctx, `
 		SELECT `+rowCols+` FROM fuel_rows r
 		  JOIN unnest($2::bytea[], $3::int4[]) AS k(txid, vout) ON r.txid = k.txid AND r.vout = k.vout
@@ -190,24 +190,30 @@ func (s *Store) updateReserved(ctx context.Context, pool string, token store.Tok
 	}
 	sorted := sortedOutpoints(ops)
 	now := s.now()
-	sqlText := `UPDATE fuel_rows SET ` + setClause + ` WHERE pool = $1 AND txid = $2 AND vout = $3 AND state = 1 AND reserved_by = $4`
+	// (state = 1) IS TRUE, not state = 1: this predicate targets exactly one row
+	// via its primary key (txid, vout), but a plain "state = 1" is *exactly* the
+	// partial predicate on fuel_rows_expiry (pool, expires_at, txid, vout) WHERE
+	// state = 1. Postgres's partial-index-match check is a syntactic proof, not a
+	// cost comparison: once it can prove the WHERE clause implies state = 1, the
+	// index becomes an eligible plan, and a generic (parameter-value-blind) plan
+	// -- which every backend connection settles into after a handful of
+	// executions of the same statement text -- routinely picks it whenever
+	// ANALYZE last ran with few reserved rows, turning an O(log n) PK lookup into
+	// an O(reserved rows in pool) scan (measured: 132ms vs 18ms per call, see the
+	// Task 7 review). Wrapping the comparison in IS TRUE (a no-op given state is
+	// NOT NULL) changes its shape just enough that the proof no longer holds, so
+	// the partial index is never considered and the PK is used unconditionally.
+	sqlText := `UPDATE fuel_rows SET ` + setClause + ` WHERE pool = $1 AND txid = $2 AND vout = $3 AND (state = 1) IS TRUE AND reserved_by = $4`
 	batch := &pgx.Batch{}
 	for _, op := range sorted {
 		args := append([]any{pool, op.TxID[:], int32(op.Vout), token[:], now}, extra...) //nolint:gosec // bounded
 		batch.Queue(sqlText, args...)
 	}
-	n := 0
+	var n int
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		br := tx.SendBatch(ctx, batch)
-		for range sorted {
-			tag, err := br.Exec()
-			if err != nil {
-				_ = br.Close()
-				return err
-			}
-			n += int(tag.RowsAffected())
-		}
-		return br.Close()
+		var err error
+		n, err = execBatch(ctx, tx, batch, len(sorted))
+		return err
 	})
 	if err != nil {
 		return 0, err
@@ -296,24 +302,22 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 		set = `state = 3, spent_by = $5, updated_at = $4`
 		extra = []any{spentBy[:]}
 	}
-	sqlText := `UPDATE fuel_rows SET ` + set + ` WHERE pool = $1 AND txid = $2 AND vout = $3 AND state = 2`
+	// (state = 2) IS TRUE, not state = 2: see the comment in updateReserved. This
+	// predicate exactly matches fuel_rows_quar's partial condition, so a plain
+	// "state = 2" is eligible for that index once Postgres settles on a generic
+	// plan for this statement text, even though the primary key already gives an
+	// O(log n) lookup for this exact (pool, txid, vout).
+	sqlText := `UPDATE fuel_rows SET ` + set + ` WHERE pool = $1 AND txid = $2 AND vout = $3 AND (state = 2) IS TRUE`
 	batch := &pgx.Batch{}
 	for _, op := range sorted {
 		args := append([]any{pool, op.TxID[:], int32(op.Vout), now}, extra...) //nolint:gosec // bounded
 		batch.Queue(sqlText, args...)
 	}
-	n := 0
+	var n int
 	err := s.tx(ctx, func(tx pgx.Tx) error {
-		br := tx.SendBatch(ctx, batch)
-		for range sorted {
-			tag, err := br.Exec()
-			if err != nil {
-				_ = br.Close()
-				return err
-			}
-			n += int(tag.RowsAffected())
-		}
-		return br.Close()
+		var err error
+		n, err = execBatch(ctx, tx, batch, len(sorted))
+		return err
 	})
 	if err != nil {
 		return 0, err

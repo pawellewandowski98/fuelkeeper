@@ -60,7 +60,12 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 			shard.Pool, shard.TxID[:], int32(shard.Size), int64(shard.Denomination), int16(shard.LockMode), int16(shard.Status), shard.BEEF, now) //nolint:gosec // validated ranges
 		if err != nil {
 			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "23505" { // fuel_shards_txid: same txid under another pool
+			// Match the specific constraint, not any 23505: the ON CONFLICT target
+			// above already absorbs a (pool, txid) replay, so the only unique
+			// violation that can still reach here is fuel_shards_txid (same txid
+			// under a different pool) — but naming it precisely means a future
+			// constraint on this table can't be silently misreported as ErrShardExists.
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "fuel_shards_txid" {
 				return store.ErrShardExists
 			}
 			return err
@@ -199,22 +204,19 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 		if len(vouts) == 0 {
 			return nil
 		}
+		// (state IN (0,1,2)) IS TRUE, not state IN (0,1,2): see the comment in
+		// updateReserved (rows.go). This predicate exactly matches
+		// fuel_rows_shard_live's partial condition, and unlike the discovery read
+		// above (which legitimately wants that index, since it's scanning a whole
+		// shard), this is a per-row point update keyed by the primary key.
 		batch := &pgx.Batch{}
 		for _, v := range vouts {
 			batch.Queue(`
 				UPDATE fuel_rows SET state=4, updated_at=$4
-				 WHERE pool=$1 AND txid=$2 AND vout=$3 AND state IN (0,1,2)`, pool, txid[:], v, now)
+				 WHERE pool=$1 AND txid=$2 AND vout=$3 AND (state IN (0,1,2)) IS TRUE`, pool, txid[:], v, now)
 		}
-		br := tx.SendBatch(ctx, batch)
-		for range vouts {
-			tag, err := br.Exec()
-			if err != nil {
-				_ = br.Close()
-				return err
-			}
-			n += int(tag.RowsAffected())
-		}
-		return br.Close()
+		n, err = execBatch(ctx, tx, batch, len(vouts))
+		return err
 	})
 	if errors.Is(err, store.ErrNotFound) {
 		return 0, store.ErrNotFound
@@ -280,24 +282,34 @@ func (s *Store) RenewShard(ctx context.Context, pool string, txid chainhash.Hash
 	if err := store.ValidateRenewUntil(until); err != nil {
 		return store.ShardHead{}, err
 	}
-	var owner string
+	// Only ever write when holder is already the owner: a CASE-guarded
+	// unconditional UPDATE would still create a new (dead) tuple version for
+	// every non-owner call against a busy, contended shard, since Postgres's
+	// MVCC writes a new row version whenever an UPDATE statement matches a row
+	// at all, whether or not any column's value actually changes.
 	var stat int16
 	var version int64
 	err := s.pool.QueryRow(ctx, `
-		UPDATE fuel_shards
-		   SET lease_until = CASE WHEN owner = $3 THEN $4 ELSE lease_until END
-		 WHERE pool = $1 AND txid = $2
-		RETURNING owner, status, version`, pool, txid[:], holder, until).Scan(&owner, &stat, &version)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return store.ShardHead{}, store.ErrNotFound
+		UPDATE fuel_shards SET lease_until = $4
+		 WHERE pool = $1 AND txid = $2 AND owner = $3
+		RETURNING status, version`, pool, txid[:], holder, until).Scan(&stat, &version)
+	if err == nil {
+		return store.ShardHead{Status: store.ShardStatus(stat), Version: version}, nil //nolint:gosec // small enum
 	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return store.ShardHead{}, wrap(err)
+	}
+	// Zero rows matched: either the shard doesn't exist, or holder isn't the
+	// current owner. Distinguish with a read instead of folding both cases into
+	// the write's WHERE clause, so a non-owner call never touches the row.
+	exists, err := s.shardExists(ctx, pool, txid)
 	if err != nil {
 		return store.ShardHead{}, wrap(err)
 	}
-	if owner != holder {
-		return store.ShardHead{}, store.ErrNotOwner
+	if !exists {
+		return store.ShardHead{}, store.ErrNotFound
 	}
-	return store.ShardHead{Status: store.ShardStatus(stat), Version: version}, nil //nolint:gosec // small enum
+	return store.ShardHead{}, store.ErrNotOwner
 }
 
 // ReleaseShard implements store.Store.
@@ -308,19 +320,34 @@ func (s *Store) ReleaseShard(ctx context.Context, pool string, txid chainhash.Ha
 	if err := store.ValidateHolder(holder); err != nil {
 		return err
 	}
+	// See the comment in RenewShard: only write when holder actually owns the
+	// lease, so a non-owner's no-op release never creates a dead tuple.
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE fuel_shards
-		   SET owner = CASE WHEN owner = $3 THEN '' ELSE owner END,
-		       lease_until = CASE WHEN owner = $3 THEN NULL ELSE lease_until END,
-		       updated_at = CASE WHEN owner = $3 THEN $4 ELSE updated_at END
-		 WHERE pool = $1 AND txid = $2`, pool, txid[:], holder, s.now())
+		UPDATE fuel_shards SET owner = '', lease_until = NULL, updated_at = $4
+		 WHERE pool = $1 AND txid = $2 AND owner = $3`, pool, txid[:], holder, s.now())
 	if err != nil {
 		return wrap(err)
 	}
-	if tag.RowsAffected() == 0 {
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	// Zero rows matched: either the shard doesn't exist (ErrNotFound) or holder
+	// isn't the owner, which the contract defines as a legitimate no-op.
+	exists, err := s.shardExists(ctx, pool, txid)
+	if err != nil {
+		return wrap(err)
+	}
+	if !exists {
 		return store.ErrNotFound
 	}
 	return nil
+}
+
+// shardExists reports whether (pool, txid) names a shard, regardless of status.
+func (s *Store) shardExists(ctx context.Context, pool string, txid chainhash.Hash) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM fuel_shards WHERE pool = $1 AND txid = $2)`, pool, txid[:]).Scan(&exists)
+	return exists, err
 }
 
 // ListShards implements store.Store.

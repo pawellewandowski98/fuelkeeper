@@ -44,7 +44,11 @@ func isolatedStore(t *testing.T, admin *pgxpool.Pool, dsn string, now func() tim
 	if strings.Contains(dsn, "?") {
 		sep = "&"
 	}
-	s, err := postgres.New(ctx, postgres.Config{DSN: dsn + sep + "search_path=" + schema, MaxConns: 8}, postgres.WithClock(now))
+	// MaxConns: 4, not the package default: RunSuite runs 28 subtests in
+	// parallel, each opening its own pool, and CI's Postgres service runs with
+	// the default max_connections=100 (only the local docker-compose sets it to
+	// 300), so 28 * MaxConns must stay well under 100.
+	s, err := postgres.New(ctx, postgres.Config{DSN: dsn + sep + "search_path=" + schema, MaxConns: 4}, postgres.WithClock(now))
 	require.NoError(t, err)
 	return s
 }
