@@ -45,6 +45,92 @@ backoff (see below). A TypeScript or other HTTP client should treat the same
 set of codes the same way: wait `retry_after` seconds (jittered) and retry
 the same reserve call with a fresh token.
 
+## When Your Broadcast Fails
+
+A consumer, not FuelKeeper, is the one who learns what actually happened to
+its own broadcast (accepted, rejected as invalid, or rejected as a
+double-spend), so a consumer is responsible for clearing its own
+reservation once it knows. `pkg/client`'s `Client.Settle` is that contract
+made concrete: it maps one `Settlement` (what your broadcast attempt did) to
+the one FuelKeeper call the outcome calls for, so you never have to work out
+spend-vs-release under pressure yourself.
+
+```go
+func (c *Client) Settle(
+    ctx context.Context, pool, token string, outpoints []string, s Settlement,
+) (int, error)
+
+type Settlement struct {
+    Outcome        Outcome  // see the Outcome constants below
+    TxID           string   // your own txid; required for Broadcast, and for
+                             // DoubleSpend when CompetingTxIDs is empty
+    CompetingTxIDs []string // known double-spenders of TxID, most preferred
+                             // first; only consulted for DoubleSpend
+}
+```
+
+`Outcome` is one of `OutcomeBroadcast`, `OutcomeNotBroadcast`,
+`OutcomeDoubleSpend` or `OutcomeUnknown`. A `TxID` `Settle` needs but does
+not have, or that is not 64 lowercase hex characters, is
+`ErrSettleTxIDRequired` -- caught client-side before it round-trips to the
+server for the same error.
+
+| Your broadcast attempt | Go: `client.Settle(..., Settlement{...})` | TS wallet-toolbox equivalent | What FuelKeeper does |
+|---|---|---|---|
+| Gateway accepted the transaction | `Outcome: OutcomeBroadcast, TxID: txid` | `createAction` returned normally (no `WERR_REVIEW_ACTIONS`), or a review result with status `success` | `Spend(token, outpoints, txid)`: reserved -> quarantined (hint), or straight to `spent` under `spend_policy: trust` |
+| The transaction provably never reached a gateway: it was never sent, or a gateway said so definitively -- a well-formed rejection naming no competing transaction (bad format/script/fee/policy; the output itself is untouched), or backpressure/shedding before the request was ever accepted | `Outcome: OutcomeNotBroadcast` | `WERR_REVIEW_ACTIONS` review result status `invalidTx` | `Release(token, outpoints)`: reserved -> available (or, under `release_policy: verify`, quarantined and requeued once the oracle/reaper confirms it -- see `docs/OPERATIONS.md`'s oracle x policy table) |
+| Rejected because an input was already spent, or a competing transaction is known | `Outcome: OutcomeDoubleSpend, TxID: txid, CompetingTxIDs: [...]` (the first well-formed competitor is reported; falls back to `TxID` when none of `CompetingTxIDs` is well-formed) | `WERR_REVIEW_ACTIONS` review result status `doubleSpend` (`CompetingTxIDs` from its `competingTxs`) | `Spend(token, outpoints, hint)`: reserved -> quarantined (hint); the reaper resolves it to `spent` once it can prove the fuel output is gone (a mined competitor, or the hint itself rejected with inputs spent) |
+| Fate not known: the request may have already reached the gateway and its outcome is simply unclear -- a transport error or timeout *after* sending, a `5xx`, or the gateway's own review service failed | `Outcome: OutcomeUnknown` | `WERR_REVIEW_ACTIONS` review result status `serviceError`, or the action's own deadline expired | No call. The reservation is left in place; if it is never settled, it expires and resolves through the reaper's usual quarantine/requeue path (see below) |
+
+**Do not treat an ambiguous failure as "not broadcast."** If the request
+might have reached the gateway before failing, report `OutcomeUnknown`, not
+`OutcomeNotBroadcast`: releasing an output that was in fact already
+broadcast hands it to the next consumer, whose own attempt to spend it then
+fails as a double-spend. `OutcomeNotBroadcast` is only for a gateway's
+definitive "no" (or a request that never went out at all).
+
+**Against arcade specifically**, a double-spend is not knowable at
+submission time: POST /tx's synchronous responses never carry a competing
+txid, so a consumer submitting straight through arcade reports
+`OutcomeBroadcast` the moment arcade accepts the transaction, exactly like
+any other accepted submission. If a competing transaction turns out to
+exist, that surfaces later, via GET /tx answering REJECTED (ARC code 466) --
+discovered by whoever next polls the transaction's fate (FuelKeeper's own
+reaper, under `spend_policy: verify`), not by the original consumer calling
+`Settle` a second time. `OutcomeDoubleSpend` exists for gateways that do name
+a competitor synchronously, and for a go-wallet-toolbox-backed consumer
+whose own asynchronous review process (`WERR_REVIEW_ACTIONS`) learns of one
+after the fact but before it calls `Settle`.
+
+**Expiry behaviour.** A reservation nobody settles (no `spend`, `release` or
+`Settle` call before `expires_at`) is quarantined by the reaper like any
+other expired reservation: with an arcade-only oracle (the expected shape --
+see `docs/OPERATIONS.md`'s "Oracle kinds and policies"), it requeues to
+`available` after `jobs.reaper.unknown_requeue_age` (10 m default) under a
+pool's `expiry_policy: requeue` (default), or stays quarantined for an
+operator under `expiry_policy: hold`. A hinted row (you called `Spend` or
+`Settle` under `spend_policy: verify`) instead follows its own transaction's
+fate, requeuing after `hint_max_wait` (24 h default) only as a last resort
+if that transaction is never mined or classified. Either way, pool capacity
+never leaks: an unspent output always makes its way back.
+
+> **This contract is the safety boundary.** FuelKeeper's reaper trusts the
+> outcome you report, within these two invariants:
+>
+> - **Never `Release` on a double-spend.** A spent output released back to
+>   the pool would be reserved by the next consumer, whose own broadcast
+>   then fails the exact same way -- and the one after that, and the one
+>   after that (a poison pill).
+> - **Never `Spend` on a rejection that names no competing transaction.**
+>   Under `spend_policy: trust`, a `Spend` is terminal the moment the server
+>   accepts it -- no oracle ever re-examines it -- so an invalid-but-not-
+>   double-spent output would be burned rather than returned to the pool for
+>   reuse.
+>
+> `Settle` exists precisely so you never have to get this mapping right by
+> hand under pressure: pass it the `Outcome` you actually observed and it
+> picks the correct call.
+
 ## Go Recipe (go-wallet-toolbox)
 
 ```go
@@ -106,14 +192,17 @@ if err != nil {
     return err
 }
 
-// Report the spend (best-effort hint; the oracle proves it).
+// Report the outcome via Settle rather than calling Spend/Release directly
+// -- see "When Your Broadcast Fails" above for the full outcome table and
+// why getting spend-vs-release backwards is costly.
 outpoints := make([]string, len(res.Outputs))
 for i, o := range res.Outputs {
     outpoints[i] = o.Outpoint
 }
-if _, err := c.Spend(ctx, "main", res.Token, outpoints, result.Txid.String()); err != nil {
+s := client.Settlement{Outcome: client.OutcomeBroadcast, TxID: result.Txid.String()}
+if _, err := c.Settle(ctx, "main", res.Token, outpoints, s); err != nil {
     // Non-fatal: your transaction already broadcast. Log and move on; see
-    // "On spend failure" below.
+    // "On Errors" below.
 }
 ```
 
@@ -130,7 +219,9 @@ go-wallet-toolbox `*wallet.Wallet` implements it directly.
 - `client.New(baseURL string, opts ...client.Option)` with
   `client.WithAPIKey(key)`, `client.WithHTTPClient(hc)`, `client.WithObserver(fn)`.
 - `c.Reserve(ctx, pool, req)`, `c.ReserveWithRetry(ctx, pool, req, opts...)`,
-  `c.Release(ctx, pool, token, outpoints)`, `c.Spend(ctx, pool, token, outpoints, txid)`.
+  `c.Release(ctx, pool, token, outpoints)`, `c.Spend(ctx, pool, token, outpoints, txid)`,
+  `c.Settle(ctx, pool, token, outpoints, client.Settlement{Outcome, TxID, CompetingTxIDs})`
+  -- see "When Your Broadcast Fails" above.
 - `client.InputBEEF(ctx, pool, res)` merges every shard's BEEF (fetched
   through the client's own per-shard cache, so an already-cached shard costs
   nothing).

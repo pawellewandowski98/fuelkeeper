@@ -6,13 +6,15 @@ fees. Fuel is spendable with unlocking data prepared in advance (a hash-puzzle
 preimage by default), so no signing service sits on the hot path.
 
 Status: Plan 5 complete: the go-wallet-toolbox treasury, BRC-29 funding
-and the arcade/teranode/composite oracles (see `docs/TREASURY.md` and
-`docs/FUNDING.md`), on top of the HTTP API, Go client and `serve` command
-(Plan 3) and the pool core (Plan 2): hash-puzzle fuel, sharded per-instance
-ownership with batched (group-commit) reservations, and background jobs
-(reaper, proof watcher, minter) behind leased runners. A module importing
-`pkg/config` or `pkg/treasury/...` must copy the three `replace` lines from
-this `go.mod`. Design:
+and the chain oracle (see `docs/TREASURY.md` and `docs/FUNDING.md`) -- by
+default an arcade-only oracle when `treasury.kind: toolbox` is configured; a
+direct teranode connection is never assumed, only an optional, opt-in
+accelerator (`oracle.kind: composite` with `teranode_url`) -- on top of the
+HTTP API, Go client and `serve` command (Plan 3) and the pool core (Plan 2):
+hash-puzzle fuel, sharded per-instance ownership with batched (group-commit)
+reservations, and background jobs (reaper, proof watcher, minter) behind
+leased runners. A module importing `pkg/config` or `pkg/treasury/...` must
+copy the three `replace` lines from this `go.mod`. Design:
 `docs/superpowers/specs/2026-09-29-fuelkeeper-design.md`.
 
 ## Develop
@@ -87,9 +89,21 @@ Pool behaviour that operators should know:
 - **Terminal states.** A row becomes `spent` only when the oracle proves a
   mined spend (or directly under `spend_policy=trust`). Everything else stays
   `quarantined` and is visible through `fuelkeeper_quarantine_oldest_age_seconds`.
-  With no oracle configured, expired reservations stay quarantined until an
-  operator acts, so `release_policy=verify` and `spend_policy=verify` need an
-  oracle.
+  With `oracle.kind: none`, `release_policy=verify` and `spend_policy=verify`
+  are rejected at config load; with any other oracle kind (including the
+  default arcade-only shape), an unhinted quarantined row with no verdict
+  instead requeues itself after `jobs.reaper.unknown_requeue_age` (a pool's
+  `expiry_policy: hold` keeps it quarantined for an operator instead). See
+  `docs/OPERATIONS.md#oracle-kinds-and-policies`.
+- **The settlement contract.** A consumer -- not FuelKeeper -- learns what
+  actually happened to its own broadcast, so it is responsible for clearing
+  its reservation once it knows: the Go client's `client.Settle` maps that
+  outcome (broadcast, rejected, double-spent, or unknown) to the right
+  `spend`/`release` call, and a TypeScript/go-wallet-toolbox consumer keeps
+  the same contract via its own review results. Getting this backwards is
+  costly (a released double-spent output poisons the pool for the next
+  consumer), so see `docs/CLIENTS.md#when-your-broadcast-fails` before
+  wiring up your own reporting.
 - **Job leases.** Each background job (reaper, watcher, minter) runs on one
   instance at a time under a store lease named `jobs/<name>`. The lease TTL
   must exceed the longest job interval plus its run time, or leadership flaps.

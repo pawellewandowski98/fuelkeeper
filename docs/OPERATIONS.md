@@ -55,9 +55,13 @@ pools:
     min_ttl: 30s                     # Minimum allowed TTL; default 30s
     max_ttl: 10m                     # Maximum allowed TTL; default 10m
     max_count: 100                   # Max outputs per reserve request; default 100
-    release_policy: trust            # trust (default) | verify; verify released outputs via oracle
+    release_policy: trust            # trust (default) | verify; verify released outputs via oracle (allowed with any
+                                     #   oracle except "none"; arcade-only makes this a delayed release, see below)
     spend_policy: trust              # trust | verify; default verify when the oracle answers outpoint queries
                                      #   (mock, teranode, composite with teranode_url), else trust; see "Oracle kinds and policies"
+    expiry_policy: requeue           # requeue (default) | hold; what the reaper does with a quarantined row that has
+                                     #   no spend hint and no oracle verdict: requeue it after jobs.reaper.unknown_requeue_age,
+                                     #   or hold it quarantined for an operator
     expected_tps: 0                  # Expected transactions per second (for capacity validation); no check if 0
 
 # Background jobs (enabled by default)
@@ -71,11 +75,16 @@ jobs:
     grace: 10s                       # Clock-skew guard before quarantining an expired reservation; default 10s
     quarantine_min_age: 30s          # Wait before the first oracle check on a quarantined row; default 30s
     min_unspent_age: 30s             # Quarantine age before an unhinted Unspent row is requeued; default 30s
-    hint_patience: 10m               # Quarantine age before a hinted Unspent row is requeued; default 10m
+    hint_patience: 10m               # Quarantine age before a hinted Unspent row (or a hint rejected tx_invalid) is requeued; default 10m
+    unknown_requeue_age: 10m         # Quarantine age before an unhinted row with no oracle verdict is requeued, under
+                                     #   pool expiry_policy: requeue; 0 disables (never requeue blind); must be 0 or >= min_unspent_age; default 10m
+    hint_max_wait: 24h               # Quarantine age before a hinted row whose tx was never mined or classified is
+                                     #   requeued as a last resort; 0 disables; must be 0 or >= hint_patience; default 24h
     batch: 500                       # ListQuarantined page size; default 500
     max_pages: 10                    # Max ListQuarantined pages per tick; default 10
     quarantine_batch: 1000           # Rows moved per Store.Quarantine call; default 1000
     oracle_batch: 200                # Outpoints per oracle call; default 200
+    tx_recheck_interval: 30s         # Minimum interval between Tx lookups for the same hinted transaction; default 30s
 
   watcher:
     interval: 10s                    # How often to check unmined shards; default 10s
@@ -92,7 +101,11 @@ jobs:
 
 # Chain oracle (verifies spend and unspent states)
 oracle:
-  kind: none                         # none (default) | mock | arcade | teranode | composite
+  kind: none                         # none | mock | arcade | teranode | composite; default resolved from treasury.kind
+                                     #   when left empty: arcade when treasury.kind is toolbox (below, it's mock, so
+                                     #   none), else none. A direct teranode connection is never assumed -- it is an
+                                     #   optional, opt-in accelerator (composite with teranode_url); see "Oracle kinds
+                                     #   and policies" below and docs/CLIENTS.md's settlement contract
   mock:
     assume_unspent: true             # When true, assume unknown outpoints are unspent (nullnet only)
   arcade_url: ""                     # Arcade base URL; required for arcade and composite (default: the
@@ -157,9 +170,13 @@ On startup, FuelKeeper validates the configuration:
 - `jobs.lease_ttl` must exceed twice the longest job interval (e.g., if minter.interval is 30s, lease_ttl must be > 60s)
 - `jobs.watcher.limit` must exceed `jobs.minter.max_pending_shards`
 - Mint capacity must be ≥ 1.2× `expected_tps` for each pool (when expected_tps > 0)
-- Pools with `spend_policy: verify` or `release_policy: verify` require an oracle (`oracle.kind` != "none")
-- `release_policy: verify` requires an oracle that answers outpoint queries (`teranode`, `composite` with `teranode_url`, or `mock`); `spend_policy` defaults to `verify` only for such an oracle and to `trust` otherwise
+- Pools with `spend_policy: verify` or `release_policy: verify` require an oracle (`oracle.kind` != "none"): `oracle.kind: none` is the only oracle that rejects either policy at config load -- an arcade-only oracle (`arcade`, or `composite` without `teranode_url`) accepts both (see "Oracle kinds and policies")
+- `spend_policy` defaults to `verify` only when the oracle answers outpoint queries directly (`mock`, `teranode`, `composite` with `teranode_url`); it defaults to `trust` otherwise (`none`, `arcade`, `composite` without `teranode_url` -- the expected arcade-only production shape). An explicit `spend_policy: verify` is kept even with an arcade-only oracle, not overridden
 - `oracle.kind: arcade` and `composite` need `oracle.arcade_url` (or a toolbox treasury, whose arcade they then use); `teranode` needs `oracle.teranode_url`
+- `oracle.kind: teranode` is rejected whenever `jobs.enabled` is true: teranode's asset API never reports a mined status, so the watcher could never confirm a shard mined and the reaper could never confirm a spend mined; use `oracle.kind: composite` with both `arcade_url` and `teranode_url` instead
+- Per pool, `expiry_policy` must be `requeue` or `hold`
+- `jobs.reaper.unknown_requeue_age` must be `0` (never requeue blind) or `>= min_unspent_age`: a row with no evidence is never requeued faster than one the oracle actually confirmed Unspent
+- `jobs.reaper.hint_max_wait` must be `0` (never requeue a stuck hint) or `>= hint_patience`
 - `treasury.kind: toolbox` needs a valid `root_key_hex` (plus `arcade_url` and `chaintracks_url` on `test`/`tstn`; `main` and `ttn` default to the toolbox's public endpoints), and every pool must share one leaf cost class (same `split_size` × `denomination`, same leaf size): one treasury keeps one chunk denomination (see [TREASURY.md](TREASURY.md))
 - `treasury.toolbox.reconcile_grace` must exceed `jobs.minter.build_timeout` + 10 s (the reconcile budget), or Reconcile could abort a split whose Build and PutShard were merely slow
 - With the toolbox treasury and jobs enabled, `jobs.lease_ttl` must exceed `jobs.minter.build_timeout` + 20 s (two 10 s reconcile phases), the longest minter round the lease has to outlast
@@ -172,6 +189,13 @@ rejected as unknown fields. `oracle.mock.assume_unspent` and
 
 ### Oracle Kinds and Policies
 
+**Arcade-only (`oracle.kind: arcade`, or `composite` without `teranode_url`)
+is the expected production shape.** A direct teranode connection is never
+assumed -- it is an optional, opt-in accelerator. `oracle.kind` defaults to
+`arcade` when `treasury.kind: toolbox` (else `none`); `serve` logs one Info
+line at start-up (`logOracleMode`) naming the resolved kind and whether it
+answers outpoint queries directly.
+
 The reaper settles quarantined rows with two oracle questions: *is this
 outpoint spent?* (`Outpoints`) and *is this txid mined, and what does it
 spend?* (`Tx`, plus the inputs lookup). Not every oracle answers both:
@@ -180,28 +204,45 @@ spend?* (`Tx`, plus the inputs lookup). Not every oracle answers both:
 |---|---|---|---|
 | `none` | never (Unknown) | never | no |
 | `mock` | nullnet only | nullnet only | as configured |
-| `arcade` | never (Unknown) | yes | no |
+| `arcade` | never (Unknown) -- no UTXO index | yes | no -- never serves raw transactions |
 | `composite` without `teranode_url` | never (Unknown) | yes (arcade) | no |
 | `composite` with `teranode_url` | yes (teranode) | yes (arcade) | yes (teranode raw tx, fetched only by the reaper) |
 | `teranode` | yes | **never** | yes; **rejected by config when jobs are enabled** |
 
-What that means for rows (and shards):
+Arcade never reports a competing transaction synchronously: POST /tx's 4xx
+and 202 bodies never carry one, so a double-spend only appears later, via a
+follow-up GET /tx answering REJECTED with ARC code 466 (mapped to
+`RejectReasonInputsSpent`; every other classifiable code maps to
+`RejectReasonTxInvalid`, except 476 "not final", which maps to
+`RejectReasonUnknown` because the transaction may still become valid once
+its locktime passes). A consumer submitting through arcade therefore reports
+its broadcast as accepted the moment arcade accepts it; a later double-spend
+is discovered by whoever next polls the transaction's fate (FuelKeeper's own
+reaper, or the consumer's own review process) -- see
+[CLIENTS.md](CLIENTS.md#when-your-broadcast-fails).
 
-| Situation | Needs | none / arcade / composite without teranode | composite with teranode | teranode alone |
+**What each policy does, per oracle, and after what delay:**
+
+| `oracle.kind` | Expired reservation (unhinted) | `release_policy: verify` | `spend_policy: trust` | `spend_policy: verify` (opt-in unless noted) |
 |---|---|---|---|---|
-| Expired reservation (every policy) | an Unspent outpoint verdict | stays quarantined until requeued by hand (`fuelkeeper quarantine requeue`) | requeued after `min_unspent_age` | requeued |
-| Release, `release_policy: trust` | nothing | available at once | available at once | available at once |
-| Release, `release_policy: verify` | an Unspent outpoint verdict | **rejected by config** | requeued after `min_unspent_age` | requeued |
-| Spend, `spend_policy: trust` | nothing | spent at once | spent at once | spent at once |
-| Spend, `spend_policy: verify` | the hinted txid mined, or a Spent verdict | resolved once the hinted txid is mined, **with no input check**: a client hint naming *any* mined txid is trusted; a false hint leaves the row quarantined (none: always quarantined; config rejects verify with none) | resolved once mined, and only if the mined spender's inputs include the outpoint | stays quarantined: teranode never reports Mined |
-| Split shards (watcher) | Mined status | never mined with `none` (use the mock treasury); mined via arcade | mined via arcade | **never mined**, so config rejects `oracle.kind: teranode` whenever jobs are enabled: "oracle.kind teranode cannot report transactions as mined ...; use kind: composite with arcade_url and teranode_url" |
+| `none` | Requeued after `unknown_requeue_age` (`expiry_policy: requeue`, default) or held for an operator (`expiry_policy: hold`, or `unknown_requeue_age: 0`) | **rejected at config load** (`release_policy=verify requires an oracle`) | spent at once, no oracle call | **rejected at config load** (`spend_policy=verify requires an oracle`) |
+| `arcade`, or `composite` without `teranode_url` | Same as `none`: `Outpoints` always answers Unknown, so the row is unhinted and follows the same `unknown_requeue_age`/`expiry_policy` rule | allowed: a **delayed release** -- `Release` stores no hint, so the row is quarantined and follows the same unhinted rule as an expired reservation above | spent at once, no oracle call | allowed (default here is `trust`): the row is hinted and resolved from `Tx(hint)` (see the reaper lifecycle table below) -- mined & spends the outpoint, a mined competitor, or a rejection naming a spent input all resolve to spent; a rejection with the inputs untouched requeues after `hint_patience`; anything still unresolved requeues after `hint_max_wait` (24h default) as a last resort |
+| `composite` with `teranode_url` | Resolved directly from teranode's UTXO-set verdict: Unspent requeues after `min_unspent_age` (30s), Spent (mined, inputs verified) resolves to spent -- no `unknown_requeue_age` wait | allowed, same delay as an expired reservation with this oracle (`min_unspent_age`, not `unknown_requeue_age`) | spent at once, no oracle call | allowed (default here): resolved once mined and the spender's inputs (from teranode) include the outpoint -- no blind trust of an unverified hint |
+| `teranode` alone | N/A -- **config refuses to start whenever `jobs.enabled` is true**: teranode's asset API never reports a mined status, so the watcher could never confirm a shard mined and the reaper could never confirm a spend mined; use `composite` with both `arcade_url` and `teranode_url` instead | | | |
 
-So: use `composite` with `teranode_url` for production. An arcade-only
-oracle (`arcade`, or `composite` without `teranode_url`) is only suitable
-with `release_policy: trust` and `spend_policy: trust` (the defaults it
-gets), and even then expired reservations accumulate in quarantine until an
-operator requeues them. Config rejects `release_policy: verify` with such an
-oracle, and `serve` logs a Warn for `spend_policy: verify` with one.
+Split shards (the watcher's mined check) follow the "Mined status" column of
+the first table above: never mined with `none` (use the mock treasury, or
+give the oracle an arcade/teranode source); mined via arcade with `arcade`
+or `composite`; never mined with `teranode` alone, which is exactly why
+config rejects that combination whenever jobs run.
+
+Configuring `oracle.teranode_url` (`oracle.kind: composite`) is optional and
+resolves the rows in the "expired reservation" / `release_policy: verify` /
+`spend_policy: verify` columns immediately from the UTXO set, instead of
+waiting out `unknown_requeue_age`/`hint_patience`/`hint_max_wait`. It is an
+accelerator, not a requirement: arcade-only deployments are expected to run
+indefinitely with these delays, and pool capacity never leaks while waiting
+them out.
 
 ## Deployment Topologies
 
@@ -253,6 +294,56 @@ Runs every `reaper.interval`. Responsibilities:
 - Expire old reservations (`>= ttl_seconds` old) and move them to quarantine
 - Move quarantined rows to "spent" only after the oracle confirms a MINED spend
 - Requeue rows marked Unspent by the oracle (after `min_unspent_age` for unhinted rows, or `hint_patience` for hinted rows)
+- Requeue an unhinted row with no oracle verdict (arcade-only: every unhinted row) after `unknown_requeue_age`, under a pool's `expiry_policy: requeue` (default); hold it for an operator under `expiry_policy: hold`
+- Resolve a hinted row (`spend_policy: verify`) from its own transaction's fate when the oracle cannot answer the outpoint directly (arcade-only)
+
+#### Reaper lifecycle, in operator terms
+
+**Unhinted rows** (an expired reservation, or a `release_policy: verify`
+release -- neither stores a hint):
+
+| Evidence this tick | Outcome | Delay | Metric |
+|---|---|---|---|
+| Oracle: Unspent | requeued | `min_unspent_age` (30s default) since quarantined | `reaper_requeued_total{reason="unspent"}` |
+| Oracle: Unknown, pool `expiry_policy: requeue` (default), `unknown_requeue_age > 0` | requeued (blind: no proof either way) | `unknown_requeue_age` (10m default) since quarantined | `reaper_requeued_total{reason="unknown_aged"}` |
+| Oracle: Unknown, pool `expiry_policy: hold`, or `unknown_requeue_age: 0` | held for an operator | -- | `reaper_held{reason="expiry_hold"}` (or `"unknown_fresh"` while still younger than `unknown_requeue_age` under `requeue`) |
+| Oracle: Spent, names a mined spending txid that spends the outpoint (its own `SpendingTxID`, or a fallback hint if it named none) | resolved to spent | immediate once mined | `reaper_spent_total{source="oracle"}` (or `"hint"` when a fallback hint resolved it) |
+| Oracle: Spent, names no txid and there is no hint to fall back on | held (a `SpentBy` cannot be fabricated) | -- | `reaper_held{reason="spent_no_txid"}` |
+| Oracle: Conflicting | held for an operator | -- | `reaper_held{reason="conflicting"}` |
+| Oracle call failed, or answered mismatched | every remaining row this tick is left untouched | -- | `reaper_held{reason="oracle_down"}` |
+
+**Hinted rows** (`spend_policy: verify`; with an arcade-only oracle every
+hinted row's outpoint verdict is Unknown, so it is resolved from
+`Tx(hint)` instead -- rule numbers match `pkg/jobs/reaper.go`'s "Hinted
+rows" doc comment):
+
+| Rule | Evidence this tick | Outcome | Delay | Metric |
+|---|---|---|---|---|
+| 1 | Hint mined, spends the outpoint | spent | immediate | `reaper_spent_total{source="hint"}` |
+| 1 | Hint mined, but its inputs exclude the outpoint (mismatch) | held | -- | `reaper_held{reason="hint_pending"}` |
+| 2 | Hint has competing transactions; one is mined and spends the outpoint (or its inputs are unknown, trusted) | spent | immediate | `reaper_spent_total{source="competitor"}` |
+| 2 | Hint has competing transactions; none is mined yet | held | -- | `reaper_held{reason="competitor_pending"}` |
+| 3 | Hint rejected `inputs_spent` (ARC 466), nothing shows the fuel output itself is untouched | spent (the fuel output is assumed gone) | immediate | `reaper_spent_total{source="inputs_spent"}` |
+| 3 | Hint rejected `inputs_spent`, but a mined competitor or the hint's own inputs show the fuel output is *not* the one spent | held | -- | `reaper_held{reason="hint_pending"}` |
+| 4 | Hint rejected `tx_invalid` (fee/format/policy; inputs untouched) | requeued | `hint_patience` (10m default) since quarantined; held (`rejected_fresh`) before that | `reaper_requeued_total{reason="rejected"}` |
+| 5 | Hint rejected, unclassified reason | held | -- | `reaper_held{reason="rejected_unknown"}` |
+| 5 | Hint known, not yet mined or rejected | held | -- | `reaper_held{reason="hint_pending"}` |
+| 5 | Hint not known to the oracle yet | held | -- | `reaper_held{reason="hint_unseen"}` |
+| -- | Any held hinted row above reaches `hint_max_wait` (> 0) since quarantined | requeued as a last resort | `hint_max_wait` (24h default) | `reaper_requeued_total{reason="hint_expired"}` |
+
+A `Tx` lookup failure this tick holds the row(s) waiting on it as
+`reaper_held{reason="tx_down"}` and an outpoint-oracle `SpendingTxID` still
+awaiting confirmation as `reaper_held{reason="spender_pending"}`, same as
+`oracle_down`/`tx_down` above: transient, and expected to clear on the next
+successful tick.
+
+#### Reaper metrics
+
+| Metric | Labels | Meaning | Operator action |
+|---|---|---|---|
+| `fuelkeeper_reaper_requeued_total` | `pool`, `reason` (`unspent`, `unknown_aged`, `rejected`, `hint_expired`) | Quarantined rows returned to `available` | `unspent`/`rejected`: normal, oracle- or patience-driven. `unknown_aged`: normal under an arcade-only oracle -- a blind requeue with no proof either way; pool capacity never leaks, but watch `reaper_spent_total{source="inputs_spent"}`/`{source="competitor"}` for a rise right after, which would mean requeued rows are coming back stale. That delay is the safety/latency trade-off of arcade-only; configuring `oracle.teranode_url` resolves these rows immediately instead, if the stale-requeue rate matters for your deployment. `hint_expired`: a hinted transaction was never mined or classified within `hint_max_wait`; a sustained nonzero rate suggests stuck or abandoned client transactions, or an arcade outage swallowing GET /tx answers -- worth investigating |
+| `fuelkeeper_reaper_spent_total` | `pool`, `source` (`oracle`, `hint`, `competitor`, `inputs_spent`) | Quarantined rows resolved to the terminal `spent` state | `oracle`/`hint`: normal terminal resolution, no action. `competitor`: a double-spend was detected and resolved -- a sustained nonzero rate points at a client population racing itself or reusing reservations; investigate the client, not FuelKeeper. `inputs_spent`: the client's own hinted transaction was rejected because one of its inputs (assumed to be this fuel output) was already spent -- a sustained nonzero rate can mean clients are reusing fuel past expiry or racing each other; check client behaviour |
+| `fuelkeeper_reaper_held` (gauge) | `pool`, `reason` (13 values: `oracle_down`, `unknown_fresh`, `expiry_hold`, `unspent_fresh`, `spent_no_txid`, `spender_pending`, `hint_pending`, `hint_unseen`, `competitor_pending`, `rejected_fresh`, `rejected_unknown`, `conflicting`, `tx_down`) | Rows the reaper examined this tick and left quarantined, by why | `unknown_fresh`/`unspent_fresh`/`rejected_fresh`: normal, still waiting out a delay, no action. `expiry_hold`: deliberate under `expiry_policy: hold` -- verify on-chain and requeue by hand via `fuelkeeper quarantine requeue`, or leave it for an operator decision. `spent_no_txid`/`conflicting`/`rejected_unknown`: the oracle could not give the reaper enough to resolve automatically -- inspect on-chain (or arcade's GET /tx for the classification code) and requeue or retire by hand. `spender_pending`/`hint_pending`/`hint_unseen`/`tx_down`: normal, transient, waiting on a transaction to propagate or mine -- watch only if it grows without bound. `competitor_pending`: a double-spend race is in progress -- **never hand-requeue these**; wait for a competitor to be mined (the row then resolves to spent under `source="competitor"`), or it clears once no competitor exists any more. `oracle_down`: the oracle call itself failed or was malformed this tick -- check oracle/arcade connectivity if sustained |
 
 ### Watcher
 
@@ -379,6 +470,9 @@ Monitor these Prometheus metrics to stay on top of pool health:
 | `fuelkeeper_pool_refilling` | gauge | pool | stuck at 1 for a long time? | 1 while the pool is mid-refill (sticky hysteresis, see `low_water`), 0 otherwise |
 | `fuelkeeper_reaper_quarantined_total` | counter | pool | track | Rows moved to quarantine |
 | `fuelkeeper_reaper_resolved_total` | counter | pool, result | track | Quarantined rows resolved by state |
+| `fuelkeeper_reaper_requeued_total` | counter | pool, reason (unspent\|unknown_aged\|rejected\|hint_expired) | `unknown_aged`/`hint_expired` sustained? | Quarantined rows returned to available, by reason; see [Reaper metrics](#reaper-metrics) |
+| `fuelkeeper_reaper_spent_total` | counter | pool, source (oracle\|hint\|competitor\|inputs_spent) | `competitor`/`inputs_spent` rate ↑? | Quarantined rows resolved to spent, by source; see [Reaper metrics](#reaper-metrics) |
+| `fuelkeeper_reaper_held` | gauge | pool, reason (13 values; see [Reaper metrics](#reaper-metrics)) | `competitor_pending`/`spent_no_txid`/`conflicting`/`rejected_unknown` nonzero for a long time? | Quarantined rows left unresolved this tick, by reason |
 | `fuelkeeper_oracle_requests_total` | counter | kind, result | track | Oracle calls by type and outcome |
 | `fuelkeeper_job_lease_held` | gauge | job (reaper\|watcher\|minter) | max by (job) < 1 for > 1 min? | 1 if this instance holds the job lease, 0 otherwise |
 
@@ -405,17 +499,29 @@ Monitor these Prometheus metrics to stay on top of pool health:
 
 ### Rows Stuck in Quarantine
 
-**Symptom**: `fuelkeeper_quarantine_oldest_age_seconds` > 5 minutes.
+**Symptom**: `fuelkeeper_quarantine_oldest_age_seconds` > 5 minutes, or
+`fuelkeeper_reaper_held{reason=...}` nonzero for a long time.
+
+With an arcade-only oracle (the expected shape), quarantine holding rows for
+a while is normal, not a symptom on its own: an unhinted row waits up to
+`unknown_requeue_age` (10m default) before it requeues itself, and a hinted
+row can wait up to `hint_max_wait` (24h default) before it does. Only treat
+this as an incident once rows sit well past those windows, or
+`fuelkeeper_reaper_held` is nonzero under a reason the reaper cannot clear on
+its own (`spent_no_txid`, `conflicting`, `rejected_unknown`, or
+`expiry_hold` under a pool configured `expiry_policy: hold`).
 
 **Diagnosis**:
 
-1. `fuelkeeper quarantine list --url http://host:8080 --pool main --key <key>`
+1. `fuelkeeper quarantine list --url http://host:8080 --pool main --key <key>` -- each row shows `outpoint`, `state`, `quarantined_at` and, when hinted, `spent_hint`. The list itself does not carry a held *reason*; cross-reference age and whether `spent_hint` is set against the `fuelkeeper_reaper_held{pool,reason}` gauge (broken down by reason, not by row) and the [Reaper lifecycle](#reaper-lifecycle-in-operator-terms) table above to work out which reason applies to a given row: a set `spent_hint` means one of the hinted-row reasons, an unset one means `unknown_fresh`/`expiry_hold`/`spent_no_txid`/`conflicting`/`oracle_down`.
 2. Manually verify on-chain whether listed outpoints are spent or unspent
 
 **Remedies**:
 
-- If truly unspent, requeue with `fuelkeeper quarantine requeue --url ... --pool main --outpoints a:0,b:1 --key <key>`
-- If spent (expected), no action needed; they will age out when `min_unspent_age` expires
+- If truly unspent and the row has already aged past what the automatic rules would need (i.e. this is an operator-held reason, not one that is still waiting out a delay), requeue with `fuelkeeper quarantine requeue --url ... --pool main --outpoints a:0,b:1 --key <key>`
+- If spent (expected), no action needed; unhinted rows age out to `spent` once the oracle proves it, hinted rows once `Tx(hint)` (or a competitor) is mined
+- **Never hand-requeue a row held as `competitor_pending`**: a double-spend race is in progress and the row will resolve to `spent{source="competitor"}` once a competitor is mined; requeuing it early can hand an about-to-be-spent output back to the pool (a poison pill for whoever reserves it next)
+- **Never try to "undo" a row retired as `spent{source="inputs_spent"}`**: it is already in the terminal `spent` state, not quarantined -- the reaper assumed the fuel output was the input that was reported already-spent on the client's own rejected transaction; trust that classification rather than trying to recover the row
 - Verify on-chain before requeuing; do not requeue spent rows
 
 ### Dead Split (Known-Unminable Shard)
@@ -498,7 +604,7 @@ Pools with `spend_policy: verify` need an oracle that is not "none"; FuelKeeper 
 
 Similarly, `release_policy: verify` requires an oracle with error `"release_policy=verify requires an oracle"`.
 
-Remedy: set `oracle.kind: composite` with `oracle.teranode_url` (arcade alone cannot answer outpoint queries, so `release_policy: verify` is rejected with it and `spend_policy: verify` trusts any mined hint; see [Oracle Kinds and Policies](#oracle-kinds-and-policies)), use `mock` with `assume_unspent: true` for nullnet, or change the policies to "trust".
+Remedy: set `oracle.kind: arcade` (or `composite`, with or without `teranode_url`) -- an arcade-only oracle now accepts both policies (see [Oracle Kinds and Policies](#oracle-kinds-and-policies)): `release_policy: verify` becomes a delayed release and `spend_policy: verify` resolves hinted rows from the client's own transaction, both requeued/resolved automatically by the reaper. Add `oracle.teranode_url` to resolve those rows immediately instead of waiting out the delay. `mock` with `assume_unspent: true` also works for nullnet, or change the policies to "trust" if verification is not wanted at all.
 
 ### Configuration Validation Errors
 

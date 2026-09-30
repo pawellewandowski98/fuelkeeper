@@ -1088,3 +1088,58 @@ Commit: `docs: clients guide, architecture, changelog and README for 0.1.0`.
   have not been run: no `FK_TTN_*` environment or funded wallet is available
   on this machine. `docs/PERFORMANCE.md` must say so and give the exact
   procedure from `docs/TREASURY.md`.
+
+## Arcade-only lifecycle (2026-09-30)
+
+- A direct teranode connection is not expected and must not be assumed: it
+  is an optional, opt-in oracle (`oracle.kind: composite` with
+  `teranode_url`), off by default. `resolveOracleDefault` sets
+  `oracle.kind` to `arcade` when `treasury.kind: toolbox`, else `none`.
+- The consuming go-wallet-toolbox wallet clears its own reservation when its
+  transaction fails to propagate; `pkg/client/settle.go`'s `Client.Settle`
+  (`Settle(ctx, pool, token, outpoints, Settlement{Outcome, TxID,
+  CompetingTxIDs})`, `Outcome` one of `OutcomeBroadcast`,
+  `OutcomeNotBroadcast`, `OutcomeDoubleSpend`, `OutcomeUnknown`) embodies
+  that contract; the TS wallet-toolbox path reads the `WERR_REVIEW_ACTIONS`
+  review results (`doubleSpend`, `invalidTx`, `serviceError`, `success`) and
+  calls the same endpoints.
+- With arcade only, an expired reservation (or a `release_policy: verify`
+  release, which stores no hint) nobody settles is requeued after
+  `jobs.reaper.unknown_requeue_age` (default 10 m, 0 disables, must be 0 or
+  `>= min_unspent_age`) when the pool's `expiry_policy` is `requeue`
+  (default); `hold` quarantines it for an operator instead. Pool capacity
+  never leaks.
+- A consumer whose broadcast is rejected as a double-spend must report the
+  output SPENT (hinting the competing txid when known via
+  `OutcomeDoubleSpend`), never release it: releasing would return an
+  already-spent output to the pool for every later consumer to fail on (a
+  poison pill). A consumer must not report spent on a rejection with no
+  competitor (`OutcomeNotBroadcast` -> `Release`): under `spend_policy:
+  trust` a spend is terminal.
+- `spend_policy` stays `trust` by default for arcade-only; `verify` is an
+  allowed opt-in, resolved from the hinted transaction's own fate
+  (`pkg/jobs/reaper_hint.go`'s rules) once `hint_patience` (10 m) or
+  `hint_max_wait` (default 24 h, 0 disables, must be 0 or `>=
+  hint_patience`) elapse. `release_policy: verify` is now allowed with
+  arcade-only too (a delayed release, requeued after
+  `unknown_requeue_age`). Verify policies are still rejected outright for
+  `oracle.kind: none`; a teranode-only oracle is rejected whenever
+  `jobs.enabled` is true.
+- Arcade never reports a competing tx synchronously: a double-spend appears
+  later via GET /tx as REJECTED, ARC code 466. `rejectReasonForCode` maps
+  466 -> `RejectReasonInputsSpent`; 462 (coinbase/input-script policy),
+  465/467/471-474 etc -> `RejectReasonTxInvalid`; 476 (not final) and any
+  unmapped code -> `RejectReasonUnknown`. `RejectReasonTxInvalid` is
+  evidence about one submission to one gateway, not a global verdict.
+- New metrics: `fuelkeeper_reaper_requeued_total{pool,reason}` (`unspent`,
+  `unknown_aged`, `rejected`, `hint_expired`); `fuelkeeper_reaper_spent_total
+  {pool,source}` (`oracle`, `hint`, `competitor`, `inputs_spent`); gauge
+  `fuelkeeper_reaper_held{pool,reason}` (13 reasons: `oracle_down`,
+  `unknown_fresh`, `expiry_hold`, `unspent_fresh`, `spent_no_txid`,
+  `spender_pending`, `hint_pending`, `hint_unseen`, `competitor_pending`,
+  `rejected_fresh`, `rejected_unknown`, `conflicting`, `tx_down`).
+  `fuelkeeper_reaper_resolved_total` is unchanged.
+- New pool config key: `expiry_policy: requeue|hold` (default `requeue`).
+  New `jobs.reaper` keys: `unknown_requeue_age` (10 m), `hint_max_wait`
+  (24 h), `tx_recheck_interval` (30 s, > 0, throttles `Tx(hint)` lookups per
+  txid across ticks).
