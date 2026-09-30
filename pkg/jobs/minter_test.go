@@ -5,6 +5,9 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"time"
+
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -328,4 +331,179 @@ func TestMinterPutShardFailureIsolatedPerPool(t *testing.T) {
 	sgood, gerr := base.Stats(ctx, "good")
 	require.NoError(t, gerr)
 	assert.Equal(t, int64(5), sgood.Available, "the other pool still minted")
+}
+
+// reconcilingTreasury is a mock treasury with the optional Reconciler and
+// ChunkEnsurer capabilities.
+type reconcilingTreasury struct {
+	*mock.Treasury
+	reconciles   int
+	reconcileErr error
+	report       treasury.ReconcileReport
+	known        func(context.Context, chainhash.Hash) (bool, error)
+	ensures      int
+	ensureErr    error
+	buildDL      time.Duration // remaining time on Build's ctx deadline
+}
+
+func (r *reconcilingTreasury) Reconcile(_ context.Context, known func(context.Context, chainhash.Hash) (bool, error)) (treasury.ReconcileReport, error) {
+	r.reconciles++
+	r.known = known
+	return r.report, r.reconcileErr
+}
+
+func (r *reconcilingTreasury) EnsureChunks(context.Context) error {
+	r.ensures++
+	return r.ensureErr
+}
+
+func (r *reconcilingTreasury) Build(ctx context.Context, req treasury.MintRequest) (*treasury.BuiltShard, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		r.buildDL = time.Until(dl)
+	}
+	return r.Treasury.Build(ctx, req)
+}
+
+var (
+	_ treasury.Reconciler   = (*reconcilingTreasury)(nil)
+	_ treasury.ChunkEnsurer = (*reconcilingTreasury)(nil)
+)
+
+func reconcileSetup(t *testing.T) (*jobs.Minter, *reconcilingTreasury, *storetest.Clock, jobs.MinterConfig) {
+	t.Helper()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	tr := &reconcilingTreasury{Treasury: mock.New()}
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.SplitSize = 10
+	pc.TargetAvailable = 10
+	pc.LowWater = 0
+	cfg := jobs.DefaultMinterConfig()
+	return newMinter(t, st, tr, []pool.Config{pc}, cfg, clk), tr, clk, cfg
+}
+
+func TestMinterReconcilesOnFirstRoundOfEachLease(t *testing.T) {
+	ctx := context.Background()
+	m, tr, clk, cfg := reconcileSetup(t)
+
+	require.NoError(t, m.RunOnce(ctx))
+	assert.Equal(t, 1, tr.reconciles, "first round of the process reconciles")
+	assert.Equal(t, 1, tr.ensures)
+	assert.Equal(t, 1, tr.Built(), "the round still mints")
+
+	clk.Advance(cfg.Interval)
+	require.NoError(t, m.RunOnce(ctx))
+	assert.Equal(t, 1, tr.reconciles, "consecutive rounds of one lease do not reconcile again")
+	assert.Equal(t, 2, tr.ensures, "EnsureChunks runs every round")
+
+	clk.Advance(3 * cfg.Interval) // ticks missed: the lease was held elsewhere
+	require.NoError(t, m.RunOnce(ctx))
+	assert.Equal(t, 2, tr.reconciles, "a re-acquired lease reconciles again")
+	assert.Equal(t, 3, tr.ensures)
+}
+
+func TestMinterRetriesFailedReconcileAndKeepsMinting(t *testing.T) {
+	ctx := context.Background()
+	m, tr, clk, cfg := reconcileSetup(t)
+	tr.reconcileErr = errors.New("wallet down")
+	tr.ensureErr = errors.New("no reserve")
+
+	require.NoError(t, m.RunOnce(ctx))
+	assert.Equal(t, 1, tr.reconciles)
+	assert.Equal(t, 1, tr.Built(), "neither failure stops minting")
+
+	clk.Advance(cfg.Interval)
+	tr.reconcileErr = nil
+	tr.report = treasury.ReconcileReport{
+		Aborted: []chainhash.Hash{{1}},
+		Errors:  map[chainhash.Hash]error{{2}: errors.New("x")},
+	}
+	require.NoError(t, m.RunOnce(ctx))
+	assert.Equal(t, 2, tr.reconciles, "a failed reconcile is retried next round")
+
+	clk.Advance(cfg.Interval)
+	require.NoError(t, m.RunOnce(ctx))
+	assert.Equal(t, 2, tr.reconciles, "a completed reconcile (even with per-split errors) is not repeated")
+}
+
+// getShardFailStore fails GetShard for one pool.
+type getShardFailStore struct {
+	store.Store
+	failPool string
+}
+
+var errGetShard = errors.New("store unavailable")
+
+func (s getShardFailStore) GetShard(ctx context.Context, p string, txid chainhash.Hash) (*store.Shard, error) {
+	if p == s.failPool {
+		return nil, errGetShard
+	}
+	return s.Store.GetShard(ctx, p, txid)
+}
+
+func TestMinterReconcileKnownConsultsEveryPool(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	mem := memory.New(memory.WithClock(clk.Now))
+	a := pool.DefaultPoolConfig("a", 50)
+	a.SplitSize, a.TargetAvailable, a.LowWater = 10, 10, 0
+	b := pool.DefaultPoolConfig("b", 50)
+	b.SplitSize, b.TargetAvailable, b.LowWater = 10, 10, 0
+	tr := &reconcilingTreasury{Treasury: mock.New()}
+	m := newMinter(t, mem, tr, []pool.Config{a, b}, jobs.DefaultMinterConfig(), clk)
+	require.NoError(t, m.RunOnce(ctx))
+	require.NotNil(t, tr.known)
+
+	shards, err := mem.ListShards(ctx, "b", store.ShardFilter{})
+	require.NoError(t, err)
+	require.Len(t, shards, 1)
+	ok, err := tr.known(ctx, shards[0].TxID)
+	require.NoError(t, err)
+	assert.True(t, ok, "a shard of the second pool is known")
+
+	ok, err = tr.known(ctx, chainhash.Hash{9})
+	require.NoError(t, err)
+	assert.False(t, ok, "ErrNotFound in every pool is unknown, not an error")
+
+	tr2 := &reconcilingTreasury{Treasury: mock.New()}
+	m2 := newMinter(t, getShardFailStore{Store: mem, failPool: "b"}, tr2, []pool.Config{a, b}, jobs.DefaultMinterConfig(), clk)
+	require.NoError(t, m2.RunOnce(ctx))
+	ok, err = tr2.known(ctx, chainhash.Hash{9})
+	require.ErrorIs(t, err, errGetShard, "a store failure is an error, never unknown")
+	assert.False(t, ok)
+}
+
+// deadlineStore records the deadline PutShard saw.
+type deadlineStore struct {
+	store.Store
+	putDL time.Duration
+}
+
+func (s *deadlineStore) PutShard(ctx context.Context, sh store.Shard, rows []store.Row) error {
+	if dl, ok := ctx.Deadline(); ok {
+		s.putDL = time.Until(dl)
+	}
+	return s.Store.PutShard(ctx, sh, rows)
+}
+
+func TestMinterBoundsBuildAndPutShardByBuildTimeout(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	st := &deadlineStore{Store: memory.New(memory.WithClock(clk.Now))}
+	tr := &reconcilingTreasury{Treasury: mock.New()}
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.SplitSize, pc.TargetAvailable, pc.LowWater = 10, 10, 0
+	cfg := jobs.DefaultMinterConfig()
+	cfg.BuildTimeout = 5 * time.Second
+	m := newMinter(t, st, tr, []pool.Config{pc}, cfg, clk)
+	require.NoError(t, m.RunOnce(ctx))
+	assert.Positive(t, tr.buildDL)
+	assert.LessOrEqual(t, tr.buildDL, cfg.BuildTimeout)
+	assert.Positive(t, st.putDL)
+	assert.LessOrEqual(t, st.putDL, tr.buildDL, "PutShard shares Build's deadline")
+
+	bad := jobs.DefaultMinterConfig()
+	bad.BuildTimeout = 0
+	require.ErrorContains(t, bad.Validate(), "build_timeout")
+	assert.Equal(t, time.Minute, jobs.DefaultMinterConfig().BuildTimeout)
 }

@@ -16,9 +16,11 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/jobs"
+	ofactory "github.com/bsv-blockchain/fuelkeeper/pkg/oracle/factory"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/sqlite"
+	tfactory "github.com/bsv-blockchain/fuelkeeper/pkg/treasury/factory"
 )
 
 // Config is the whole file.
@@ -27,8 +29,8 @@ type Config struct {
 	Store    factory.Config      `yaml:"store"`
 	Pools    []pool.Config       `yaml:"pools"`
 	Jobs     JobsConfig          `yaml:"jobs"`
-	Oracle   OracleConfig        `yaml:"oracle"`
-	Treasury TreasuryConfig      `yaml:"treasury"`
+	Oracle   ofactory.Config     `yaml:"oracle"`
+	Treasury tfactory.Config     `yaml:"treasury"`
 	API      APIConfig           `yaml:"api"`
 	Log      LogConfig           `yaml:"log"`
 }
@@ -40,32 +42,6 @@ type JobsConfig struct {
 	Reaper   jobs.ReaperConfig  `yaml:"reaper"`
 	Watcher  jobs.WatcherConfig `yaml:"watcher"`
 	Minter   jobs.MinterConfig  `yaml:"minter"`
-}
-
-// OracleConfig selects the chain oracle. teranode/arcade/composite are wired in Plan 5.
-type OracleConfig struct {
-	Kind string `yaml:"kind"` // none | mock | teranode | arcade | composite
-	Mock struct {
-		// AssumeUnspent makes the mock oracle answer Unspent instead of Unknown
-		// for outpoints it has no verdict for; "nullnet" development mode only.
-		AssumeUnspent bool `yaml:"assume_unspent"`
-	} `yaml:"mock"`
-	Teranode struct {
-		URL string `yaml:"url"`
-	} `yaml:"teranode"`
-	Arcade struct {
-		URL string `yaml:"url"`
-	} `yaml:"arcade"`
-}
-
-// TreasuryConfig selects the treasury. toolbox fields are added in Plan 5.
-type TreasuryConfig struct {
-	Kind string `yaml:"kind"` // mock | toolbox
-	Mock struct {
-		// ConfirmAfter is how long after a successful Send the mock treasury's
-		// nullnet wiring marks the split mined; must be > 0 when Kind is mock.
-		ConfirmAfter time.Duration `yaml:"confirm_after"`
-	} `yaml:"mock"`
 }
 
 // APIConfig configures the HTTP listener.
@@ -96,10 +72,8 @@ type LogConfig struct {
 
 // Default returns a config with every default filled and no pools.
 func Default() *Config {
-	oracleCfg := OracleConfig{Kind: "none"}
+	oracleCfg := ofactory.Config{Kind: ofactory.KindNone}
 	oracleCfg.Mock.AssumeUnspent = true
-	treasuryCfg := TreasuryConfig{Kind: "mock"}
-	treasuryCfg.Mock.ConfirmAfter = 2 * time.Second
 	return &Config{
 		Instance: pool.DefaultInstanceConfig(),
 		Store:    factory.Config{Backend: factory.BackendMemory},
@@ -113,7 +87,7 @@ func Default() *Config {
 			Minter:   jobs.DefaultMinterConfig(),
 		},
 		Oracle:   oracleCfg,
-		Treasury: treasuryCfg,
+		Treasury: tfactory.Default(),
 		API: APIConfig{
 			Listen:         ":8080",
 			ReadTimeout:    10 * time.Second,
@@ -223,8 +197,8 @@ type rawConfig struct {
 	Store    factory.Config      `yaml:"store"`
 	Pools    []rawPool           `yaml:"pools"`
 	Jobs     JobsConfig          `yaml:"jobs"`
-	Oracle   OracleConfig        `yaml:"oracle"`
-	Treasury TreasuryConfig      `yaml:"treasury"`
+	Oracle   ofactory.Config     `yaml:"oracle"`
+	Treasury tfactory.Config     `yaml:"treasury"`
 	API      APIConfig           `yaml:"api"`
 	Log      LogConfig           `yaml:"log"`
 }
@@ -354,18 +328,18 @@ func (c *Config) Validate() error {
 		}
 		seen[p.Name] = true
 	}
-	switch c.Oracle.Kind {
-	case "none", "mock", "teranode", "arcade", "composite":
-	default:
-		return fmt.Errorf("config: oracle.kind %q is not one of none|mock|teranode|arcade|composite", c.Oracle.Kind)
+	if err := c.Oracle.Validate(); err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
-	switch c.Treasury.Kind {
-	case "mock", "toolbox":
-	default:
-		return fmt.Errorf("config: treasury.kind %q is not one of mock|toolbox", c.Treasury.Kind)
+	if err := c.Treasury.Validate(c.Pools); err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
-	if c.Treasury.Kind == "mock" && c.Treasury.Mock.ConfirmAfter <= 0 {
-		return errors.New("config: treasury.mock.confirm_after must be > 0")
+	if c.Treasury.Kind == tfactory.KindToolbox && c.Treasury.Toolbox.ReconcileGrace <= c.Jobs.Minter.BuildTimeout {
+		// Reconcile's grace only protects a split whose Build and PutShard
+		// finish within it; the minter bounds that window by build_timeout.
+		return fmt.Errorf("config: treasury.toolbox.reconcile_grace (%s) must exceed jobs.minter.build_timeout (%s), "+
+			"or a slow Build+PutShard could be aborted by Reconcile as unrecorded",
+			c.Treasury.Toolbox.ReconcileGrace, c.Jobs.Minter.BuildTimeout)
 	}
 	if c.Jobs.Enabled {
 		if err := c.Jobs.Reaper.Validate(); err != nil {

@@ -370,3 +370,113 @@ func TestApplyPoolDefaultsForProgrammaticConfig(t *testing.T) {
 	require.NoError(t, c.Validate())
 	assert.Equal(t, pool.SpendTrust, p.SpendPolicy)
 }
+
+func TestLoadExampleNullnet(t *testing.T) {
+	c, err := config.Load("../../examples/nullnet.yaml")
+	require.NoError(t, err)
+	assert.Equal(t, "mock", c.Oracle.Kind)
+	assert.True(t, c.Oracle.Mock.AssumeUnspent)
+	assert.Equal(t, "mock", c.Treasury.Kind)
+	assert.Equal(t, 500*time.Millisecond, c.Treasury.Mock.ConfirmAfter)
+}
+
+func setTeratestnetEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("FUELKEEPER_TREASURY_KEY", "0000000000000000000000000000000000000000000000000000000000000001")
+	t.Setenv("FUELKEEPER_API_KEY", "api")
+	t.Setenv("FUELKEEPER_ADMIN_KEY", "admin")
+	t.Setenv("FUELKEEPER_STORE_PATH", filepath.Join(t.TempDir(), "fk.sqlite"))
+}
+
+func TestLoadExampleTeratestnet(t *testing.T) {
+	setTeratestnetEnv(t)
+	c, err := config.Load("../../examples/teratestnet.yaml")
+	require.NoError(t, err)
+	assert.Equal(t, "composite", c.Oracle.Kind)
+	assert.Equal(t, "https://arcade-v2-ttn-us-1.bsvblockchain.tech", c.Oracle.ArcadeURL, "toolbox ttn default")
+	assert.Empty(t, c.Oracle.TeranodeURL)
+	tb := c.Treasury.Toolbox
+	assert.Equal(t, "toolbox", c.Treasury.Kind)
+	assert.Equal(t, "ttn", tb.Network)
+	assert.Equal(t, "0000000000000000000000000000000000000000000000000000000000000001", tb.RootKeyHex)
+	assert.Equal(t, "https://arcade-v2-ttn-us-1.bsvblockchain.tech/chaintracks", tb.ChaintracksURL)
+	assert.Equal(t, 2*time.Minute, tb.ReconcileGrace)
+	assert.Equal(t, 60*time.Second, c.Jobs.Minter.BuildTimeout)
+	require.Len(t, c.Pools, 1)
+	assert.Equal(t, 50, c.Pools[0].SplitSize)
+	assert.Equal(t, int64(500), c.Pools[0].TargetAvailable)
+	assert.Equal(t, pool.SpendVerify, c.Pools[0].SpendPolicy)
+
+	t.Setenv("FUELKEEPER_TERANODE_URL", "http://teranode:8090/api/v1")
+	c, err = config.Load("../../examples/teratestnet.yaml")
+	require.NoError(t, err)
+	assert.Equal(t, "http://teranode:8090/api/v1", c.Oracle.TeranodeURL)
+}
+
+func TestLoadExampleTeratestnetNeedsTreasuryKey(t *testing.T) {
+	setTeratestnetEnv(t)
+	require.NoError(t, os.Unsetenv("FUELKEEPER_TREASURY_KEY"))
+	_, err := config.Load("../../examples/teratestnet.yaml")
+	require.ErrorContains(t, err, "FUELKEEPER_TREASURY_KEY")
+}
+
+func toolboxConfig(t *testing.T) *config.Config {
+	t.Helper()
+	setTeratestnetEnv(t)
+	c, err := config.Load("../../examples/teratestnet.yaml")
+	require.NoError(t, err)
+	return c
+}
+
+func TestValidateOracleAndTreasuryFactories(t *testing.T) {
+	c := toolboxConfig(t)
+	c.Oracle.ArcadeURL = ""
+	require.ErrorContains(t, c.Validate(), "oracle.arcade_url is required")
+
+	c = toolboxConfig(t)
+	c.Oracle.Kind = "teranode"
+	require.ErrorContains(t, c.Validate(), "oracle.teranode_url is required")
+
+	c = toolboxConfig(t)
+	c.Treasury.Toolbox.ChaintracksURL = ""
+	require.ErrorContains(t, c.Validate(), "treasury.toolbox.chaintracks_url")
+
+	c = toolboxConfig(t)
+	big := c.Pools[0]
+	big.Name = "big"
+	big.Denomination = 500
+	c.Pools = append(c.Pools, big)
+	require.ErrorContains(t, c.Validate(), "leaf cost", "one treasury funds one leaf cost class")
+
+	c = toolboxConfig(t)
+	c.Pools[0].SpendPolicy = pool.SpendVerify
+	c.Oracle.Kind = "none"
+	require.ErrorContains(t, c.Validate(), "spend_policy=verify requires an oracle")
+}
+
+func TestValidateReconcileGraceExceedsBuildTimeout(t *testing.T) {
+	c := toolboxConfig(t)
+	c.Treasury.Toolbox.ReconcileGrace = c.Jobs.Minter.BuildTimeout
+	err := c.Validate()
+	require.ErrorContains(t, err, "treasury.toolbox.reconcile_grace")
+	require.ErrorContains(t, err, "jobs.minter.build_timeout")
+
+	c.Treasury.Toolbox.ReconcileGrace = c.Jobs.Minter.BuildTimeout + time.Second
+	require.NoError(t, c.Validate())
+
+	c.Jobs.Minter.BuildTimeout = 0
+	require.ErrorContains(t, c.Validate(), "build_timeout")
+
+	// The mock treasury does not reconcile: no constraint.
+	c = toolboxConfig(t)
+	c.Treasury.Kind = "mock"
+	c.Treasury.Toolbox.ReconcileGrace = time.Second
+	require.NoError(t, c.Validate())
+}
+
+func TestDefaultTreasuryToolboxIsTTN(t *testing.T) {
+	c := config.Default()
+	assert.Equal(t, "ttn", c.Treasury.Toolbox.Network)
+	assert.Equal(t, "fuelkeeper", c.Treasury.Toolbox.Originator)
+	assert.Equal(t, time.Minute, c.Jobs.Minter.BuildTimeout)
+}

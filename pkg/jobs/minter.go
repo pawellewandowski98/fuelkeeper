@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
@@ -38,11 +39,15 @@ type MinterConfig struct {
 	MaxPendingShards int `yaml:"max_pending_shards"`
 	// MaxPerRound caps how many splits are attempted per pool per RunOnce.
 	MaxPerRound int `yaml:"max_per_round"`
+	// BuildTimeout bounds one split's Build plus PutShard. A treasury that
+	// reconciles unrecorded splits (treasury.Reconciler) must wait longer than
+	// this before aborting one; config.Validate enforces it for the toolbox.
+	BuildTimeout time.Duration `yaml:"build_timeout"`
 }
 
 // DefaultMinterConfig returns the spec defaults.
 func DefaultMinterConfig() MinterConfig {
-	return MinterConfig{Interval: 30 * time.Second, MaxPendingShards: 50, MaxPerRound: 20}
+	return MinterConfig{Interval: 30 * time.Second, MaxPendingShards: 50, MaxPerRound: 20, BuildTimeout: time.Minute}
 }
 
 // Validate checks the config.
@@ -52,6 +57,9 @@ func (c MinterConfig) Validate() error {
 	}
 	if c.MaxPendingShards <= 0 || c.MaxPerRound <= 0 {
 		return fmt.Errorf("jobs: minter max_pending_shards and max_per_round must be > 0")
+	}
+	if c.BuildTimeout <= 0 {
+		return fmt.Errorf("jobs: minter build_timeout must be > 0")
 	}
 	return nil
 }
@@ -73,6 +81,12 @@ func (c MinterConfig) Validate() error {
 // TargetAvailable rather than just past LowWater. While available sits
 // anywhere in [LowWater, TargetAvailable) the minter does nothing, so a pool
 // does not re-split for every single row consumed. See needsRefill.
+//
+// Treasuries with optional capabilities get two more steps at the start of a
+// round: a treasury.Reconciler is reconciled on the first round of every
+// lease (see startRound), and a treasury.ChunkEnsurer tops up its funding
+// chunks every round. Build plus PutShard of one split is bounded by
+// MinterConfig.BuildTimeout, the window a Reconciler's grace must exceed.
 type Minter struct {
 	st    store.Store
 	tr    treasury.Treasury
@@ -80,6 +94,12 @@ type Minter struct {
 	cfg   MinterConfig
 	clock pool.Clock
 	log   *slog.Logger
+
+	// lastRound is when the previous RunOnce ended (zero before the first).
+	lastRound time.Time
+	// reconcilePending is set on the first round of a lease and cleared once
+	// a Reconcile completes (a failed one is retried next round).
+	reconcilePending bool
 }
 
 // NewMinter creates a minter for the configured pools, or an error if cfg is
@@ -101,6 +121,8 @@ func (m *Minter) Interval() time.Duration { return m.cfg.Interval }
 // others, but a cancelled context stops immediately instead of working
 // through the remaining pools.
 func (m *Minter) RunOnce(ctx context.Context) error {
+	defer func() { m.lastRound = m.clock.Now() }()
+	m.startRound(ctx)
 	var errs []error
 	for _, pc := range m.pools {
 		if err := ctx.Err(); err != nil {
@@ -111,6 +133,83 @@ func (m *Minter) RunOnce(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// newLease reports whether this round starts a lease. The runner calls
+// RunOnce only while it holds the minter's lease, one Interval after the
+// previous round ended, so a gap of more than 1.5 intervals means at least
+// one tick found the lease held elsewhere and this instance has just
+// (re)acquired it. The first round of the process is a new lease too. A
+// false positive (a slow lease renewal) only costs an extra Reconcile, which
+// is a single wallet listing when there is nothing to settle.
+func (m *Minter) newLease(now time.Time) bool {
+	return m.lastRound.IsZero() || now.Sub(m.lastRound) > m.cfg.Interval+m.cfg.Interval/2
+}
+
+// startRound runs the treasury's optional per-round steps: Reconcile on the
+// first round of a lease (retried each round until it completes), then
+// EnsureChunks. Neither failure stops the round.
+func (m *Minter) startRound(ctx context.Context) {
+	if m.newLease(m.clock.Now()) {
+		m.reconcilePending = true
+	}
+	if rec, ok := m.tr.(treasury.Reconciler); ok && m.reconcilePending {
+		m.reconcilePending = !m.reconcile(ctx, rec)
+	}
+	if ce, ok := m.tr.(treasury.ChunkEnsurer); ok {
+		if err := ce.EnsureChunks(ctx); err != nil && ctx.Err() == nil {
+			m.log.Warn("treasury could not ensure funding chunks", "err", err)
+		}
+	}
+}
+
+// reconcile settles splits the treasury built but never recorded or sent,
+// and reports whether it completed.
+func (m *Minter) reconcile(ctx context.Context, rec treasury.Reconciler) bool {
+	rep, err := rec.Reconcile(ctx, m.knownSplit)
+	if err != nil {
+		if ctx.Err() == nil {
+			m.log.Error("treasury reconcile failed; retrying next round", "err", err)
+		}
+		return false
+	}
+	lvl := slog.LevelInfo
+	if len(rep.Aborted) > 0 || len(rep.Errors) > 0 {
+		lvl = slog.LevelWarn
+	}
+	m.log.Log(ctx, lvl, "treasury reconciled", "resent", len(rep.Resent), "aborted", len(rep.Aborted),
+		"deferred", len(rep.Deferred), "errors", len(rep.Errors))
+	m.log.Debug("treasury reconcile txids", "resent", hashStrings(rep.Resent), "aborted", hashStrings(rep.Aborted),
+		"deferred", hashStrings(rep.Deferred))
+	for txid, err := range rep.Errors {
+		m.log.Warn("treasury reconcile could not settle a split", "txid", txid.String(), "err", err)
+	}
+	return true
+}
+
+// knownSplit reports whether any configured pool records a shard for txid.
+// A store failure is an error, so Reconcile never aborts a split it could
+// not look up.
+func (m *Minter) knownSplit(ctx context.Context, txid chainhash.Hash) (bool, error) {
+	for _, pc := range m.pools {
+		_, err := m.st.GetShard(ctx, pc.Name, txid)
+		switch {
+		case err == nil:
+			return true, nil
+		case errors.Is(err, store.ErrNotFound):
+		default:
+			return false, fmt.Errorf("pool %s: %w", pc.Name, err)
+		}
+	}
+	return false, nil
+}
+
+func hashStrings(hs []chainhash.Hash) []string {
+	out := make([]string, len(hs))
+	for i, h := range hs {
+		out[i] = h.String()
+	}
+	return out
 }
 
 func publishStats(p string, st store.Stats) {
@@ -159,8 +258,11 @@ func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		b, err := m.tr.Build(ctx, treasury.MintRequest{Pool: pc.Name, Denomination: pc.Denomination, Count: pc.SplitSize, LockMode: pc.LockMode})
+		// Build and PutShard share one deadline (see MinterConfig.BuildTimeout).
+		bctx, cancel := context.WithTimeout(ctx, m.cfg.BuildTimeout)
+		b, err := m.tr.Build(bctx, treasury.MintRequest{Pool: pc.Name, Denomination: pc.Denomination, Count: pc.SplitSize, LockMode: pc.LockMode})
 		if err != nil {
+			cancel()
 			minterSplits.WithLabelValues(pc.Name, "build_failed").Inc()
 			if errors.Is(err, treasury.ErrInsufficientFunds) {
 				m.log.Warn("treasury cannot fund a split", "pool", pc.Name, "deficit", deficit)
@@ -172,11 +274,13 @@ func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 			m.log.Error("build split", "pool", pc.Name, "err", err)
 			return err
 		}
-		if err := m.st.PutShard(ctx, b.Shard, b.Rows); err != nil {
+		err = m.st.PutShard(bctx, b.Shard, b.Rows)
+		cancel()
+		if err != nil {
 			minterSplits.WithLabelValues(pc.Name, "record_failed").Inc()
 			// A signed split now exists in the treasury that was never
-			// recorded; log at Error with the txid so Plan 5's startup
-			// reconciliation of unrecorded splits can find it.
+			// recorded; log at Error with the txid. A treasury.Reconciler
+			// aborts it on the next lease's first round.
 			m.log.Error("record split; a signed split may now be unrecorded", "pool", pc.Name, "txid", b.Shard.TxID.String(), "err", err)
 			return err // never send what we could not record
 		}

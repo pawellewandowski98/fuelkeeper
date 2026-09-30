@@ -19,11 +19,12 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/config"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/jobs"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/oracle"
+	ofactory "github.com/bsv-blockchain/fuelkeeper/pkg/oracle/factory"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/treasury"
-	tmock "github.com/bsv-blockchain/fuelkeeper/pkg/treasury/mock"
+	tfactory "github.com/bsv-blockchain/fuelkeeper/pkg/treasury/factory"
 )
 
 // shutdownTimeout bounds how long graceful HTTP shutdown waits for
@@ -60,29 +61,16 @@ func newLogger(c config.LogConfig) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, opts))
 }
 
-// buildOracle returns the configured oracle. Only "none" and "mock" are
-// available in this build; teranode/arcade/composite arrive in Plan 5. The
-// second return value is non-nil only for "mock", so callers can drive it
-// further (SetAssumeUnspent, or wiring it to the mock treasury's send hook).
-func buildOracle(c config.OracleConfig) (oracle.Oracle, *oracle.Mock, error) {
-	switch c.Kind {
-	case "none":
-		return oracle.None{}, nil, nil
-	case "mock":
-		m := oracle.NewMock()
-		m.SetAssumeUnspent(c.Mock.AssumeUnspent)
-		return m, m, nil
-	default:
-		return nil, nil, fmt.Errorf("oracle.kind %q is not available in this build", c.Kind)
+// buildOracle returns the configured oracle (pkg/oracle/factory). The second
+// return value is non-nil only for "mock", so callers can drive it further
+// (wiring it to the mock treasury's send hook).
+func buildOracle(c ofactory.Config) (oracle.Oracle, *oracle.Mock, error) {
+	orc, err := ofactory.New(c)
+	if err != nil {
+		return nil, nil, err
 	}
-}
-
-// stoppable is implemented by a treasury.Treasury that owns background
-// timers which must be halted before the store closes (see
-// sendConfirmer/buildTreasury). runServeConfig type-asserts for it during
-// teardown; a treasury that owns no such timers need not implement it.
-type stoppable interface {
-	stopPendingTimers()
+	m, _ := orc.(*oracle.Mock)
+	return orc, m, nil
 }
 
 // sendConfirmer schedules delayed callbacks (the nullnet mock's simulated
@@ -135,43 +123,37 @@ func (c *sendConfirmer) Stop() {
 	}
 }
 
-// confirmingTreasury wraps a treasury.Treasury with the sendConfirmer that
-// backs its WithOnSend callback, so runServeConfig can stop pending timers on
-// teardown via the stoppable interface.
-type confirmingTreasury struct {
-	treasury.Treasury
+// openedTreasury is an open treasury plus the nullnet confirmer backing the
+// mock's send hook.
+type openedTreasury struct {
+	*tfactory.Opened
 	confirmer *sendConfirmer
 }
 
-func (t *confirmingTreasury) stopPendingTimers() { t.confirmer.Stop() }
-
-var _ stoppable = (*confirmingTreasury)(nil)
-
-// buildTreasury returns the configured treasury. Only "mock" is available in
-// this build; the toolbox treasury arrives in Plan 5. For "mock", it wires
-// WithOnSend so that, ConfirmAfter after a split is sent, mockOracle reports
-// it mined -- the "nullnet" pipeline that lets the watcher and minter run
-// against no real chain. mockOracle may be nil (oracle.kind: none), in which
-// case sends are never confirmed. This never touches the store, so callers
-// can (and should) call it before opening one: an unsupported oracle/treasury
-// kind then fails fast without ever creating a sqlite file or postgres pool.
-func buildTreasury(c config.TreasuryConfig, mockOracle *oracle.Mock) (treasury.Treasury, error) {
-	switch c.Kind {
-	case "mock":
-		var opts []tmock.Option
-		confirmer := newSendConfirmer()
-		if mockOracle != nil {
-			delay := c.Mock.ConfirmAfter
-			opts = append(opts, tmock.WithOnSend(func(txid chainhash.Hash) {
-				confirmer.schedule(delay, func() {
-					mockOracle.SetTx(txid, oracle.TxStatus{Known: true, Mined: true, BlockHeight: 1, MerklePath: []byte{0}})
-				})
-			}))
-		}
-		return &confirmingTreasury{Treasury: tmock.New(opts...), confirmer: confirmer}, nil
-	default:
-		return nil, fmt.Errorf("treasury.kind %q is not available in this build", c.Kind)
+// openTreasury opens the configured treasury (pkg/treasury/factory). For
+// "mock", it wires the send hook so that, ConfirmAfter after a split is
+// sent, mockOracle reports it mined -- the "nullnet" pipeline that lets the
+// watcher and minter run against no real chain. mockOracle may be nil
+// (oracle.kind: none), in which case sends are never confirmed. For
+// "toolbox" it opens the wallet storage and starts the toolbox services; a
+// config error returns before that. The store is never touched, so an
+// invalid kind fails before a sqlite file or postgres pool is created.
+func openTreasury(ctx context.Context, cfg *config.Config, mockOracle *oracle.Mock, log *slog.Logger) (*openedTreasury, error) {
+	confirmer := newSendConfirmer()
+	var opts []tfactory.Option
+	if mockOracle != nil {
+		delay := cfg.Treasury.Mock.ConfirmAfter
+		opts = append(opts, tfactory.WithMockOnSend(func(txid chainhash.Hash) {
+			confirmer.schedule(delay, func() {
+				mockOracle.SetTx(txid, oracle.TxStatus{Known: true, Mined: true, BlockHeight: 1, MerklePath: []byte{0}})
+			})
+		}))
 	}
+	o, err := tfactory.Open(ctx, cfg.Treasury, cfg.Pools, log, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("treasury: %w", err)
+	}
+	return &openedTreasury{Opened: o, confirmer: confirmer}, nil
 }
 
 // logNullnetHint logs a one-line development nudge when a mock treasury is
@@ -242,13 +224,14 @@ func runServe(ctx context.Context, cfgPath string, onListen func(string)) error 
 // hand-built *config.Config (e.g. one with a deliberately invalid Jobs
 // config) or with hooks.newStore standing in for a real backend.
 //
-// Order is deliberate: the oracle and treasury are built, and their "kind"
-// validated, before the store is opened -- an unsupported kind then fails
-// fast without ever touching disk or a database. Shutdown order is the
-// mirror image and is the load-bearing part of this function: stop accepting
-// HTTP (srv.Shutdown, which drains in-flight requests) *before* cancelling
-// the pools and jobs that those in-flight requests still need, then close
-// the store only once everything above it has stopped touching it.
+// Order is deliberate: the oracle is built and the treasury opened before
+// the store is opened -- a bad oracle or treasury config then fails fast
+// without ever touching the store. Shutdown order is the mirror image and is
+// the load-bearing part of this function: stop accepting HTTP (srv.Shutdown,
+// which drains in-flight requests) *before* cancelling the pools and jobs
+// that those in-flight requests still need, then close the treasury (which
+// the jobs used), and close the store only once everything above it has
+// stopped touching it.
 //
 // poolCtx and jobCtx deliberately derive from context.WithoutCancel(ctx),
 // not ctx itself: ctx is the process's signal context, cancelled the instant
@@ -261,9 +244,10 @@ func runServe(ctx context.Context, cfgPath string, onListen func(string)) error 
 //
 // Every stage logs once it completes, at Info: "shutting down" (the decision
 // to stop has been made), "http drained" (Shutdown returned), "pools
-// stopped", "jobs stopped", "store closed" (or a store-close error, at
-// Error). Pools, jobs and any pending mock-treasury timers are torn down by
-// one deferred function, registered right after they start, so a listen
+// stopped", "jobs stopped", "treasury closed", "store closed" (or a close
+// error, at Error). Pools, jobs, the treasury and any pending mock-treasury
+// timers are torn down by one deferred function, registered right after
+// they start, so a listen
 // failure or a startJobs error also reaches it -- there is exactly one
 // teardown path, not one for the happy path and another for early errors.
 func runServeConfig(ctx context.Context, cfg *config.Config, hooks serveHooks) error {
@@ -271,15 +255,28 @@ func runServeConfig(ctx context.Context, cfg *config.Config, hooks serveHooks) e
 	logNullnetHint(log, cfg)
 	warnInsecureListener(log, cfg)
 
-	// Validate the oracle/treasury kind before the store is ever opened.
+	// Build the oracle and open the treasury before the store is ever opened.
 	orc, mockOrc, err := buildOracle(cfg.Oracle)
 	if err != nil {
 		return err
 	}
-	tr, err := buildTreasury(cfg.Treasury, mockOrc)
+	ot, err := openTreasury(ctx, cfg, mockOrc, log)
 	if err != nil {
 		return err
 	}
+	tr := ot.Treasury
+	// closeTreasury runs once: normally from the teardown below, after the
+	// jobs stopped and before the store closes; this defer only covers a
+	// return before that teardown is registered (a store-open failure).
+	closeTreasury := sync.OnceFunc(func() {
+		ot.confirmer.Stop()
+		if cerr := ot.Closer.Close(); cerr != nil {
+			log.Error("treasury close failed", "err", cerr)
+			return
+		}
+		log.Info("treasury closed")
+	})
+	defer closeTreasury()
 
 	clock := pool.RealClock{}
 	newStore := hooks.newStore
@@ -334,9 +331,7 @@ func runServeConfig(ctx context.Context, cfg *config.Config, hooks serveHooks) e
 		cancelJobs()
 		jobWG.Wait()
 		log.Info("jobs stopped")
-		if s, ok := tr.(stoppable); ok {
-			s.stopPendingTimers()
-		}
+		closeTreasury()
 	}()
 
 	if cfg.Jobs.Enabled {
@@ -355,6 +350,7 @@ func runServeConfig(ctx context.Context, cfg *config.Config, hooks serveHooks) e
 		MaxBodyBytes:   cfg.API.MaxBodyBytes,
 		RequestTimeout: cfg.API.RequestTimeout,
 		Version:        version,
+		Funder:         ot.Funder,
 	})
 	srv := api.NewServer(cfg.API.Listen, h, cfg.API.ReadTimeout, cfg.API.WriteTimeout, cfg.API.IdleTimeout)
 	var lc net.ListenConfig

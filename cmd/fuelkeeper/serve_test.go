@@ -6,9 +6,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,15 +112,14 @@ log:
 }
 
 // TestServeRejectsBadConfig checks two ways runServe fails fast: a config
-// file that does not exist, and a config that asks for a build kind that is
-// not wired up yet (oracle.kind: teranode arrives in Plan 5).
+// file that does not exist, and an oracle kind missing the URL it needs.
 func TestServeRejectsBadConfig(t *testing.T) {
 	t.Run("missing file", func(t *testing.T) {
 		err := runServe(context.Background(), filepath.Join(t.TempDir(), "does-not-exist.yaml"), nil)
 		require.Error(t, err)
 	})
 
-	t.Run("oracle kind not available in this build", func(t *testing.T) {
+	t.Run("oracle kind without its url", func(t *testing.T) {
 		cfg := `
 store:
   backend: memory
@@ -137,7 +138,7 @@ log:
 		path := filepath.Join(t.TempDir(), "fk.yaml")
 		require.NoError(t, os.WriteFile(path, []byte(cfg), 0o600))
 		err := runServe(context.Background(), path, nil)
-		require.ErrorContains(t, err, "not available in this build")
+		require.ErrorContains(t, err, "oracle.teranode_url is required")
 	})
 }
 
@@ -365,4 +366,104 @@ func TestRunServeConfigStartJobsErrorWrapping(t *testing.T) {
 
 	err := runServeConfig(context.Background(), cfg, serveHooks{})
 	require.ErrorContains(t, err, "reaper:")
+}
+
+// TestRunServeConfigToolboxTreasury serves with the go-wallet-toolbox
+// treasury against a local stand-in for arcade and chaintracks (every
+// endpoint 404s, so nothing leaves the machine) and an empty sqlite wallet:
+// the treasury opens before the store, its Funder backs GET /v1/funding, the
+// jobs run against it (an unfunded wallet only logs), and shutdown closes
+// the treasury after the jobs and before the store.
+func TestRunServeConfigToolboxTreasury(t *testing.T) {
+	stub := httptest.NewServer(http.NotFoundHandler())
+	defer stub.Close()
+	cfg := shutdownTestConfig(t)
+	cfg.Oracle.Kind = "arcade"
+	cfg.Oracle.ArcadeURL = stub.URL
+	cfg.Treasury.Kind = "toolbox"
+	tb := &cfg.Treasury.Toolbox
+	tb.RootKeyHex = "0000000000000000000000000000000000000000000000000000000000000002"
+	tb.ArcadeURL = stub.URL
+	tb.ChaintracksURL = stub.URL + "/chaintracks"
+	tb.FeeSatPerKB = 1
+	tb.Storage.SQLite = filepath.Join(t.TempDir(), "treasury.sqlite")
+	require.NoError(t, cfg.Validate())
+
+	var (
+		mu     sync.Mutex
+		events []string
+	)
+	record := func(e string) { mu.Lock(); events = append(events, e); mu.Unlock() }
+	hooks := serveHooks{
+		newStore: func(ctx context.Context, sc factory.Config, now func() time.Time) (store.Store, error) {
+			record("store opened")
+			st, err := factory.New(ctx, sc, now)
+			if err != nil {
+				return nil, err
+			}
+			return closeRecorder{Store: st, onClose: func() { record("store closed") }}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	addr := make(chan string, 1)
+	hooks.onListen = func(a string) { addr <- a }
+	errc := make(chan error, 1)
+	go func() { errc <- runServeConfig(ctx, cfg, hooks) }()
+	var base string
+	select {
+	case base = <-addr:
+	case err := <-errc:
+		t.Fatalf("serve exited early: %v", err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("serve did not start")
+	}
+	c, err := client.New("http://" + base)
+	require.NoError(t, err)
+	info, err := c.FundingInfo(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, "ttn", info.Network)
+	assert.Equal(t, "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5", info.IdentityKey)
+	assert.NotEmpty(t, info.DerivationPrefix)
+
+	time.Sleep(300 * time.Millisecond) // let the minter run a few rounds against the unfunded wallet
+	cancel()
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("serve did not stop")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"store opened", "store closed"}, events)
+	_, err = os.Stat(tb.Storage.SQLite)
+	require.NoError(t, err, "the treasury wallet storage was created")
+}
+
+// TestRunServeConfigBadToolboxConfigFailsBeforeStore bypasses config.Validate
+// with a toolbox treasury that has no root key: the treasury fails to open
+// and the store is never opened.
+func TestRunServeConfigBadToolboxConfigFailsBeforeStore(t *testing.T) {
+	cfg := shutdownTestConfig(t)
+	cfg.Treasury.Kind = "toolbox"
+	hooks := serveHooks{
+		newStore: func(context.Context, factory.Config, func() time.Time) (store.Store, error) {
+			t.Fatal("store opened despite a bad treasury config")
+			return nil, nil
+		},
+	}
+	err := runServeConfig(context.Background(), cfg, hooks)
+	require.ErrorContains(t, err, "treasury:")
+	require.ErrorContains(t, err, "root_key_hex")
+}
+
+// closeRecorder reports Close.
+type closeRecorder struct {
+	store.Store
+	onClose func()
+}
+
+func (c closeRecorder) Close() error {
+	c.onClose()
+	return c.Store.Close()
 }

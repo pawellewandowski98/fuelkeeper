@@ -84,19 +84,44 @@ jobs:
     interval: 30s                    # How often to mint new shards; default 30s
     max_per_round: 20                # Max new shards per minting round; default 20
     max_pending_shards: 50           # Max unmined shards before minting pauses; default 50
+    build_timeout: 60s               # Bound on one split's Build + PutShard; default 60s; must be < treasury.toolbox.reconcile_grace
 
 # Chain oracle (verifies spend and unspent states)
 oracle:
-  kind: none                         # none | mock | teranode | arcade | composite (Plan 5+)
+  kind: none                         # none (default) | mock | arcade | teranode | composite
   mock:
     assume_unspent: true             # When true, assume unknown outpoints are unspent (nullnet only)
-  # teranode, arcade fields come in Plan 5
+  arcade_url: ""                     # Arcade base URL; required for arcade and composite
+  teranode_url: ""                   # Teranode asset API base (e.g. http://teranode:8090/api/v1);
+                                     #   required for teranode, optional for composite
+  teranode_batch_threshold: 0        # Outpoints above which teranode batches lookups; 0 = 8, < 0 disables
 
 # Treasury (produces split transactions)
 treasury:
-  kind: mock                         # mock (nullnet only) | toolbox (Plan 5)
+  kind: mock                         # mock (default, nullnet only) | toolbox
   mock:
     confirm_after: 2s                # How long after send to mark splits mined (nullnet only)
+  toolbox:                           # go-wallet-toolbox wallet; see docs/TREASURY.md
+    network: ttn                     # main | test | ttn (default) | tstn
+    root_key_hex: ${FUELKEEPER_TREASURY_KEY}  # 64 hex chars; required for kind toolbox; never commit it
+    originator: fuelkeeper           # BRC-100 originator; default fuelkeeper
+    fee_sat_per_kb: 0                # 0 = read arcade /policy at start (floor 1)
+    arcade_url: ""                   # Arcade base URL (broadcast, status); required
+    arcade_events_url: ""            # Arcade SSE events base; default arcade_url
+    chaintracks_url: ""              # Chaintracks (headers, SPV); required
+    storage:
+      engine: sqlite                 # sqlite (default) | postgres
+      sqlite_path: treasury.sqlite   # Wallet database for engine sqlite
+      postgres: {host: "", port: 0, dbname: "", user: "", password: "", sslmode: ""}  # port 0 = 5432; sslmode "" = verify-full
+    chunking:
+      fanout_outputs_per_tx: 100     # Chunks per reserve chunk (M); default 100
+      target_chunks: 50              # Leaf-sized chunks kept ready; default 50
+      low_water_percent: 60          # Refill below this share of target_chunks; default 60
+      headroom_sats: 20              # Added to each chunk so the leaf surplus stays below dust; default 20
+      interval: 10s                  # Keeper cadence (the minter drives it each round); default 10s
+      reserve_basket: reserve        # Wallet basket for reserve chunks; default reserve
+      chunk_basket: chunks           # Wallet basket for leaf-sized chunks; default chunks
+    reconcile_grace: 2m              # Gap between Reconcile's two listings; must exceed jobs.minter.build_timeout
 
 # HTTP API listener
 api:
@@ -126,6 +151,9 @@ On startup, FuelKeeper validates the configuration:
 - `jobs.watcher.limit` must exceed `jobs.minter.max_pending_shards`
 - Mint capacity must be ≥ 1.2× `expected_tps` for each pool (when expected_tps > 0)
 - Pools with `spend_policy: verify` or `release_policy: verify` require an oracle (`oracle.kind` != "none")
+- `oracle.kind: arcade` and `composite` need `oracle.arcade_url`; `teranode` needs `oracle.teranode_url`
+- `treasury.kind: toolbox` needs a valid `root_key_hex`, `arcade_url` and `chaintracks_url`, and every pool must share one leaf cost class (same `split_size` × `denomination`, same leaf size): one treasury keeps one chunk denomination (see [TREASURY.md](TREASURY.md))
+- `treasury.toolbox.reconcile_grace` must exceed `jobs.minter.build_timeout`, or Reconcile could abort a split whose Build and PutShard were merely slow
 
 ## Deployment Topologies
 
@@ -176,7 +204,9 @@ Runs every `watcher.interval`. Responsibilities:
 
 Runs every `minter.interval`. Responsibilities:
 
-- Build, sign and send new split transactions ("shards") to keep each pool's available rows near target
+- On the first round of each lease (and each process start), run the treasury's Reconcile: splits built but never recorded are aborted, recorded but unsent ones are sent (toolbox treasury; see [TREASURY.md](TREASURY.md#reconciliation))
+- At the start of every round, top up the treasury's leaf-sized funding chunks (toolbox treasury)
+- Build, sign and send new split transactions ("shards") to keep each pool's available rows near target; one split's Build + PutShard is bounded by `build_timeout`
 - Stop minting when unmined shards exceed `max_pending_shards`
 - Retire shards if the treasury rejects them (terminal failure)
 
@@ -216,6 +246,24 @@ Key differences from production:
 - **Mock treasury** instantly "mines" shards after `confirm_after` (never to production)
 - **Memory backend** loses all state on restart
 - Shorter job intervals enable faster testing
+
+## Teratestnet (Real Treasury)
+
+`examples/teratestnet.yaml` runs the go-wallet-toolbox treasury on the public
+Teranode test network with a composite (arcade + teranode) oracle and sqlite
+storage. It needs `FUELKEEPER_TREASURY_KEY`, `FUELKEEPER_API_KEY` and
+`FUELKEEPER_ADMIN_KEY` in the environment; the arcade and chaintracks URLs
+default to the toolbox's public ttn endpoints. Fund the treasury with
+`fuelkeeper fund` ([FUNDING.md](FUNDING.md)) before expecting fuel; until
+then the minter logs "treasury cannot fund a split" each round. Key
+material, chunk sizing, backups and reconciliation are in
+[TREASURY.md](TREASURY.md).
+
+At start-up a binary that links the toolbox prints two lines on stderr,
+`WARN: No config file 'settings.conf'` and `WARN: No local config file
+'settings_local.conf'`. They come from a settings package the toolbox's
+chaintracks client pulls in and are harmless; FuelKeeper does not read
+those files.
 
 ## What to Watch
 
@@ -358,7 +406,7 @@ Pools with `spend_policy: verify` need an oracle that is not "none"; FuelKeeper 
 
 Similarly, `release_policy: verify` requires an oracle with error `"release_policy=verify requires an oracle"`.
 
-Remedy: either set `oracle.kind` to teranode, arcade, composite, or mock (with assume_unspent: true for nullnet), or change the policies to "trust".
+Remedy: either set `oracle.kind` to arcade, teranode or composite (with its `arcade_url`/`teranode_url`), or mock (with assume_unspent: true for nullnet), or change the policies to "trust".
 
 ### Configuration Validation Errors
 

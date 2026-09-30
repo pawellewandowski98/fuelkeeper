@@ -1,0 +1,85 @@
+# Teratestnet (ttn) configuration: a real go-wallet-toolbox treasury on the
+# public Teranode test network, arcade + teranode as the chain oracle, sqlite
+# storage for both FuelKeeper and the treasury wallet.
+#
+# Environment (see docs/TREASURY.md and docs/OPERATIONS.md):
+#   FUELKEEPER_TREASURY_KEY   required: the treasury wallet root key, 64 hex chars.
+#                             Every derived key (BRC-29 funding, per-pool P2PKH
+#                             fuel keys) comes from it: back it up, never commit it.
+#   FUELKEEPER_API_KEY        required: the /v1 API key.
+#   FUELKEEPER_ADMIN_KEY      required: the admin key (funding, quarantine).
+#   FUELKEEPER_ARCADE_URL     optional: defaults to the toolbox's public ttn arcade
+#                             (go-wallet-toolbox defs.ArcadeTTNURL).
+#   FUELKEEPER_CHAINTRACKS_URL optional: defaults to that host's /chaintracks, the
+#                             toolbox's ttn default.
+#   FUELKEEPER_TERANODE_URL   optional: a teranode asset API base
+#                             (e.g. http://teranode:8090/api/v1); without it the
+#                             oracle is arcade-only and outpoint checks stay Unknown.
+#
+# References below use the brace form: a dollar sign and a braced NAME is the
+# environment variable NAME and must be set; ":-default" inside the braces
+# supplies a default instead. Two dollar signs are one literal dollar sign.
+# Expansion also applies inside comments, so do not write a reference here.
+
+instance:
+  instance_id: ${FUELKEEPER_INSTANCE_ID:-ttn-1}
+
+store:
+  backend: sqlite
+  sqlite:
+    path: ${FUELKEEPER_STORE_PATH:-fuelkeeper.sqlite}
+
+pools:
+  # One treasury funds one leaf cost class: every pool must share
+  # split_size x denomination and lock mode (docs/TREASURY.md).
+  - name: main
+    denomination: 50
+    split_size: 50
+    target_available: 500
+    low_water: 250
+    lock_mode: puzzle
+
+jobs:
+  enabled: true
+  minter:
+    interval: 30s
+    max_per_round: 5
+    max_pending_shards: 20
+    # Build + PutShard of one split; treasury.toolbox.reconcile_grace must exceed it.
+    build_timeout: 60s
+
+oracle:
+  kind: composite
+  arcade_url: ${FUELKEEPER_ARCADE_URL:-https://arcade-v2-ttn-us-1.bsvblockchain.tech}
+  teranode_url: ${FUELKEEPER_TERANODE_URL:-}
+
+treasury:
+  kind: toolbox
+  toolbox:
+    network: ttn
+    root_key_hex: ${FUELKEEPER_TREASURY_KEY}
+    originator: fuelkeeper
+    # 0 = read arcade's /policy at start (floor 1 sat/kB).
+    fee_sat_per_kb: 0
+    arcade_url: ${FUELKEEPER_ARCADE_URL:-https://arcade-v2-ttn-us-1.bsvblockchain.tech}
+    chaintracks_url: ${FUELKEEPER_CHAINTRACKS_URL:-https://arcade-v2-ttn-us-1.bsvblockchain.tech/chaintracks}
+    storage:
+      engine: sqlite
+      sqlite_path: ${FUELKEEPER_TREASURY_DB:-treasury.sqlite}
+    chunking:
+      fanout_outputs_per_tx: 100
+      target_chunks: 50
+      low_water_percent: 60
+      headroom_sats: 20
+      interval: 10s
+      reserve_basket: reserve
+      chunk_basket: chunks
+    reconcile_grace: 2m
+
+api:
+  listen: "127.0.0.1:8080"
+  api_keys: ["${FUELKEEPER_API_KEY}"]
+  admin_keys: ["${FUELKEEPER_ADMIN_KEY}"]
+
+log:
+  level: info
