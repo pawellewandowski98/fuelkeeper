@@ -27,6 +27,7 @@ import (
 	"github.com/bsv-blockchain/go-wallet-toolbox/pkg/defs"
 	pkgerrors "github.com/bsv-blockchain/go-wallet-toolbox/pkg/errors"
 	"github.com/bsv-blockchain/go-wallet-toolbox/pkg/wdk"
+	"github.com/bsv-blockchain/go-wallet-toolbox/pkg/wdk/primitives"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -124,48 +125,90 @@ func TestRunToolboxModeRequiresArcade(t *testing.T) {
 // TestToolboxClassifiesCreateErrors pins classifyCreateError's mapping.
 func TestToolboxClassifiesCreateErrors(t *testing.T) {
 	someTxID := "ab" + strings.Repeat("0", 62)
+
+	// reviewErr builds a *pkgerrors.ProcessActionError carrying someTxID and
+	// one ReviewActionResult for it, as go-wallet-toolbox's storage layer
+	// would after arcade reviewed a posted transaction.
+	reviewErr := func(status wdk.ReviewActionResultStatus, competing []string) error {
+		return pkgerrors.NewProcessActionError(nil, []wdk.ReviewActionResult{
+			{TxID: primitives.TXIDHexString(someTxID), Status: status, CompetingTxs: competing},
+		}).WithTx(someTxID, nil)
+	}
+
 	cases := map[string]struct {
 		err  error
 		code string
-		then outcome
-		txid string
+		want client.Settlement
 	}{
-		"reject with txid": {
+		"reject with txid, double spend review": {
+			fmt.Errorf("create action failed: %w", reviewErr(wdk.ReviewActionResultStatusDoubleSpend, []string{"cc1", "cc2"})),
+			"reject:double_spend",
+			client.Settlement{Outcome: client.OutcomeDoubleSpend, TxID: someTxID, CompetingTxIDs: []string{"cc1", "cc2"}},
+		},
+		"reject with txid, invalid tx review": {
+			reviewErr(wdk.ReviewActionResultStatusInvalidTx, nil),
+			"reject:invalid",
+			client.Settlement{Outcome: client.OutcomeNotBroadcast, TxID: someTxID},
+		},
+		"reject with txid, service error review": {
+			fmt.Errorf("create action failed: %w", reviewErr(wdk.ReviewActionResultStatusServiceError, nil)),
+			"reject:service",
+			client.Settlement{Outcome: client.OutcomeUnknown, TxID: someTxID},
+		},
+		"reject with txid, unexpected success review": {
+			reviewErr(wdk.ReviewActionResultStatusSuccess, nil),
+			"reject:unknown",
+			client.Settlement{Outcome: client.OutcomeUnknown, TxID: someTxID},
+		},
+		"reject with txid, no matching review result": {
 			fmt.Errorf("create action failed: %w", pkgerrors.NewProcessActionError(nil, nil).WithTx(someTxID, nil).Wrap(errors.New("arcade said no"))),
-			"reject", outcomeSpend, someTxID,
+			"reject:unknown",
+			client.Settlement{Outcome: client.OutcomeUnknown, TxID: someTxID},
 		},
 		"reject without txid": {
 			// As storage raises it after a broadcast it then failed to record.
 			fmt.Errorf("cannot update single tx after broadcast: %w", pkgerrors.NewProcessActionError(nil, nil).Wrap(pkgerrors.NewTransactionErrorFromTxIDHex(someTxID))),
-			"reject:unknown", outcomeHold, "",
+			"reject:unknown",
+			client.Settlement{Outcome: client.OutcomeUnknown},
 		},
-		"reject wrapping not-enough-funds": {
-			// ProcessActionError.Is also matches its cause; it is still a reject.
+		"reject wrapping not-enough-funds, no review": {
+			// The process-error-with-txid branch is checked (and its lack of
+			// a matching review result decided) before errors.Is ever sees
+			// the wrapped wdk.ErrNotEnoughFunds: it is still reject:unknown,
+			// not underfunded.
 			pkgerrors.NewProcessActionError(nil, nil).WithTx(someTxID, nil).Wrap(wdk.ErrNotEnoughFunds),
-			"reject", outcomeSpend, someTxID,
+			"reject:unknown",
+			client.Settlement{Outcome: client.OutcomeUnknown, TxID: someTxID},
 		},
-		"reject with txid wrapping a deadline": {
-			// The process error is checked first: a posted tx with a known
-			// txid is a spend even when the deadline also expired.
+		"reject with txid wrapping a deadline, no review": {
+			// Likewise: a posted tx with a known txid is classified from its
+			// (missing) review result, not reclassified as a timeout just
+			// because the deadline also expired.
 			fmt.Errorf("create action failed: %w", pkgerrors.NewProcessActionError(nil, nil).WithTx(someTxID, nil).Wrap(context.DeadlineExceeded)),
-			"reject", outcomeSpend, someTxID,
+			"reject:unknown",
+			client.Settlement{Outcome: client.OutcomeUnknown, TxID: someTxID},
 		},
 		"action deadline": {
 			fmt.Errorf("create action failed: failed to process created action: %w", context.DeadlineExceeded),
-			"timeout", outcomeHold, "",
+			"timeout",
+			client.Settlement{Outcome: client.OutcomeUnknown},
 		},
 		"underfunded": {
 			fmt.Errorf("create action failed: failed to create transaction: %w", wdk.ErrNotEnoughFunds),
-			"underfunded", outcomeRelease, "",
+			"underfunded",
+			client.Settlement{Outcome: client.OutcomeNotBroadcast},
 		},
-		"other": {errors.New("failed to verify beef"), "create", outcomeRelease, ""},
+		"other": {
+			errors.New("failed to verify beef"),
+			"create",
+			client.Settlement{Outcome: client.OutcomeNotBroadcast},
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			code, then, txid := classifyCreateError(tc.err)
+			code, got := classifyCreateError(tc.err)
 			assert.Equal(t, tc.code, code)
-			assert.Equal(t, tc.then, then)
-			assert.Equal(t, tc.txid, txid)
+			assert.Equal(t, tc.want, got)
 		})
 	}
 }
@@ -252,12 +295,23 @@ func (f *fakeCreator) CreateAction(context.Context, sdk.CreateActionArgs, string
 // the reaper's quarantine + oracle path, so no other worker can reserve an
 // output that may already be on the network.
 func TestToolboxHoldsOutputsOfUnknownFate(t *testing.T) {
+	holdTxID := "cd" + strings.Repeat("0", 62)
 	cases := map[string]struct {
 		err  error
 		code string
 	}{
 		"reject without txid": {pkgerrors.NewProcessActionError(nil, nil).Wrap(errors.New("cannot update single tx after broadcast")), "reject:unknown"},
-		"timeout":             {fmt.Errorf("create action failed: %w", context.DeadlineExceeded), "timeout"},
+		"reject with txid, no matching review result": {
+			pkgerrors.NewProcessActionError(nil, nil).WithTx(holdTxID, nil).Wrap(errors.New("arcade said no")),
+			"reject:unknown",
+		},
+		"reject with txid, service error review": {
+			pkgerrors.NewProcessActionError(nil, []wdk.ReviewActionResult{
+				{TxID: primitives.TXIDHexString(holdTxID), Status: wdk.ReviewActionResultStatusServiceError},
+			}).WithTx(holdTxID, nil),
+			"reject:service",
+		},
+		"timeout": {fmt.Errorf("create action failed: %w", context.DeadlineExceeded), "timeout"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

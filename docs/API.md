@@ -10,7 +10,7 @@ A typical workflow:
 2. **Fetch BEEF** for each shard using the server-relative `beef_url` paths
 3. **Build and broadcast** your transaction with fuel outputs as inputs (each carries a complete unlocking script; no signing required)
 4. **Spend** the outputs with `POST /v1/pools/{pool}/spend` to report the transaction
-5. **Release** unused outputs with `POST /v1/pools/{pool}/release` if the transaction was not sent
+5. **Release** unused outputs with `POST /v1/pools/{pool}/release` if the transaction was not sent — but if it was rejected as a double-spend, report `spend` with the competing txid instead, never `release`; see docs/CLIENTS.md
 
 Example request bodies:
 
@@ -248,7 +248,7 @@ TypeScript wallets or other HTTP clients use the same endpoints and logic:
 4. Merge the fetched BEEF and pass it as `inputBEEF` to your transaction creation
 5. Broadcast the transaction
 6. `POST /v1/pools/{pool}/spend` with `{"token": "...", "outpoints": [...], "txid": "..."}` to report the spend
-7. On error, `POST /v1/pools/{pool}/release` to return unused outputs
+7. On error, `POST /v1/pools/{pool}/release` to return unused outputs — but if it was rejected as a double-spend, report `spend` with the competing txid instead, never `release`; see docs/CLIENTS.md
 
 **Note on development mode (nullnet)**: The mock treasury emits synthetic BEEF that the go-sdk cannot parse, so `InputBEEF` and `createAction` only work against a real treasury (Plan 5). Reservation, release, and spend operations work normally in nullnet.
 

@@ -284,56 +284,79 @@ func (t *toolboxRunner) Close() {
 	}
 }
 
-// outcome is what a worker does with a fuel output after a failed
-// createAction.
-type outcome int
-
-const (
-	// outcomeRelease hands the output back to the pool: the failure happened
-	// before any broadcast.
-	outcomeRelease outcome = iota
-	// outcomeSpend reports the output spent in the returned txid: the
-	// transaction was built and posted, so the oracle settles it.
-	outcomeSpend
-	// outcomeHold neither spends nor releases the output: it may have been
-	// broadcast, but no txid is known. The reservation is left to expire so
-	// the reaper's quarantine + oracle path settles it; releasing it would
-	// let another worker reserve an output that may already be spent.
-	outcomeHold
-)
-
 // classifyCreateError maps a createAction failure to the code toolbox mode
-// tallies it under, what to do with the fuel output, and the txid to report
-// when that is a spend:
+// tallies it under and the client.Settlement to report for the fuel output
+// it spent -- see (*toolboxRunner).spendBatch, which routes every one of
+// these through fk.Settle rather than deciding spend-vs-release itself:
 //
-//   - "reject" (spend): a *pkgerrors.ProcessActionError carrying a TxID --
-//     the wallet built, signed and posted the transaction but arcade did not
-//     accept it (or its verdict is missing).
-//   - "reject:unknown" (hold): a *pkgerrors.ProcessActionError without a
-//     TxID, e.g. storage failing to record a transaction it has already
-//     broadcast (TB pkg/storage/internal/actions/process.go:771-775).
-//   - "timeout" (hold): the action's own deadline (actionTimeout) expired;
-//     the transaction may or may not have been posted.
-//   - "underfunded" (release): wdk.ErrNotEnoughFunds -- the fuel output
-//     alone cannot pay the OP_RETURN output plus the fee at the wallet's fee
-//     model (raise the pool denomination or lower --fee-kb).
-//   - "create" (release): anything else (input BEEF verification, a
-//     malformed input, storage), all before any broadcast.
-func classifyCreateError(err error) (code string, then outcome, txid string) {
+//   - a *pkgerrors.ProcessActionError carrying a TxID -- the wallet built,
+//     signed and posted the transaction -- is classified from its
+//     ReviewResults entry for that TxID, when the wallet returned one:
+//     "reject:double_spend" (client.OutcomeDoubleSpend, hinting every
+//     competitor the review named) for status doubleSpend; "reject:invalid"
+//     (client.OutcomeNotBroadcast -- no competing transaction exists, so
+//     it's safe to release) for status invalidTx; "reject:service"
+//     (client.OutcomeUnknown -- arcade's own review service failed, the
+//     toolbox may still post the transaction later) for status
+//     serviceError. Unlike arcade's own synchronous POST /tx response
+//     (which never names a competitor -- see Client.Settle's "When a
+//     double-spend is actually knowable"), go-wallet-toolbox's storage
+//     layer reviews a posted transaction's fate asynchronously (polling for
+//     arcade's later ARC-466 conflict verdict, or via another configured
+//     gateway) before handing back this ProcessActionError, so a doubleSpend
+//     review result here is real and can be trusted immediately.
+//   - a TxID with no matching review result -- e.g. storage failing to
+//     record a transaction it has already broadcast (TB
+//     pkg/storage/internal/actions/process.go:771-775) -- is
+//     "reject:unknown" (client.OutcomeUnknown): reporting it Spend on sight
+//     regardless of review, as toolbox mode once did, would burn the row
+//     under spend_policy: trust on a mere bookkeeping failure, so its fate
+//     is instead left to the reservation's own expiry.
+//   - "timeout" (client.OutcomeUnknown): the action's own deadline
+//     (actionTimeout) expired; the transaction may or may not have been
+//     posted.
+//   - "underfunded" (client.OutcomeNotBroadcast): wdk.ErrNotEnoughFunds --
+//     the fuel output alone cannot pay the OP_RETURN output plus the fee at
+//     the wallet's fee model (raise the pool denomination or lower
+//     --fee-kb).
+//   - "create" (client.OutcomeNotBroadcast): anything else (input BEEF
+//     verification, a malformed input, storage), all before any broadcast.
+func classifyCreateError(err error) (code string, s client.Settlement) {
 	var perr *pkgerrors.ProcessActionError
 	if errors.As(err, &perr) {
 		if perr.TxID != "" {
-			return "reject", outcomeSpend, perr.TxID
+			if rr, ok := reviewResultFor(perr.ReviewResults, perr.TxID); ok {
+				switch rr.Status {
+				case wdk.ReviewActionResultStatusDoubleSpend:
+					return "reject:double_spend", client.Settlement{
+						Outcome: client.OutcomeDoubleSpend, TxID: perr.TxID, CompetingTxIDs: rr.CompetingTxs,
+					}
+				case wdk.ReviewActionResultStatusInvalidTx:
+					return "reject:invalid", client.Settlement{Outcome: client.OutcomeNotBroadcast, TxID: perr.TxID}
+				case wdk.ReviewActionResultStatusServiceError:
+					return "reject:service", client.Settlement{Outcome: client.OutcomeUnknown, TxID: perr.TxID}
+				}
+			}
 		}
-		return "reject:unknown", outcomeHold, ""
+		return "reject:unknown", client.Settlement{Outcome: client.OutcomeUnknown, TxID: perr.TxID}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return "timeout", outcomeHold, ""
+		return "timeout", client.Settlement{Outcome: client.OutcomeUnknown}
 	}
 	if errors.Is(err, wdk.ErrNotEnoughFunds) {
-		return "underfunded", outcomeRelease, ""
+		return "underfunded", client.Settlement{Outcome: client.OutcomeNotBroadcast}
 	}
-	return "create", outcomeRelease, ""
+	return "create", client.Settlement{Outcome: client.OutcomeNotBroadcast}
+}
+
+// reviewResultFor returns results' entry for txid, when one is present.
+func reviewResultFor(results []wdk.ReviewActionResult, txid string) (wdk.ReviewActionResult, bool) {
+	for _, rr := range results {
+		if rr.TxID.String() == txid {
+			return rr, true
+		}
+	}
+	return wdk.ReviewActionResult{}, false
 }
 
 // actionArgs is the createAction call spending one fuel input into the
@@ -361,26 +384,28 @@ func (t *toolboxRunner) actionArgs(res *wire.ReserveResponse, beef []byte, in sd
 	return args
 }
 
-// reportSpend reports outpoint spent in txid under token on a detached
-// deadline of its own (see reportTimeout) and tallies "spend:<code>" on
-// failure.
-func (t *toolboxRunner) reportSpend(ctx context.Context, token, outpoint, txid string) {
-	spendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
+// reportSettle reports s for outpoint under token on a detached deadline of
+// its own (see reportTimeout) and tallies "settle:<code>" on failure.
+func (t *toolboxRunner) reportSettle(ctx context.Context, token, outpoint string, s client.Settlement) {
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
 	defer cancel()
-	if _, err := t.fk.Spend(spendCtx, t.pool, token, []string{outpoint}, txid); err != nil {
-		t.rep.fail("spend:" + apiCode(err))
+	if _, err := t.fk.Settle(settleCtx, t.pool, token, []string{outpoint}, s); err != nil {
+		t.rep.fail("settle:" + apiCode(err))
 	}
 }
 
-// release hands outpoints back to the pool on a detached deadline of its
-// own (see reportTimeout), best effort.
+// release settles outpoints as OutcomeNotBroadcast (never reached a
+// gateway, or classified so by classifyCreateError) on a detached deadline
+// of its own (see reportTimeout), best effort. Batching every batch's
+// leftover outpoints into one Settle call here, rather than reporting each
+// individually, is what "release-of-unused" means throughout this file.
 func (t *toolboxRunner) release(ctx context.Context, token string, outpoints []string) {
 	if len(outpoints) == 0 {
 		return
 	}
 	relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
 	defer cancel()
-	_, _ = t.fk.Release(relCtx, t.pool, token, outpoints)
+	_, _ = t.fk.Settle(relCtx, t.pool, token, outpoints, client.Settlement{Outcome: client.OutcomeNotBroadcast})
 }
 
 // worker runs one toolbox-mode loop until ctx is done: reserve a batch of
@@ -460,26 +485,29 @@ func (t *toolboxRunner) spendBatch(ctx context.Context, res *wire.ReserveRespons
 		r, cerr := t.w.CreateAction(actCtx, args, toolboxOriginator)
 		cancel()
 		if cerr != nil {
-			code, then, txid := classifyCreateError(cerr)
+			code, s := classifyCreateError(cerr)
 			t.rep.fail(code)
 			if code == "underfunded" {
 				t.underfundedOnce.Do(func() {
 					t.warn("fueldemo: the toolbox wallet cannot pay the fee from one fuel output alone at --fee-kb; raise the pool denomination or lower --fee-kb (%v)\n", cerr)
 				})
 			}
-			switch then {
-			case outcomeSpend:
-				t.reportSpend(ctx, res.Token, o.Outpoint, txid)
-			case outcomeRelease:
-				unused = append(unused, o.Outpoint)
-			case outcomeHold:
-				// Left reserved: see outcomeHold.
+			switch s.Outcome {
+			case client.OutcomeNotBroadcast:
+				unused = append(unused, o.Outpoint) // batched into one Settle call at the end; see release
+			case client.OutcomeUnknown:
+				// Left reserved: see classifyCreateError's "timeout",
+				// "reject:unknown" and "reject:service" cases. The
+				// reservation expires and the reaper's quarantine + oracle
+				// path settles it.
+			default: // client.OutcomeDoubleSpend
+				t.reportSettle(ctx, res.Token, o.Outpoint, s)
 			}
 			continue
 		}
 
 		t.rep.ok(time.Since(start))
-		t.reportSpend(ctx, res.Token, o.Outpoint, r.Txid.String())
+		t.reportSettle(ctx, res.Token, o.Outpoint, client.Settlement{Outcome: client.OutcomeBroadcast, TxID: r.Txid.String()})
 		ok++
 	}
 	return ok

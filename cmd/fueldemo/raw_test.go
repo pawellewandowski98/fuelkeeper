@@ -114,6 +114,12 @@ type fakeSubmitter struct {
 	mu    sync.Mutex
 	posts int
 	err   error
+
+	// txStatus overrides the default success verdict ("SEEN_ON_NETWORK")
+	// when non-empty, e.g. "DOUBLE_SPEND_ATTEMPTED"; competingTxs is copied
+	// into the response's CompetingTxs. Both are ignored when err is set.
+	txStatus     string
+	competingTxs []string
 }
 
 func (f *fakeSubmitter) PostTx(_ context.Context, tx []byte) (*arcadeclient.SubmitResponse, error) {
@@ -141,7 +147,11 @@ func (f *fakeSubmitter) PostTx(_ context.Context, tx []byte) (*arcadeclient.Subm
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &arcadeclient.SubmitResponse{TxID: parsed.TxID().String(), Status: 200, TxStatus: "SEEN_ON_NETWORK"}, nil
+	status := f.txStatus
+	if status == "" {
+		status = "SEEN_ON_NETWORK"
+	}
+	return &arcadeclient.SubmitResponse{TxID: parsed.TxID().String(), Status: 200, TxStatus: status, CompetingTxs: f.competingTxs}, nil
 }
 
 func (f *fakeSubmitter) postsCount() int {
@@ -167,7 +177,7 @@ func safeSlice(tx []byte, from, to int) []byte {
 // env minted with many more than 1000 rows can still be read back.
 const getRowsPageSize = 1000
 
-func spentCount(t *testing.T, st store.Store, poolName string, rows []store.Row) int64 {
+func spentCount(t *testing.T, st store.Store, poolName string, rows []store.Row) int64 { //nolint:unparam // every current caller uses "main"; kept general-purpose like newRawTestEnv
 	t.Helper()
 	ops := storetest.Ops(rows)
 	var n int64
@@ -213,14 +223,71 @@ func TestWorkerSpendsFuelIntoOpReturn(t *testing.T) {
 	assert.Equal(t, rep.Sent, spentCount(t, st, "main", rows), "every reported send must show spent in the store")
 }
 
-// TestWorkerRejectStillReportsSpend checks that arcade rejecting a
-// submission is still tallied and still reported to FuelKeeper as spent (a
-// rejected fuel spend is handed to the oracle, not released).
-func TestWorkerRejectStillReportsSpend(t *testing.T) {
+// TestWorkerInvalidRejectReleases checks that arcade rejecting a submission
+// as invalid, with no competing transaction, is tallied and its output
+// released back to the pool -- not reported spent (that would burn it under
+// spend_policy: trust for a submission that never even reached the network).
+//
+// It stops the worker after exactly one reserve/process/release cycle via
+// afterCycle (see TestWorkerBackpressureReleasesOutputs's doc comment for
+// why): released rows are immediately reservable again, so a wall-clock
+// cutoff would let the worker reserve, reject and release the same five
+// rows many times over instead of once.
+func TestWorkerInvalidRejectReleases(t *testing.T) {
 	srv, st, rows := newRawTestEnv(t, 1, 5)
 	fk, err := client.New(srv.URL)
 	require.NoError(t, err)
 	fake := &fakeSubmitter{err: &arcadeclient.RejectError{Status: 461, Title: "INVALID_OUTPUTS", Detail: "test"}}
+	rep := newReport("raw", "test", 1)
+	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var cycles atomic.Int32
+	r.afterCycle = func() {
+		if cycles.Add(1) == 1 {
+			cancel()
+		}
+	}
+
+	done := make(chan struct{})
+	go func() { defer close(done); r.worker(ctx, 0) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not stop within 5s of its first cycle completing")
+	}
+
+	assert.Zero(t, rep.Sent)
+	assert.Equal(t, int64(5), rep.Failed["arcade:461"])
+	assert.Zero(t, spentCount(t, st, "main", rows), "an invalid rejection with no competing tx must never be reported spent")
+
+	require.Eventually(t, func() bool {
+		got, gerr := st.GetRows(context.Background(), "main", storetest.Ops(rows))
+		if gerr != nil {
+			return false
+		}
+		for _, row := range got {
+			if row.State != store.StateAvailable {
+				return false
+			}
+		}
+		return true
+	}, time.Second, 5*time.Millisecond, "an invalid rejection must release its output")
+}
+
+// TestWorkerRejectDoubleSpendReportsSpend checks that a 4xx RejectError
+// naming a competing transaction is reported spent by that competitor, not
+// released (RejectError.DoubleSpend() branch of worker). Real arcade never
+// populates a 4xx body's competingTxs synchronously (see worker's doc
+// comment); this fake exercises the forward/other-gateway-compatibility
+// branch, not live arcade behaviour.
+func TestWorkerRejectDoubleSpendReportsSpend(t *testing.T) {
+	srv, st, rows := newRawTestEnv(t, 1, 5)
+	fk, err := client.New(srv.URL)
+	require.NoError(t, err)
+	competitor := storetest.NewTxID().String()
+	fake := &fakeSubmitter{err: &arcadeclient.RejectError{Status: 462, Title: "DOUBLE_SPEND", Detail: "test", CompetingTxs: []string{competitor}}}
 	rep := newReport("raw", "test", 1)
 	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
 
@@ -229,8 +296,93 @@ func TestWorkerRejectStillReportsSpend(t *testing.T) {
 	r.worker(ctx, 0)
 
 	assert.Zero(t, rep.Sent)
-	assert.Equal(t, int64(5), rep.Failed["arcade:461"])
-	assert.Equal(t, int64(5), spentCount(t, st, "main", rows), "a rejected spend must still be reported to the oracle as spent")
+	assert.Equal(t, int64(5), rep.Failed["arcade:462"])
+	got, err := st.GetRows(context.Background(), "main", storetest.Ops(rows))
+	require.NoError(t, err)
+	for _, row := range got {
+		assert.Equal(t, store.StateSpent, row.State, "a double-spent output must be reported spent, not released")
+		require.NotNil(t, row.SpentBy)
+		assert.Equal(t, competitor, row.SpentBy.String())
+	}
+}
+
+// TestWorkerDoubleSpendReportsSpend checks that a submission answered with a
+// 2xx DOUBLE_SPEND_ATTEMPTED verdict (naming a competitor) is reported spent
+// by that competitor under trust, never released -- a spent output released
+// back to the pool would be handed to every later consumer, each failing the
+// same way in turn. Real arcade has no synchronous DOUBLE_SPEND_ATTEMPTED
+// producer (see worker's doc comment); this fake exercises the
+// forward/other-gateway-compatibility branch, not live arcade behaviour.
+func TestWorkerDoubleSpendReportsSpend(t *testing.T) {
+	srv, st, rows := newRawTestEnv(t, 1, 5)
+	fk, err := client.New(srv.URL)
+	require.NoError(t, err)
+	competitor := storetest.NewTxID().String()
+	fake := &fakeSubmitter{txStatus: "DOUBLE_SPEND_ATTEMPTED", competingTxs: []string{competitor}}
+	rep := newReport("raw", "test", 1)
+	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	r.worker(ctx, 0)
+
+	assert.Zero(t, rep.Sent)
+	assert.Equal(t, int64(5), rep.Failed["arcade:double_spend"])
+	got, err := st.GetRows(context.Background(), "main", storetest.Ops(rows))
+	require.NoError(t, err)
+	for _, row := range got {
+		assert.Equal(t, store.StateSpent, row.State, "a double-spent output must be reported spent, not released")
+		require.NotNil(t, row.SpentBy)
+		assert.Equal(t, competitor, row.SpentBy.String(), "spent by the competitor, not the worker's own tx")
+	}
+}
+
+// TestWorkerRejectedIn2xxReleases checks that a 2xx response carrying a
+// terminal REJECTED verdict inline (no error from PostTx) is tallied and
+// released, exactly like an out-of-band RejectError with no competing
+// transaction. It stops after exactly one cycle via afterCycle; see
+// TestWorkerInvalidRejectReleases's doc comment for why.
+func TestWorkerRejectedIn2xxReleases(t *testing.T) {
+	srv, st, rows := newRawTestEnv(t, 1, 5)
+	fk, err := client.New(srv.URL)
+	require.NoError(t, err)
+	fake := &fakeSubmitter{txStatus: "REJECTED"}
+	rep := newReport("raw", "test", 1)
+	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var cycles atomic.Int32
+	r.afterCycle = func() {
+		if cycles.Add(1) == 1 {
+			cancel()
+		}
+	}
+
+	done := make(chan struct{})
+	go func() { defer close(done); r.worker(ctx, 0) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not stop within 5s of its first cycle completing")
+	}
+
+	assert.Zero(t, rep.Sent)
+	assert.Equal(t, int64(5), rep.Failed["arcade:rejected"])
+	assert.Zero(t, spentCount(t, st, "main", rows))
+
+	require.Eventually(t, func() bool {
+		got, gerr := st.GetRows(context.Background(), "main", storetest.Ops(rows))
+		if gerr != nil {
+			return false
+		}
+		for _, row := range got {
+			if row.State != store.StateAvailable {
+				return false
+			}
+		}
+		return true
+	}, time.Second, 5*time.Millisecond)
 }
 
 // TestWorkerBackpressureReleasesOutputs checks that arcade backpressure is

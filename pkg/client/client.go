@@ -1,7 +1,9 @@
 // Package client is a Go client for the FuelKeeper HTTP API (pkg/api): typed
 // wrappers over reserve/release/spend/pools, a per-pool LRU BEEF cache with
-// singleflight-deduplicated fetches, the admin endpoints, and (in beef.go)
-// helpers that turn a reservation into go-sdk createAction inputs.
+// singleflight-deduplicated fetches, the admin endpoints, (in beef.go)
+// helpers that turn a reservation into go-sdk createAction inputs, and (in
+// settle.go) Settle, which maps a consumer's own broadcast outcome to the
+// right spend/release/hint call.
 package client
 
 import (
@@ -417,7 +419,11 @@ func jitter(d time.Duration) time.Duration {
 }
 
 // Release returns reserved outpoints under token to pool, reporting how many
-// changed.
+// changed. A consumer settling its own broadcast's outcome should call
+// Settle instead of calling this directly: Release must never be called for
+// an outpoint whose broadcast was rejected as a double-spend (see Settle) --
+// a spent output released back to the pool would be handed to every later
+// consumer, each failing the same way in turn.
 func (c *Client) Release(ctx context.Context, pool, token string, outpoints []string) (int, error) {
 	req := wire.ReleaseRequest{Token: token, Outpoints: outpoints}
 	var out wire.CountResponse
@@ -428,7 +434,12 @@ func (c *Client) Release(ctx context.Context, pool, token string, outpoints []st
 }
 
 // Spend reports outpoints under token spent in txid, reporting how many
-// changed.
+// changed. A consumer settling its own broadcast's outcome should call
+// Settle instead of calling this directly: Spend must never be called for a
+// rejection that names no competing transaction -- under spend_policy:
+// trust a Spend is terminal the moment the server accepts it, so an
+// invalid-but-not-double-spent output would be burned rather than returned
+// to the pool for reuse (see Settle).
 func (c *Client) Spend(ctx context.Context, pool, token string, outpoints []string, txid string) (int, error) {
 	req := wire.SpendRequest{Token: token, Outpoints: outpoints, TxID: txid}
 	var out wire.CountResponse

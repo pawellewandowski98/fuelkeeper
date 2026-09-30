@@ -178,24 +178,46 @@ func sleepBounded(ctx context.Context, d time.Duration) {
 	}
 }
 
-// reportSpend reports outpoint spent in txid under token, on a
+// reportSettle reports s for outpoint under token, on a
 // context.WithoutCancel-derived deadline of its own (see reportTimeout)
-// rather than ctx, and tallies "spend:<code>" on failure.
-func (r *rawRunner) reportSpend(ctx context.Context, token, outpoint, txid string) {
-	spendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
+// rather than ctx, and tallies "settle:<code>" on failure.
+func (r *rawRunner) reportSettle(ctx context.Context, token, outpoint string, s client.Settlement) {
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
 	defer cancel()
-	if _, serr := r.fk.Spend(spendCtx, r.pool, token, []string{outpoint}, txid); serr != nil {
-		r.rep.fail("spend:" + apiCode(serr))
+	if _, serr := r.fk.Settle(settleCtx, r.pool, token, []string{outpoint}, s); serr != nil {
+		r.rep.fail("settle:" + apiCode(serr))
 	}
 }
 
 // worker runs one raw-mode round-trip loop until ctx is done: reserve a
 // batch of fuel, spend every output into its own OP_RETURN transaction
-// submitted to arcade in extended format, and report the outcome to fk.
-// Outputs that could not be spent (rate limiting cut short by ctx, a
-// transport failure, or arcade backpressure) are released back to the pool
-// at the end of the batch; a rejected transaction is still reported spent
-// (see the RejectError case below).
+// submitted to arcade in extended format, and report the outcome to fk via
+// Settle. Outputs that could not be spent at all (rate limiting cut short by
+// ctx, a transport failure, arcade backpressure, or a rejection that names
+// no competing transaction) are released back to the pool at the end of the
+// batch; a rejection identifying a double-spend is reported spent by the
+// competitor instead -- never released, since a spent output released back
+// to the pool would be handed to every later consumer, each failing the
+// same way in turn (see the RejectError and 2xx-with-a-verdict cases below).
+//
+// Against arcade specifically, neither of those double-spend cases fires
+// synchronously today: POST /tx's 4xx body is {error, txid, reason, status,
+// title, detail, type} with no competingTxs, its 202 body is only {txid,
+// status, txStatus}, and a conflict is assigned purely asynchronously (ARC
+// 466, visible later via GET /tx as REJECTED with status 466 and
+// competingTxs) -- arcade has no synchronous DOUBLE_SPEND_ATTEMPTED
+// producer. A synchronous rejection from arcade is therefore always
+// classified invalid (released) here; the correct handling of an
+// arcade-originated double-spend is that Settle(OutcomeBroadcast) already
+// ran at submission time (so the row is spent, or -- under spend_policy:
+// verify -- quarantined pending the oracle), and it is the reaper/oracle
+// that later resolves the 466 conflict, not this worker. The
+// RejectError/SubmitResponse DoubleSpend() branches below exist for
+// forward/other-gateway compatibility (an ARC-compatible gateway other than
+// arcade, or a future arcade version, that does assign a conflict
+// synchronously) and are exercised by TestWorkerRejectDoubleSpendReportsSpend
+// and TestWorkerDoubleSpendReportsSpend against a fake arcade, not live
+// arcade behaviour.
 func (r *rawRunner) worker(ctx context.Context, id int) {
 	// A small per-worker jitter on the reserve retry pause keeps many
 	// workers that hit the same transient failure from retrying in lockstep.
@@ -244,7 +266,8 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 				continue
 			}
 
-			if _, perr := r.arc.PostTx(ctx, ef); perr != nil {
+			resp, perr := r.arc.PostTx(ctx, ef)
+			if perr != nil {
 				r.rep.fail("arcade:" + apiCode(perr))
 
 				var backpressure *arcadeclient.BackpressureError
@@ -253,23 +276,50 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 				case errors.As(perr, &backpressure):
 					unused = append(unused, o.Outpoint)
 					sleepBounded(ctx, time.Duration(backpressure.RetryAfter)*time.Second)
-				case errors.As(perr, &reject):
-					// A rejected fuel spend is suspicious: hand it to the
-					// oracle rather than release it back to the pool.
-					r.reportSpend(ctx, res.Token, o.Outpoint, tx.TxID().String())
+				case errors.As(perr, &reject) && reject.DoubleSpend():
+					// Forward/other-gateway compatibility: arcade's own 4xx
+					// body never carries competingTxs today (see worker's
+					// doc comment), so this does not fire against arcade,
+					// but another ARC-compatible gateway might name a
+					// competitor synchronously. Report it spent by the
+					// competitor, never released.
+					r.reportSettle(ctx, res.Token, o.Outpoint, client.Settlement{
+						Outcome: client.OutcomeDoubleSpend, TxID: tx.TxID().String(), CompetingTxIDs: reject.CompetingTxs,
+					})
 				default:
+					// Rejected as invalid with no competing transaction (or
+					// any other submission failure): safe to release.
 					unused = append(unused, o.Outpoint)
 				}
 				continue
 			}
 
-			r.rep.ok(time.Since(start))
-			r.reportSpend(ctx, res.Token, o.Outpoint, tx.TxID().String())
+			switch {
+			case resp.DoubleSpend():
+				// Forward/other-gateway compatibility: arcade's 202 body is
+				// only {txid, status, txStatus} today, with no
+				// DOUBLE_SPEND_ATTEMPTED producer and no competingTxs (see
+				// worker's doc comment), so this branch does not fire
+				// against arcade as it stands.
+				r.rep.fail("arcade:double_spend")
+				r.reportSettle(ctx, res.Token, o.Outpoint, client.Settlement{
+					Outcome: client.OutcomeDoubleSpend, TxID: tx.TxID().String(), CompetingTxIDs: resp.CompetingTxs,
+				})
+			case resp.TxStatus == "REJECTED":
+				// A 2xx response can still carry a terminal REJECTED verdict
+				// inline; with no competing transaction named, this is safe
+				// to release.
+				r.rep.fail("arcade:rejected")
+				unused = append(unused, o.Outpoint)
+			default:
+				r.rep.ok(time.Since(start))
+				r.reportSettle(ctx, res.Token, o.Outpoint, client.Settlement{Outcome: client.OutcomeBroadcast, TxID: tx.TxID().String()})
+			}
 		}
 
 		if len(unused) > 0 {
 			relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
-			_, _ = r.fk.Release(relCtx, r.pool, res.Token, unused)
+			_, _ = r.fk.Settle(relCtx, r.pool, res.Token, unused, client.Settlement{Outcome: client.OutcomeNotBroadcast})
 			cancel()
 		}
 
