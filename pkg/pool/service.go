@@ -108,6 +108,15 @@ func (p *Pool) Holder() string { return p.mgr.Holder() }
 // EnsureRows exposes the bounded adoption path (tests, readiness).
 func (p *Pool) EnsureRows(ctx context.Context) bool { return p.mgr.EnsureRows(ctx) }
 
+// Ready reports whether this pool can serve a Reserve call without first
+// waiting on shard adoption: true when at least one row is already queued in
+// the allocator, or at least one shard is owned (rows are expected shortly,
+// e.g. mid-adoption or between rescans). It reads only in-memory state -- no
+// store call -- so Plan 3's readiness probe can call it on every health check.
+func (p *Pool) Ready(_ context.Context) bool {
+	return p.alloc.Available() > 0 || len(p.alloc.Shards()) > 0
+}
+
 // Run runs the coalescer and shard manager until ctx is done.
 func (p *Pool) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
@@ -387,7 +396,7 @@ func (p *Pool) Stats(ctx context.Context) (store.Stats, error) {
 func (p *Pool) BEEF(ctx context.Context, txid chainhash.Hash) ([]byte, int64, store.ShardStatus, error) {
 	sh, err := p.st.GetShard(ctx, p.cfg.Name, txid)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, 0, 0, mapStoreErr(err)
 	}
 	return sh.BEEF, sh.Version, sh.Status, nil
 }

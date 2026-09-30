@@ -292,6 +292,48 @@ func TestPoolStatsAndBEEF(t *testing.T) {
 	assert.NotEmpty(t, f.p.Holder())
 }
 
+// getShardErrStore wraps a store.Store and forces GetShard to return err.
+type getShardErrStore struct {
+	store.Store
+	err error
+}
+
+func (s *getShardErrStore) GetShard(_ context.Context, _ string, _ chainhash.Hash) (*store.Shard, error) {
+	return nil, s.err
+}
+
+func TestPoolBEEFMapsStoreErrors(t *testing.T) {
+	base := memory.New(memory.WithClock(storetest.NewClock(storetest.Start).Now))
+	wrapped := &getShardErrStore{Store: base, err: store.ErrUnavailable}
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.MinTTL = time.Second
+	require.NoError(t, pc.Validate())
+	p := pool.NewPool(wrapped, pc, testInstanceConfig(), pool.RealClock{}, slog.Default())
+	ctx := context.Background()
+
+	_, _, _, err := p.BEEF(ctx, storetest.NewTxID())
+	require.ErrorIs(t, err, pool.ErrUnavailable, "a store outage must map to pool.ErrUnavailable")
+
+	wrapped.err = store.ErrNotFound
+	_, _, _, err = p.BEEF(ctx, storetest.NewTxID())
+	require.ErrorIs(t, err, store.ErrNotFound, "not-found must pass through unchanged")
+	assert.NotErrorIs(t, err, pool.ErrUnavailable)
+}
+
+func TestPoolReady(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx := context.Background()
+	assert.False(t, f.p.Ready(ctx), "nothing owned and nothing queued")
+
+	storetest.MintShard(t, f.st, "main", 3, store.ShardMined)
+	require.True(t, f.p.EnsureRows(ctx))
+	assert.True(t, f.p.Ready(ctx), "rows queued in the allocator")
+
+	_, err := f.p.Reserve(ctx, pool.ReserveRequest{Count: 3})
+	require.NoError(t, err)
+	assert.True(t, f.p.Ready(ctx), "the shard is still owned even though its rows are all reserved")
+}
+
 func outpointsOf(outs []pool.Output) []store.Outpoint {
 	ops := make([]store.Outpoint, len(outs))
 	for i, o := range outs {
