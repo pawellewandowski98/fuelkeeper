@@ -19,15 +19,23 @@ const (
 	OutcomeBroadcast Outcome = iota
 	// OutcomeNotBroadcast means the transaction provably never reached a
 	// gateway (it was never sent, or a gateway said so definitively -- a
-	// well-formed rejection with no competing transaction named, or the
-	// gateway's own backpressure/shedding response before it ever accepted
-	// the request), so it is safe to release: Settle releases the
-	// outpoints. If instead the request may have reached the gateway and
-	// simply left its fate unclear -- a transport error after the request
-	// was already sent, a timeout, or a 5xx -- use OutcomeUnknown, not this
-	// one: releasing an output that was in fact already broadcast would
-	// hand it to the next consumer to reserve, whose own attempt to spend
-	// it then fails as a double-spend.
+	// well-formed rejection with no competing transaction named, sent
+	// before the gateway ever accepted the request), so it is safe to
+	// release: Settle releases the outpoints. If instead the request may
+	// have reached the gateway and simply left its fate unclear -- a
+	// transport error after the request was already sent, a timeout, a
+	// 5xx, or the gateway's own backpressure/shedding response -- use
+	// OutcomeUnknown, not this one: releasing an output that was in fact
+	// already broadcast (or merely accepted and queued) would hand it to
+	// the next consumer to reserve, whose own attempt to spend it then
+	// fails as a double-spend. Backpressure in particular is not provably
+	// "never accepted" for every gateway: arcade, for example, persists the
+	// submission (inserting a RECEIVED row carrying the raw tx) before the
+	// downstream publish that can answer 503, and arcade's own propagation
+	// reaper rebroadcasts a stale RECEIVED row an hour later -- so a caller
+	// reporting a gateway's backpressure response should default to
+	// OutcomeUnknown unless it knows that particular gateway rejects before
+	// persisting anything.
 	OutcomeNotBroadcast
 	// OutcomeDoubleSpend means the broadcast was rejected because an input
 	// was already spent, or because a competing transaction exists: Settle

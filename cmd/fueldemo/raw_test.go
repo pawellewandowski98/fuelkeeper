@@ -8,9 +8,11 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -337,12 +339,15 @@ func TestWorkerDoubleSpendReportsSpend(t *testing.T) {
 	}
 }
 
-// TestWorkerRejectedIn2xxReleases checks that a 2xx response carrying a
+// TestWorkerRejectedIn2xxHolds checks that a 2xx response carrying a
 // terminal REJECTED verdict inline (no error from PostTx) is tallied and
-// released, exactly like an out-of-band RejectError with no competing
-// transaction. It stops after exactly one cycle via afterCycle; see
-// TestWorkerInvalidRejectReleases's doc comment for why.
-func TestWorkerRejectedIn2xxReleases(t *testing.T) {
+// held, not released: arcade already accepted the submission (a 2xx), so
+// this verdict alone does not prove the transaction never reached the
+// network -- exactly like backpressure (see worker's doc comment). Unlike a
+// PostTx error, a REJECTED verdict is a per-transaction result, not
+// evidence arcade itself is unavailable, so it does not abandon the rest of
+// the batch: every output is tried (and held) once.
+func TestWorkerRejectedIn2xxHolds(t *testing.T) {
 	srv, st, rows := newRawTestEnv(t, 1, 5)
 	fk, err := client.New(srv.URL)
 	require.NoError(t, err)
@@ -350,55 +355,42 @@ func TestWorkerRejectedIn2xxReleases(t *testing.T) {
 	rep := newReport("raw", "test", 1)
 	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	var cycles atomic.Int32
-	r.afterCycle = func() {
-		if cycles.Add(1) == 1 {
-			cancel()
-		}
-	}
-
-	done := make(chan struct{})
-	go func() { defer close(done); r.worker(ctx, 0) }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("worker did not stop within 5s of its first cycle completing")
-	}
+	r.worker(ctx, 0)
 
 	assert.Zero(t, rep.Sent)
-	assert.Equal(t, int64(5), rep.Failed["arcade:rejected"])
+	assert.Equal(t, int64(5), rep.Failed["arcade:rejected"], "every output tried exactly once: %v", rep.Failed)
 	assert.Zero(t, spentCount(t, st, "main", rows))
-
-	require.Eventually(t, func() bool {
-		got, gerr := st.GetRows(context.Background(), "main", storetest.Ops(rows))
-		if gerr != nil {
-			return false
-		}
-		for _, row := range got {
-			if row.State != store.StateAvailable {
-				return false
-			}
-		}
-		return true
-	}, time.Second, 5*time.Millisecond)
+	got, gerr := st.GetRows(context.Background(), "main", storetest.Ops(rows))
+	require.NoError(t, gerr)
+	for _, row := range got {
+		assert.Equal(t, store.StateReserved, row.State, "a 2xx REJECTED verdict must hold, not release")
+	}
 }
 
 // TestWorkerHoldsOnUncertainSubmission checks that a PostTx failure whose
 // cause leaves the transaction's fate genuinely unknown -- a transport
-// failure that may have happened after the request body was already sent,
-// or the per-call context ending mid-POST -- neither releases nor reports
-// spent its outputs: it is the mutation guard for worker's default case in
-// the PostTx-error switch. Releasing on this default would risk handing an
-// already-broadcast output to a later consumer (who would then fail as a
-// double-spend); reporting it spent would risk burning a row that in fact
-// never reached the network. Rows tried exactly once (the pool then holds
-// no more available rows to retry with) stay StateReserved.
+// failure past the dial phase, ctx ending mid-POST, an unexpected HTTP
+// status, or a 2xx response this client failed to decode -- holds only the
+// one output actually attempted: it is the mutation guard for worker's
+// default case in the PostTx-error switch. Releasing that output would risk
+// handing an already-broadcast output to a later consumer (who would then
+// fail as a double-spend); reporting it spent would risk burning a row that
+// in fact never reached the network. The rest of the batch -- never
+// attempted, since an uncertain failure abandons the batch early rather
+// than holding every remaining output the same way (see worker's doc
+// comment) -- is released.
+//
+// It stops the worker after exactly one cycle via afterCycle, rather than a
+// wall-clock cutoff: see TestWorkerBackpressureHoldsOneReleasesRest's doc
+// comment for why that matters here.
 func TestWorkerHoldsOnUncertainSubmission(t *testing.T) {
 	cases := map[string]error{
-		"connection reset":  errors.New("fake: read tcp 127.0.0.1:1->127.0.0.1:2: connection reset by peer"),
-		"deadline exceeded": fmt.Errorf("fake: post /tx: %w", context.DeadlineExceeded),
+		"connection reset":      errors.New("fake: read tcp 127.0.0.1:1->127.0.0.1:2: connection reset by peer"),
+		"deadline exceeded":     fmt.Errorf("fake: post /tx: %w", context.DeadlineExceeded),
+		"5xx unexpected status": &arcadeclient.UnexpectedStatusError{Method: "POST", Path: "/tx", Code: 500},
+		"2xx decode error":      fmt.Errorf("arcadeclient: decode submit response: %w", errors.New("unexpected EOF")),
 	}
 	for name, postErr := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -409,25 +401,119 @@ func TestWorkerHoldsOnUncertainSubmission(t *testing.T) {
 			rep := newReport("raw", "test", 1)
 			r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			r.worker(ctx, 0)
+			var cycles atomic.Int32
+			r.afterCycle = func() {
+				if cycles.Add(1) == 1 {
+					cancel()
+				}
+			}
+
+			done := make(chan struct{})
+			go func() { defer close(done); r.worker(ctx, 0) }()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("worker did not stop within 5s of its first cycle completing")
+			}
 
 			assert.Zero(t, rep.Sent)
-			assert.Equal(t, int64(5), rep.Failed["arcade:unknown"], "every output tried exactly once: %v", rep.Failed)
+			assert.Equal(t, int64(1), rep.Failed["arcade:unknown"], "the batch is abandoned after the first uncertain failure")
 			assert.Zero(t, spentCount(t, st, "main", rows), "an uncertain submission must never be reported spent")
-			got, gerr := st.GetRows(context.Background(), "main", storetest.Ops(rows))
-			require.NoError(t, gerr)
-			for _, row := range got {
-				assert.Equal(t, store.StateReserved, row.State, "an uncertain submission must stay reserved, not released")
-			}
+
+			require.Eventually(t, func() bool {
+				got, gerr := st.GetRows(context.Background(), "main", storetest.Ops(rows))
+				if gerr != nil {
+					return false
+				}
+				var reserved, available int
+				for _, row := range got {
+					switch row.State {
+					case store.StateReserved:
+						reserved++
+					case store.StateAvailable:
+						available++
+					}
+				}
+				return reserved == 1 && available == 4
+			}, time.Second, 5*time.Millisecond, "exactly one output -- the one actually attempted -- stays held; the rest of the batch was never attempted and must be released")
 		})
 	}
 }
 
-// TestWorkerBackpressureReleasesOutputs checks that arcade backpressure is
-// tallied and that the affected outputs are released back to the pool
-// rather than left reserved or reported spent.
+// TestWorkerDialFailureReleasesAndBacksOff is the regression test for the
+// "arcade outage drains the pool" bug: previously, any PostTx failure held
+// its output and the worker immediately reserved a fresh batch, so a
+// sustained connection-refused outage measured holding 200 rows reserved in
+// under 500ms -- each one then stuck until its reservation's own expiry
+// plus unknown_requeue_age, rather than ever reaching the reaper's requeue
+// rule sooner.
+//
+// It drives several outage cycles (via afterCycle) against a fake arcade
+// that always fails to dial, and checks both halves of the fix: every
+// output across every cycle is released, never held (a dial failure is
+// provably never-sent -- see worker's doc comment), and the worker paces
+// itself between cycles rather than looping tightly (each cycle's
+// afterCycle timestamp is spaced out from the previous one by at least the
+// worker's base retry pause, proving outageBackoff's sleep actually ran
+// rather than the loop spinning straight back into Reserve).
+func TestWorkerDialFailureReleasesAndBacksOff(t *testing.T) {
+	srv, st, rows := newRawTestEnv(t, 1, 60)
+	fk, err := client.New(srv.URL)
+	require.NoError(t, err)
+	dialErr := fmt.Errorf("arcadeclient: POST /tx: %w", &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED})
+	fake := &fakeSubmitter{err: dialErr}
+	rep := newReport("raw", "test", 1)
+	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 10, rep: rep, memo: []byte("x"), satPerKB: 100}
+
+	const wantCycles = 4
+	var mu sync.Mutex
+	var at []time.Time
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.afterCycle = func() {
+		mu.Lock()
+		at = append(at, time.Now())
+		n := len(at)
+		mu.Unlock()
+		if n >= wantCycles {
+			cancel()
+		}
+	}
+
+	done := make(chan struct{})
+	go func() { defer close(done); r.worker(ctx, 0) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker did not stop within 10s")
+	}
+
+	mu.Lock()
+	timestamps := append([]time.Time(nil), at...)
+	mu.Unlock()
+	require.Len(t, timestamps, wantCycles)
+	for i := 1; i < len(timestamps); i++ {
+		gap := timestamps[i].Sub(timestamps[i-1])
+		assert.GreaterOrEqual(t, gap, reserveRetryPause, "cycle %d did not pace itself: the worker must back off between cycles, not drain the pool in a tight loop", i)
+	}
+
+	assert.Zero(t, spentCount(t, st, "main", rows))
+	got, gerr := st.GetRows(context.Background(), "main", storetest.Ops(rows))
+	require.NoError(t, gerr)
+	for _, row := range got {
+		assert.NotEqual(t, store.StateReserved, row.State, "a dial failure must release its output, never hold it (the original drain bug)")
+	}
+}
+
+// TestWorkerBackpressureHoldsOneReleasesRest checks that arcade backpressure
+// is tallied, that the one output actually attempted is held (arcade
+// persists a submission before the downstream publish that can answer 503,
+// so backpressure does not prove the transaction never reached it -- see
+// worker's doc comment), and that the rest of the batch -- never attempted,
+// since backpressure abandons the batch early rather than trying every
+// remaining output against a gateway already shedding load -- is released.
 //
 // It stops the worker deterministically after exactly one full
 // reserve/process/release cycle via afterCycle, rather than racing a
@@ -443,7 +529,7 @@ func TestWorkerHoldsOnUncertainSubmission(t *testing.T) {
 // only ever fires between cycles, once the previous one's release has
 // already completed, so cancelling from it can never race an in-flight
 // Reserve.
-func TestWorkerBackpressureReleasesOutputs(t *testing.T) {
+func TestWorkerBackpressureHoldsOneReleasesRest(t *testing.T) {
 	srv, st, rows := newRawTestEnv(t, 1, 5)
 	fk, err := client.New(srv.URL)
 	require.NoError(t, err)
@@ -469,7 +555,7 @@ func TestWorkerBackpressureReleasesOutputs(t *testing.T) {
 	}
 
 	assert.Zero(t, rep.Sent)
-	assert.Positive(t, rep.Failed["arcade:backpressure"])
+	assert.Equal(t, int64(1), rep.Failed["arcade:backpressure"], "the batch is abandoned after the first backpressure response")
 	assert.Zero(t, spentCount(t, st, "main", rows), "backpressure must never be reported as spent")
 
 	// afterCycle already guarantees the worker only stops between cycles
@@ -481,13 +567,17 @@ func TestWorkerBackpressureReleasesOutputs(t *testing.T) {
 		if gerr != nil {
 			return false
 		}
+		var reserved, available int
 		for _, row := range got {
-			if row.State != store.StateAvailable {
-				return false
+			switch row.State {
+			case store.StateReserved:
+				reserved++
+			case store.StateAvailable:
+				available++
 			}
 		}
-		return true
-	}, time.Second, 5*time.Millisecond, "unused output must be released back to available")
+		return reserved == 1 && available == 4
+	}, time.Second, 5*time.Millisecond, "the attempted output stays held; the rest of the batch is released")
 }
 
 // p2pkhLockingScript returns a syntactically plausible (not cryptographically

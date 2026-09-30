@@ -301,6 +301,25 @@ func (t *toolboxRunner) Close() {
 //     failed to answer, the toolbox may still post the transaction later)
 //     for status serviceError.
 //
+//     Against the toolbox's own configuration (servicesConfig enables only
+//     arcade), "reject:invalid" realistically never fires and every
+//     definite arcade rejection lands in "reject:service" instead: TB
+//     pkg/services/internal/arcade's PostEF sets a non-nil Error on every
+//     4xx rejection and on a REJECTED verdict alike (Error is how a
+//     "problem" is signalled at all -- DoubleSpend is a separate bool, set
+//     only when CompetingTxs is non-empty, which arcade's response never
+//     is), and newAggregatedPostFromBEEF (TB
+//     pkg/wdk/services_aggregated_postebeef_result.go) counts any non-nil
+//     Error as a service error before it ever reaches the invalidTx
+//     default case. So against arcade, classifyCreateError's practical
+//     behaviour is more conservative than raw.go's: every synchronous
+//     rejection is held (reject:service), never released on sight
+//     (reject:invalid) -- correctly so, since a status-serviceError review
+//     result here does not distinguish "arcade said no" from "some
+//     broadcaster's own request failed", so classifyCreateError cannot
+//     assume the transaction never reached arcade the way raw.go's own
+//     RejectError case can.
+//
 //     This verdict is set synchronously, at post time, not by polling
 //     arcade later: go-wallet-toolbox's storage layer aggregates every
 //     enabled broadcaster's result for the txid (TB

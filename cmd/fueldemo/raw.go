@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
+	"syscall"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -178,6 +180,49 @@ func sleepBounded(ctx context.Context, d time.Duration) {
 	}
 }
 
+// isDialFailure reports whether err is a connection-establishment failure:
+// a dial-phase *net.OpError, or the connection-refused syscall error it
+// commonly wraps. Either means the request body was never written, so the
+// transaction provably never reached arcade -- unlike a failure past the
+// dial phase (the connection was established, so the request, or part of
+// it, may already be on the wire), whose fate worker treats as genuinely
+// uncertain; see worker's doc comment.
+func isDialFailure(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
+// outpointsOf extracts outputs' outpoints, for releasing a batch's untried
+// tail in one Settle call (see worker).
+func outpointsOf(outputs []wire.Output) []string {
+	ops := make([]string, len(outputs))
+	for i, o := range outputs {
+		ops[i] = o.Outpoint
+	}
+	return ops
+}
+
+// outageBackoffMax caps the exponential backoff worker applies after
+// abandoning a batch early for an outage-shaped PostTx failure (a
+// dial-phase failure, or one whose cause leaves arcade's receipt of the
+// transaction genuinely uncertain): each such failure with no successful
+// send in between doubles the pause before the next Reserve, up to this
+// bound, so a sustained arcade outage cannot make a worker spin through
+// Reserve/PostTx/Release at an unbounded rate. See worker's doc comment.
+const outageBackoffMax = 2 * time.Second
+
+// nextOutageBackoff doubles d, capped at outageBackoffMax.
+func nextOutageBackoff(d time.Duration) time.Duration {
+	d *= 2
+	if d > outageBackoffMax {
+		return outageBackoffMax
+	}
+	return d
+}
+
 // reportSettle reports s for outpoint under token, on a
 // context.WithoutCancel-derived deadline of its own (see reportTimeout)
 // rather than ctx, and tallies "settle:<code>" on failure.
@@ -194,30 +239,69 @@ func (r *rawRunner) reportSettle(ctx context.Context, token, outpoint string, s 
 // submitted to arcade in extended format, and report the outcome to fk via
 // Settle.
 //
-// After a failed PostTx, whether to release an output or merely hold it
+// After a failed PostTx, whether to release an output, hold it
 // (OutcomeUnknown -- left reserved, for the reservation's own expiry to
-// resolve) turns on whether the transaction provably never reached arcade:
+// resolve), and whether to abandon the rest of the batch early, turns on
+// what the failure actually tells us:
 //
-//   - *arcadeclient.BackpressureError (arcade's broker shed the request
-//     before accepting it) and a *arcadeclient.RejectError naming no
-//     competitor (a well-formed rejection: arcade parsed the request and
-//     said no before ever accepting it) both mean the transaction never
-//     entered the network -- safe to release, along with a build/EF
-//     failure (never even attempted).
-//   - everything else -- a transport failure that may have happened after
-//     the request body was already sent, ctx ending mid-POST, an
-//     unexpected HTTP status, or a 2xx response this client failed to
-//     decode -- leaves whether arcade ever received (and accepted) the
-//     transaction unknown: it may already be on the network. Releasing it
-//     regardless would hand an already-broadcast output to a later
-//     consumer, whose own attempt to spend it then fails as a double-spend.
-//     So these hold instead (tallied "arcade:unknown") and the reservation
-//     is left to expire; the reaper's requeue rule settles it once its fate
-//     is no longer in doubt.
+//   - a dial-phase failure (isDialFailure: a *net.OpError with Op ==
+//     "dial", or the ECONNREFUSED it commonly wraps) means the request
+//     body was never written -- the transaction provably never reached
+//     arcade -- so it is safe to release. But arcade being unreachable
+//     this way is evidence the rest of the batch will fail exactly the
+//     same way: trying each remaining output anyway would only burn time
+//     rediscovering that individually, so the batch is abandoned early
+//     (its untried outputs released alongside the one actually attempted)
+//     and the worker backs off (see outageBackoffMax) before the next
+//     Reserve.
+//   - *arcadeclient.BackpressureError means arcade's broker is shedding
+//     load, not that the transaction never reached arcade: arcade inserts
+//     the RECEIVED row (carrying the raw tx) before the Kafka publish that
+//     can answer this 503 (arcade services/api_server/handlers.go's
+//     txsHandler, ~895-966), and arcade's propagation reaper rebroadcasts a
+//     stale RECEIVED row after an hour (services/propagation/reaper.go:59,
+//     264) -- so, unlike a dial failure, this is not provably "never
+//     sent". The attempted output is held, not released; only the batch's
+//     untried outputs are released, the batch is abandoned early the same
+//     way, and the worker waits the server-given Retry-After before the
+//     next Reserve.
+//   - a *arcadeclient.RejectError naming no competitor is a well-formed
+//     rejection: arcade parsed the request and said no before ever
+//     accepting it, so it's safe to release. This is a verdict on one
+//     transaction, not evidence the gateway itself is unavailable, so --
+//     unlike the two cases above -- it does not abandon the rest of the
+//     batch.
+//   - everything else -- a transport failure past the dial phase (so the
+//     request, or part of it, may already be on the wire), ctx ending
+//     mid-POST, an unexpected HTTP status, or a 2xx response this client
+//     failed to decode -- leaves whether arcade ever received (and
+//     accepted) the transaction unknown: it may already be on the network.
+//     Releasing it regardless would hand an already-broadcast output to a
+//     later consumer, whose own attempt to spend it then fails as a
+//     double-spend. So this output is held (tallied "arcade:unknown",
+//     skipped when ctx is already done -- shutdown, not a real failure,
+//     exactly as the Reserve path above treats it), the rest of the batch
+//     is abandoned and released the same way as the two outage cases
+//     above, and the worker backs off.
+//
+// Abandoning a batch early on any of those three outage-shaped failures,
+// and backing off before the next Reserve, is what keeps a genuine arcade
+// outage from draining the whole pool: without it, the per-output loop --
+// tried against every reservable row as fast as Reserve would hand them
+// out, and with every failure classified as "hold" before this fix existed
+// -- once measured holding 200 rows in under 500ms against a refused
+// connection, each one then stuck reserved until its own expiry plus
+// unknown_requeue_age before the reaper's requeue rule could return it to
+// the pool.
 //
 // A rejection (or 2xx verdict) identifying a double-spend is reported spent
-// by the competitor instead -- never released, for the same reason (see the
-// RejectError and 2xx-with-a-verdict cases below).
+// by the competitor instead -- never released, for the same reason as
+// backpressure and the uncertain case above (see the RejectError and
+// 2xx-with-a-verdict cases below). Likewise, a 2xx response carrying a
+// terminal REJECTED verdict inline is held, not released: a 2xx means
+// arcade already accepted the submission, so (exactly as with
+// backpressure) a REJECTED lifecycle status alone does not prove the
+// transaction never reached the network.
 //
 // Against arcade specifically, none of those double-spend cases fire
 // synchronously today: POST /tx's 4xx body is {error, txid, reason, status,
@@ -228,8 +312,9 @@ func (r *rawRunner) reportSettle(ctx context.Context, token, outpoint string, s 
 // DOUBLE_SPEND_ATTEMPTED status: what a later GET /tx shows is a REJECTED
 // verdict with status 466 and the teranode rejection reason as a line of
 // free text in ExtraInfo, not a named competitor. A synchronous rejection
-// from arcade is therefore always classified invalid (released) here; the
-// correct handling of an arcade-originated double-spend is that
+// from arcade is therefore always classified invalid (released, or -- on
+// backpressure or a REJECTED 2xx verdict -- held) here; the correct
+// handling of an arcade-originated double-spend is that
 // Settle(OutcomeBroadcast) already ran at submission time (so the row is
 // spent, or -- under spend_policy: verify -- quarantined pending the
 // oracle), and it is the reaper/oracle that later resolves the 466 verdict,
@@ -243,6 +328,13 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 	// A small per-worker jitter on the reserve retry pause keeps many
 	// workers that hit the same transient failure from retrying in lockstep.
 	pause := reserveRetryPause + time.Duration(id%5)*time.Millisecond
+	// outageBackoff is the pause used after a batch is abandoned early for
+	// an outage-shaped PostTx failure (a dial-phase failure, or one whose
+	// cause leaves arcade's receipt of the transaction genuinely
+	// uncertain): it starts at pause and doubles (capped at
+	// outageBackoffMax) each time that happens again with no successful
+	// send in between, resetting to pause the moment a send succeeds.
+	outageBackoff := pause
 
 	for {
 		if ctx.Err() != nil {
@@ -261,7 +353,8 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 		r.rep.reserved()
 
 		unused := make([]string, 0, len(res.Outputs))
-		for _, o := range res.Outputs {
+	outputLoop:
+		for i, o := range res.Outputs {
 			if ctx.Err() != nil {
 				unused = append(unused, o.Outpoint)
 				continue
@@ -293,12 +386,14 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 				var reject *arcadeclient.RejectError
 				switch {
 				case errors.As(perr, &backpressure):
-					// Never queued: arcade's broker shed the request before
-					// accepting it, so it provably never reached the
-					// network. Safe to release.
+					// Not provably "never sent" (see worker's doc comment):
+					// hold the attempted output, release only the rest of
+					// this batch (untried), abandon it, and wait the
+					// server-given Retry-After.
 					r.rep.fail("arcade:" + apiCode(perr))
-					unused = append(unused, o.Outpoint)
+					unused = append(unused, outpointsOf(res.Outputs[i+1:])...)
 					sleepBounded(ctx, time.Duration(backpressure.RetryAfter)*time.Second)
+					break outputLoop
 				case errors.As(perr, &reject) && reject.DoubleSpend():
 					// Forward/other-gateway compatibility: arcade's own 4xx
 					// body never carries competingTxs today (see worker's
@@ -314,20 +409,43 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 					// A well-formed rejection: arcade parsed the request
 					// and said no before ever accepting it, naming no
 					// competitor, so it provably never reached the
-					// network. Safe to release.
+					// network. Safe to release; a verdict on one
+					// transaction, not evidence arcade itself is down, so
+					// the rest of the batch is still worth trying.
 					r.rep.fail("arcade:" + apiCode(perr))
 					unused = append(unused, o.Outpoint)
+				case isDialFailure(perr):
+					// The request body was never written: provably never
+					// reached arcade, so safe to release -- but arcade
+					// being unreachable this way means the rest of the
+					// batch will fail the exact same way, so abandon it
+					// (release its untried outputs too) and back off.
+					r.rep.fail("arcade:" + apiCode(perr))
+					unused = append(unused, o.Outpoint)
+					unused = append(unused, outpointsOf(res.Outputs[i+1:])...)
+					sleepBounded(ctx, outageBackoff)
+					outageBackoff = nextOutageBackoff(outageBackoff)
+					break outputLoop
 				default:
-					// Everything else: a transport failure that may have
-					// happened after the request body was already sent,
-					// ctx ending mid-POST, an unexpected HTTP status (e.g.
-					// a 5xx), or a 2xx response this client failed to
+					// Everything else: a transport failure past the dial
+					// phase (so the request, or part of it, may already be
+					// on the wire), ctx ending mid-POST, an unexpected
+					// HTTP status, or a 2xx response this client failed to
 					// decode. Whether arcade ever received (and accepted)
 					// the transaction is unknown -- it may already be on
 					// the network -- so hold rather than release it (see
-					// worker's doc comment): the reservation is left to
-					// expire and the reaper's requeue rule settles it.
-					r.rep.fail("arcade:unknown")
+					// worker's doc comment), abandon the rest of the batch
+					// (release its untried outputs), and back off. The
+					// tally is skipped when ctx is already done: that is
+					// shutdown, not a real failure, exactly as the Reserve
+					// path above treats it.
+					if ctx.Err() == nil {
+						r.rep.fail("arcade:unknown")
+					}
+					unused = append(unused, outpointsOf(res.Outputs[i+1:])...)
+					sleepBounded(ctx, outageBackoff)
+					outageBackoff = nextOutageBackoff(outageBackoff)
+					break outputLoop
 				}
 				continue
 			}
@@ -344,13 +462,14 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 					Outcome: client.OutcomeDoubleSpend, TxID: tx.TxID().String(), CompetingTxIDs: resp.CompetingTxs,
 				})
 			case resp.TxStatus == "REJECTED":
-				// A 2xx response can still carry a terminal REJECTED verdict
-				// inline; with no competing transaction named, this is safe
-				// to release.
+				// A 2xx means arcade already accepted the submission, so
+				// (exactly as with backpressure) this verdict alone does
+				// not prove the transaction never reached the network:
+				// hold, don't release.
 				r.rep.fail("arcade:rejected")
-				unused = append(unused, o.Outpoint)
 			default:
 				r.rep.ok(time.Since(start))
+				outageBackoff = pause // a real send went through: stop backing off
 				r.reportSettle(ctx, res.Token, o.Outpoint, client.Settlement{Outcome: client.OutcomeBroadcast, TxID: tx.TxID().String()})
 			}
 		}
