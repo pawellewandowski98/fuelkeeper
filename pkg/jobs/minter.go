@@ -29,6 +29,9 @@ var (
 	poolShards = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "fuelkeeper_pool_shards", Help: "Shards by status (sampled by the minter).",
 	}, []string{"pool", "status"})
+	poolRefilling = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "fuelkeeper_pool_refilling", Help: "1 if the pool is mid-refill (Minter.refilling), 0 otherwise.",
+	}, []string{"pool"})
 )
 
 // MinterConfig tunes replenishment. Per-pool refill hysteresis
@@ -126,7 +129,8 @@ type Minter struct {
 	// the Minter doc comment). It is set once a round finds available below
 	// refillTrigger(pc), and cleared once a round's projected supply reaches
 	// TargetAvailable. Absent/false means "not refilling", so every pool
-	// starts not-refilling when a new Minter is created.
+	// starts not-refilling when a new Minter is created. Mirrored, at the
+	// same two transitions, by the fuelkeeper_pool_refilling gauge.
 	refilling map[string]bool
 }
 
@@ -326,6 +330,7 @@ func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 	// supply reaches TargetAvailable, checked after the loop below.
 	if stats.Available < refillTrigger(pc) {
 		m.refilling[pc.Name] = true
+		poolRefilling.WithLabelValues(pc.Name).Set(1)
 	}
 	if !m.refilling[pc.Name] {
 		return nil
@@ -415,6 +420,7 @@ func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 	// next round.
 	if deficit <= 0 {
 		m.refilling[pc.Name] = false
+		poolRefilling.WithLabelValues(pc.Name).Set(0)
 	}
 	return nil
 }

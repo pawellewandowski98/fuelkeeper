@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -168,6 +169,12 @@ func TestMinterRefillsFromLowWaterToTarget(t *testing.T) {
 	cfg.MaxPerRound = 20
 	cfg.MaxPendingShards = 100 // large enough that the pending cap never interferes here
 	m := newMinter(t, st, tr, []pool.Config{pc}, cfg, clk)
+	// refillingGauge is a package-global metric shared by every test in this
+	// binary, so only read it after this test's own Set() calls (below) have
+	// overwritten it -- Set is an absolute assignment, not a delta, so once
+	// this test has triggered its own transition the value no longer depends
+	// on what an earlier test left behind for pool "main".
+	refillingGauge := func() float64 { return testutil.ToFloat64(jobs.PoolRefilling.WithLabelValues("main")) }
 
 	// Round 1: 0 < low_water (200) triggers refilling; max_per_round (20)
 	// caps this round at exactly low_water.
@@ -176,6 +183,7 @@ func TestMinterRefillsFromLowWaterToTarget(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(200), stats.Available, "round 1 mints max_per_round (20) splits of 10")
 	assert.Equal(t, 20, tr.Built())
+	assert.InDelta(t, 1.0, refillingGauge(), 0, "deficit not yet met: fuelkeeper_pool_refilling turns on")
 
 	// Round 2: available (200) is no longer < low_water, but refilling was
 	// already triggered and must continue -- this is the bug: the old code
@@ -186,10 +194,12 @@ func TestMinterRefillsFromLowWaterToTarget(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(300), stats.Available, "refilling continues past low_water up to target_available")
 	assert.Equal(t, 30, tr.Built())
+	assert.InDelta(t, 0.0, refillingGauge(), 0, "target_available reached: fuelkeeper_pool_refilling turns off")
 
 	// Round 3: supply is at target_available; refilling has turned off.
 	require.NoError(t, m.RunOnce(ctx))
 	assert.Equal(t, 30, tr.Built(), "at target_available: nothing minted")
+	assert.InDelta(t, 0.0, refillingGauge(), 0)
 
 	// Drop supply to 250: still >= low_water (200), so no refill starts.
 	spendAvailable(t, st, clk, "main", 50)
@@ -198,10 +208,13 @@ func TestMinterRefillsFromLowWaterToTarget(t *testing.T) {
 	require.Equal(t, int64(250), stats.Available)
 	require.NoError(t, m.RunOnce(ctx))
 	assert.Equal(t, 30, tr.Built(), "250 >= low_water 200: no minting")
+	assert.InDelta(t, 0.0, refillingGauge(), 0, "250 >= low_water: still not refilling")
 
 	// Drop supply to 199: now < low_water (200), so minting resumes and
 	// fills back up past target_available (deficit 101 rounds up to 11
-	// splits of 10).
+	// splits of 10). This round both starts and finishes the refill, so the
+	// gauge's final value is 0 again -- the on/off transitions above already
+	// pin the gauge's behavior when a refill spans multiple rounds.
 	spendAvailable(t, st, clk, "main", 51)
 	stats, err = st.Stats(ctx, "main")
 	require.NoError(t, err)
@@ -211,6 +224,7 @@ func TestMinterRefillsFromLowWaterToTarget(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 41, tr.Built(), "199 < low_water 200: minting resumes")
 	assert.Equal(t, int64(309), stats.Available, "mints past target_available by one split_size, same as any round")
+	assert.InDelta(t, 0.0, refillingGauge(), 0, "round both starts and reaches target: ends not refilling")
 }
 
 // TestMinterRefillSurvivesRestart pins the chosen restart behavior: the

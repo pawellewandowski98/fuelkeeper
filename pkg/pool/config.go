@@ -66,9 +66,15 @@ type Config struct {
 	SplitSize int `yaml:"split_size"`
 	// TargetAvailable is the desired count of available rows.
 	TargetAvailable int64 `yaml:"target_available"`
-	// LowWater triggers a refill split when available rows drop below it: the
-	// minter mints only once available < LowWater, then fills back up to
-	// TargetAvailable (0 means always refill below TargetAvailable).
+	// LowWater triggers a refill when available rows drop below it (0 means
+	// always refill below TargetAvailable). Once triggered, the minter's
+	// refill is sticky, not a per-round recheck: it keeps minting -- even
+	// across rounds where a cap (max_per_round, max_pending_shards) leaves
+	// available still short and a later round finds available back at or
+	// above LowWater -- until available actually reaches TargetAvailable,
+	// only then stopping until the next dip below LowWater. That refill
+	// state lives only in the minter's process memory (see jobs.Minter), so
+	// it does not survive a restart.
 	LowWater int64 `yaml:"low_water"`
 	// ServePolicy says which shard statuses may be served from.
 	ServePolicy ServePolicy `yaml:"serve_policy"`

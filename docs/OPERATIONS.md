@@ -231,6 +231,8 @@ make bench-cluster-down                   # stop and remove volumes
 
 `bench-run`'s `OUT` defaults to `/tmp/fuelbench-last.json` (`docs/benchmarks/` does not exist in this tree). Give the minter a few seconds after `bench-cluster-up` to fill `pools[0].available` toward `target_available` before a long run, or lower `target_available` in the bench config for a quick smoke test; a handful of `exhausted` errors right after start-up, before the mock treasury's first splits are mined, is expected and not a bug. Every service sets `SETTINGS_ENV_FILE=/dev/null` (see "Teratestnet" above) so the toolbox's settings package does not pick up a stray `.env`/`settings.conf`.
 
+`fk1`-`fk3` bind-mount the same `deploy/fuelkeeper-bench.yaml` read-only with the SELinux relabel option `z` (lowercase), not `Z`: all three containers read the one host file, and `Z` relabels it privately for whichever container starts last, leaving the other two unable to read it (`permission denied` on startup) under rootless Podman.
+
 ## Durability and Consistency
 
 **Correctness guarantee G1** (no fuel output is ever handed to two live reservations) depends on durability:
@@ -374,6 +376,7 @@ Monitor these Prometheus metrics to stay on top of pool health:
 | `fuelkeeper_watcher_transitions_total` | counter | pool, result | track | Shard state changes by outcome |
 | `fuelkeeper_minter_splits_total` | counter | pool, result (ok\|build_failed\|record_failed\|rejected\|send_failed) | failed rate ↑? | Minted splits by outcome |
 | `fuelkeeper_minter_last_success_timestamp` | gauge | pool | track | Unix time of last successful split |
+| `fuelkeeper_pool_refilling` | gauge | pool | stuck at 1 for a long time? | 1 while the pool is mid-refill (sticky hysteresis, see `low_water`), 0 otherwise |
 | `fuelkeeper_reaper_quarantined_total` | counter | pool | track | Rows moved to quarantine |
 | `fuelkeeper_reaper_resolved_total` | counter | pool, result | track | Quarantined rows resolved by state |
 | `fuelkeeper_oracle_requests_total` | counter | kind, result | track | Oracle calls by type and outcome |
