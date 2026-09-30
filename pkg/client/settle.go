@@ -135,8 +135,13 @@ func isHexTxID(s string) bool {
 //
 // OutcomeUnknown makes no HTTP call and returns (0, nil): neither "spent"
 // nor "available" is known to be true yet, so the reservation is left in
-// place to expire on its own, letting the reaper's requeue rule settle it
-// once its fate becomes clear (or clearly never will).
+// place to expire on its own and be quarantined. With an outpoint oracle
+// configured, the reaper's requeue rule settles it once that oracle proves
+// it unspent. With arcade alone -- no outpoint oracle -- the row's fate is
+// never actually learned by FuelKeeper: the reaper's unknown_requeue_age
+// (10 minutes, by default) instead requeues it blindly once the row has
+// been quarantined that long, trusting that a transaction still
+// unconfirmed after that much time is not coming.
 //
 // An Outcome outside the Outcome constants is an error. A txid Settle needs
 // but does not have, or that is not 64 lowercase hex characters, is

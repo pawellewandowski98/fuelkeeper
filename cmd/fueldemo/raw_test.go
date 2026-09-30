@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -578,6 +580,63 @@ func TestWorkerBackpressureHoldsOneReleasesRest(t *testing.T) {
 		}
 		return reserved == 1 && available == 4
 	}, time.Second, 5*time.Millisecond, "the attempted output stays held; the rest of the batch is released")
+}
+
+// TestWorkerBackpressureReleasesRestBeforeSleeping pins the ordering fix for
+// the batch-abandon path: the untried rest of the batch must be released
+// right away, not merely queued for release after the Retry-After wait.
+// With RetryAfter set to a full second, it uses client.WithObserver (the
+// same deterministic hook pkg/client/settle_test.go's countingClient uses)
+// to record when the /release call is actually seen by the server, and
+// checks that timestamp lands a comfortable margin before the sleep could
+// have elapsed: the pre-fix code, which only appended the untried outputs
+// to a slice released after sleepBounded returned, would instead show the
+// release arriving at roughly start+1s.
+func TestWorkerBackpressureReleasesRestBeforeSleeping(t *testing.T) {
+	srv, _, _ := newRawTestEnv(t, 1, 5)
+
+	var mu sync.Mutex
+	var releaseSeenAt time.Time
+	fk, err := client.New(srv.URL, client.WithObserver(func(method, path string, _ int, _ time.Duration, _ error) {
+		if method == http.MethodPost && strings.HasSuffix(path, "/release") {
+			mu.Lock()
+			if releaseSeenAt.IsZero() {
+				releaseSeenAt = time.Now()
+			}
+			mu.Unlock()
+		}
+	}))
+	require.NoError(t, err)
+
+	const retryAfter = time.Second
+	fake := &fakeSubmitter{err: &arcadeclient.BackpressureError{RetryAfter: int(retryAfter / time.Second)}}
+	rep := newReport("raw", "test", 1)
+	r := &rawRunner{fk: fk, arc: fake, pool: "main", batch: 5, rep: rep, memo: []byte("x"), satPerKB: 100}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var cycles atomic.Int32
+	r.afterCycle = func() {
+		if cycles.Add(1) == 1 {
+			cancel()
+		}
+	}
+
+	start := time.Now()
+	done := make(chan struct{})
+	go func() { defer close(done); r.worker(ctx, 0) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not stop within 5s of its first cycle completing")
+	}
+
+	mu.Lock()
+	seenAt := releaseSeenAt
+	mu.Unlock()
+	require.False(t, seenAt.IsZero(), "the release call must have happened")
+	assert.Less(t, seenAt.Sub(start), retryAfter/2,
+		"the untried outputs must be released before the Retry-After sleep starts, not after it returns")
 }
 
 // p2pkhLockingScript returns a syntactically plausible (not cryptographically

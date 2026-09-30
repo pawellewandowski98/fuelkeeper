@@ -234,6 +234,28 @@ func (r *rawRunner) reportSettle(ctx context.Context, token, outpoint string, s 
 	}
 }
 
+// release settles outpoints as OutcomeNotBroadcast (never reached a
+// gateway, or provably so -- see worker's doc comment), on a detached
+// deadline of its own (see reportTimeout) rather than ctx, best effort. A
+// no-op for an empty outpoints, so a caller can pass an as-yet-unused slice
+// unconditionally.
+//
+// worker calls this immediately -- not just appending to a slice released
+// later -- whenever it abandons a batch early (backpressure, a dial
+// failure, or a genuinely uncertain PostTx failure, all of which sleep
+// before the next Reserve): the batch's untried outputs are already known
+// to be going nowhere this cycle, so releasing them right away, before that
+// sleep, returns them to the pool as soon as possible instead of leaving
+// them reserved and unusable for however long the sleep lasts.
+func (r *rawRunner) release(ctx context.Context, token string, outpoints []string) {
+	if len(outpoints) == 0 {
+		return
+	}
+	relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
+	defer cancel()
+	_, _ = r.fk.Settle(relCtx, r.pool, token, outpoints, client.Settlement{Outcome: client.OutcomeNotBroadcast})
+}
+
 // worker runs one raw-mode round-trip loop until ctx is done: reserve a
 // batch of fuel, spend every output into its own OP_RETURN transaction
 // submitted to arcade in extended format, and report the outcome to fk via
@@ -388,10 +410,13 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 				case errors.As(perr, &backpressure):
 					// Not provably "never sent" (see worker's doc comment):
 					// hold the attempted output, release only the rest of
-					// this batch (untried), abandon it, and wait the
-					// server-given Retry-After.
+					// this batch (untried) right away -- not left reserved
+					// through the wait below -- abandon the batch, and wait
+					// the server-given Retry-After.
 					r.rep.fail("arcade:" + apiCode(perr))
 					unused = append(unused, outpointsOf(res.Outputs[i+1:])...)
+					r.release(ctx, res.Token, unused)
+					unused = unused[:0]
 					sleepBounded(ctx, time.Duration(backpressure.RetryAfter)*time.Second)
 					break outputLoop
 				case errors.As(perr, &reject) && reject.DoubleSpend():
@@ -419,10 +444,13 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 					// reached arcade, so safe to release -- but arcade
 					// being unreachable this way means the rest of the
 					// batch will fail the exact same way, so abandon it
-					// (release its untried outputs too) and back off.
+					// (release its untried outputs too, right away rather
+					// than through the backoff sleep below) and back off.
 					r.rep.fail("arcade:" + apiCode(perr))
 					unused = append(unused, o.Outpoint)
 					unused = append(unused, outpointsOf(res.Outputs[i+1:])...)
+					r.release(ctx, res.Token, unused)
+					unused = unused[:0]
 					sleepBounded(ctx, outageBackoff)
 					outageBackoff = nextOutageBackoff(outageBackoff)
 					break outputLoop
@@ -435,14 +463,17 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 					// the transaction is unknown -- it may already be on
 					// the network -- so hold rather than release it (see
 					// worker's doc comment), abandon the rest of the batch
-					// (release its untried outputs), and back off. The
-					// tally is skipped when ctx is already done: that is
-					// shutdown, not a real failure, exactly as the Reserve
-					// path above treats it.
+					// (release its untried outputs right away, not through
+					// the backoff sleep below), and back off. The tally is
+					// skipped when ctx is already done: that is shutdown,
+					// not a real failure, exactly as the Reserve path above
+					// treats it.
 					if ctx.Err() == nil {
 						r.rep.fail("arcade:unknown")
 					}
 					unused = append(unused, outpointsOf(res.Outputs[i+1:])...)
+					r.release(ctx, res.Token, unused)
+					unused = unused[:0]
 					sleepBounded(ctx, outageBackoff)
 					outageBackoff = nextOutageBackoff(outageBackoff)
 					break outputLoop
@@ -474,11 +505,7 @@ func (r *rawRunner) worker(ctx context.Context, id int) {
 			}
 		}
 
-		if len(unused) > 0 {
-			relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
-			_, _ = r.fk.Settle(relCtx, r.pool, res.Token, unused, client.Settlement{Outcome: client.OutcomeNotBroadcast})
-			cancel()
-		}
+		r.release(ctx, res.Token, unused)
 
 		if r.afterCycle != nil {
 			r.afterCycle()
