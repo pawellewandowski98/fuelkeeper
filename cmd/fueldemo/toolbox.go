@@ -60,10 +60,14 @@ type actionCreator interface {
 // on a go-wallet-toolbox wallet that holds no funds of its own. The action's
 // only input is the fuel output (its unlocking script supplied, its BEEF the
 // reservation's merged shard BEEF) and its only output an OP_RETURN; the
-// wallet computes the fee, and the surplus (denomination minus fee, below
-// the dust floor for small fuel) goes to miners, so no change output is
-// created. The wallet broadcasts through arcade itself (non-delayed), so a
-// successful createAction already carries arcade's verdict.
+// wallet computes the fee. A surplus (denomination minus fee) below the
+// funder's dust floor -- twice the fee of a minimal 1-in/1-out P2PKH spend,
+// 40 sat at 100 sat/kB (TB pkg/internal/storage/funder/sql.go:505-512) -- is
+// left to miners as extra fee, so small fuel (e.g. 50 sat) creates no change
+// output; a surplus above fee plus that floor does become a change output in
+// the wallet's default basket. The wallet broadcasts through arcade itself
+// (non-delayed), so a successful createAction already carries arcade's
+// verdict.
 type toolboxRunner struct {
 	fk      *client.Client
 	w       actionCreator
@@ -150,23 +154,9 @@ func openToolbox(ctx context.Context, o options, log *slog.Logger) (_ *toolboxRu
 	}
 	identityKey := key.PubKey().ToDERHex()
 
-	svcCfg := defs.DefaultServicesConfig(network)
-	svcCfg.Arcade.Enabled = true
-	svcCfg.Arcade.URL = o.arcadeURL
-	svcCfg.Arcade.EventsURL = o.arcadeURL
-	svcCfg.Arcade.CallbackToken = wdk.DeriveArcadeCallbackToken(identityKey)
-	svcCfg.ChaintracksClient.Enabled = true
-	svcCfg.ChaintracksClient.Mode = defs.ChaintracksClientModeRemote
-	svcCfg.ChaintracksClient.RemoteURL = o.chaintracks
-	// Only the arcade and chaintracks named on the command line: no failover
-	// broadcast to public ARC/GorillaPool/WhatsOnChain endpoints, which would
-	// silently move a benchmark off the system under test.
-	svcCfg.ArcConfig.Enabled = false
-	svcCfg.ArcGorillaPoolConfig.Enabled = false
-	svcCfg.WhatsOnChain.Enabled = false
-	svcCfg.Bitails.Enabled = false
-	if err := svcCfg.Validate(); err != nil {
-		return nil, fmt.Errorf("fueldemo: toolbox services config: %w", err)
+	svcCfg, err := servicesConfig(o, network, identityKey)
+	if err != nil {
+		return nil, err
 	}
 	fee := defs.FeeModel{Type: defs.SatPerKB, Value: int64(o.feeKB)} //nolint:gosec // a fee rate, far below MaxInt64
 
@@ -216,10 +206,12 @@ func openToolbox(ctx context.Context, o options, log *slog.Logger) (_ *toolboxRu
 		return nil, fmt.Errorf("fueldemo: migrate toolbox storage: %w", err)
 	}
 
-	// AutoKnownTxids off: every action's inputBEEF comes from FuelKeeper,
-	// not from this wallet's own graph. TrustSelf "known" (also the
-	// toolbox default) lets the wallet accept txid-only entries for splits
-	// it has already seen.
+	// AutoKnownTxids off: storage answers with full ancestry rather than
+	// bare txids the wallet knows, for the output BEEF it returns. Harmless
+	// here either way (ReturnTXIDOnly: that BEEF is never used), and it
+	// keeps the wallet out of the known-txid advertise/resolve path.
+	// TrustSelf "known" (also the toolbox default) lets the wallet accept
+	// txid-only inputBEEF entries for splits it has already seen.
 	t.wallet, err = wallet.New(network, key, t.provider,
 		wallet.WithServices(t.svc),
 		wallet.WithLogger(log),
@@ -231,6 +223,32 @@ func openToolbox(ctx context.Context, o options, log *slog.Logger) (_ *toolboxRu
 	}
 	t.w = t.wallet
 	return t, nil
+}
+
+// servicesConfig is the toolbox's network defaults (TB
+// pkg/defs/services.go:126) with the command line's arcade (callback token
+// derived from the wallet identity key, TB pkg/wdk/arcade_token.go:12) and
+// remote chaintracks, and every other broadcaster and header source turned
+// off: no failover broadcast to public ARC/GorillaPool/WhatsOnChain/Bitails
+// endpoints, which would silently move a benchmark off the system under
+// test.
+func servicesConfig(o options, network defs.BSVNetwork, identityKey string) (defs.WalletServices, error) {
+	s := defs.DefaultServicesConfig(network)
+	s.Arcade.Enabled = true
+	s.Arcade.URL = o.arcadeURL
+	s.Arcade.EventsURL = o.arcadeURL
+	s.Arcade.CallbackToken = wdk.DeriveArcadeCallbackToken(identityKey)
+	s.ChaintracksClient.Enabled = true
+	s.ChaintracksClient.Mode = defs.ChaintracksClientModeRemote
+	s.ChaintracksClient.RemoteURL = o.chaintracks
+	s.ArcConfig.Enabled = false
+	s.ArcGorillaPoolConfig.Enabled = false
+	s.WhatsOnChain.Enabled = false
+	s.Bitails.Enabled = false
+	if err := s.Validate(); err != nil {
+		return defs.WalletServices{}, fmt.Errorf("fueldemo: toolbox services config: %w", err)
+	}
+	return s, nil
 }
 
 // walletKey parses hexKey, or generates a fresh key (printed to stderr so
@@ -266,29 +284,56 @@ func (t *toolboxRunner) Close() {
 	}
 }
 
+// outcome is what a worker does with a fuel output after a failed
+// createAction.
+type outcome int
+
+const (
+	// outcomeRelease hands the output back to the pool: the failure happened
+	// before any broadcast.
+	outcomeRelease outcome = iota
+	// outcomeSpend reports the output spent in the returned txid: the
+	// transaction was built and posted, so the oracle settles it.
+	outcomeSpend
+	// outcomeHold neither spends nor releases the output: it may have been
+	// broadcast, but no txid is known. The reservation is left to expire so
+	// the reaper's quarantine + oracle path settles it; releasing it would
+	// let another worker reserve an output that may already be spent.
+	outcomeHold
+)
+
 // classifyCreateError maps a createAction failure to the code toolbox mode
-// tallies it under, and the txid of the transaction the wallet built when
-// the error carries one:
+// tallies it under, what to do with the fuel output, and the txid to report
+// when that is a spend:
 //
-//   - "reject": a *pkgerrors.ProcessActionError -- the wallet built and
-//     signed the transaction and storage tried to broadcast it, but arcade
-//     did not accept it (or the verdict is missing). Its TxID, when set, is
-//     reported to FuelKeeper as the spend so the oracle can settle the
-//     output, rather than releasing an output that may have been broadcast.
-//   - "underfunded": wdk.ErrNotEnoughFunds -- the fuel output alone cannot
-//     pay the OP_RETURN output plus the fee at the wallet's fee model (raise
-//     the pool denomination or lower --fee-kb).
-//   - "create": anything else (input BEEF verification, a malformed input,
-//     storage), all before any broadcast.
-func classifyCreateError(err error) (code, txid string) {
+//   - "reject" (spend): a *pkgerrors.ProcessActionError carrying a TxID --
+//     the wallet built, signed and posted the transaction but arcade did not
+//     accept it (or its verdict is missing).
+//   - "reject:unknown" (hold): a *pkgerrors.ProcessActionError without a
+//     TxID, e.g. storage failing to record a transaction it has already
+//     broadcast (TB pkg/storage/internal/actions/process.go:771-775).
+//   - "timeout" (hold): the action's own deadline (actionTimeout) expired;
+//     the transaction may or may not have been posted.
+//   - "underfunded" (release): wdk.ErrNotEnoughFunds -- the fuel output
+//     alone cannot pay the OP_RETURN output plus the fee at the wallet's fee
+//     model (raise the pool denomination or lower --fee-kb).
+//   - "create" (release): anything else (input BEEF verification, a
+//     malformed input, storage), all before any broadcast.
+func classifyCreateError(err error) (code string, then outcome, txid string) {
 	var perr *pkgerrors.ProcessActionError
 	if errors.As(err, &perr) {
-		return "reject", perr.TxID
+		if perr.TxID != "" {
+			return "reject", outcomeSpend, perr.TxID
+		}
+		return "reject:unknown", outcomeHold, ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout", outcomeHold, ""
 	}
 	if errors.Is(err, wdk.ErrNotEnoughFunds) {
-		return "underfunded", ""
+		return "underfunded", outcomeRelease, ""
 	}
-	return "create", ""
+	return "create", outcomeRelease, ""
 }
 
 // actionArgs is the createAction call spending one fuel input into the
@@ -357,17 +402,23 @@ func (t *toolboxRunner) worker(ctx context.Context, id int) {
 			continue
 		}
 		t.rep.reserved()
-		t.spendBatch(ctx, res)
+		if t.spendBatch(ctx, res) == 0 {
+			// Nothing went through: pause before reserving again, so a
+			// persistent failure does not hot-loop reserve/release.
+			sleepBounded(ctx, pause)
+		}
 	}
 }
 
 // spendBatch spends every output of res through its own createAction call
-// (the reservation's shard BEEF is fetched and merged once) and reports each
-// outcome to FuelKeeper: Spend after a success, or after a rejected
-// broadcast whose txid is known (the oracle settles it); everything else
-// left unspent -- cut short by ctx or the rate limiter, underfunded, or
-// failed before broadcast -- is released at the end of the batch.
-func (t *toolboxRunner) spendBatch(ctx context.Context, res *wire.ReserveResponse) {
+// (the reservation's shard BEEF is fetched and merged once), reports each
+// outcome to FuelKeeper as classifyCreateError directs, and returns how many
+// actions succeeded. Outputs left unspent before any broadcast -- cut short
+// by ctx or the rate limiter, underfunded, or failed before broadcast -- are
+// released at the end of the batch; an output whose broadcast fate is
+// unknown is held (neither spent nor released) until its reservation
+// expires.
+func (t *toolboxRunner) spendBatch(ctx context.Context, res *wire.ReserveResponse) (ok int) {
 	unused := make([]string, 0, len(res.Outputs))
 	defer func() { t.release(ctx, res.Token, unused) }()
 	all := func() {
@@ -380,7 +431,7 @@ func (t *toolboxRunner) spendBatch(ctx context.Context, res *wire.ReserveRespons
 	if err != nil {
 		t.rep.fail("inputs")
 		all()
-		return
+		return 0
 	}
 	beef, err := t.fk.InputBEEF(ctx, t.pool, res)
 	if err != nil {
@@ -388,7 +439,7 @@ func (t *toolboxRunner) spendBatch(ctx context.Context, res *wire.ReserveRespons
 			t.rep.fail("beef:" + apiCode(err))
 		}
 		all()
-		return
+		return 0
 	}
 
 	for i, o := range res.Outputs {
@@ -409,22 +460,27 @@ func (t *toolboxRunner) spendBatch(ctx context.Context, res *wire.ReserveRespons
 		r, cerr := t.w.CreateAction(actCtx, args, toolboxOriginator)
 		cancel()
 		if cerr != nil {
-			code, txid := classifyCreateError(cerr)
+			code, then, txid := classifyCreateError(cerr)
 			t.rep.fail(code)
 			if code == "underfunded" {
 				t.underfundedOnce.Do(func() {
 					t.warn("fueldemo: the toolbox wallet cannot pay the fee from one fuel output alone at --fee-kb; raise the pool denomination or lower --fee-kb (%v)\n", cerr)
 				})
 			}
-			if txid != "" {
+			switch then {
+			case outcomeSpend:
 				t.reportSpend(ctx, res.Token, o.Outpoint, txid)
-			} else {
+			case outcomeRelease:
 				unused = append(unused, o.Outpoint)
+			case outcomeHold:
+				// Left reserved: see outcomeHold.
 			}
 			continue
 		}
 
 		t.rep.ok(time.Since(start))
 		t.reportSpend(ctx, res.Token, o.Outpoint, r.Txid.String())
+		ok++
 	}
+	return ok
 }

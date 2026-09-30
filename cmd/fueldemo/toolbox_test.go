@@ -23,12 +23,15 @@ import (
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+	sdk "github.com/bsv-blockchain/go-sdk/wallet"
+	"github.com/bsv-blockchain/go-wallet-toolbox/pkg/defs"
 	pkgerrors "github.com/bsv-blockchain/go-wallet-toolbox/pkg/errors"
 	"github.com/bsv-blockchain/go-wallet-toolbox/pkg/wdk"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/api"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/api/wire"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/client"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/fuel"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
@@ -120,27 +123,180 @@ func TestRunToolboxModeRequiresArcade(t *testing.T) {
 
 // TestToolboxClassifiesCreateErrors pins classifyCreateError's mapping.
 func TestToolboxClassifiesCreateErrors(t *testing.T) {
-	reject := pkgerrors.NewProcessActionError(nil, nil).WithTx("ab"+strings.Repeat("0", 62), nil).Wrap(errors.New("arcade said no"))
-	code, txid := classifyCreateError(fmt.Errorf("create action failed: %w", reject))
-	assert.Equal(t, "reject", code)
-	assert.Equal(t, "ab"+strings.Repeat("0", 62), txid)
+	someTxID := "ab" + strings.Repeat("0", 62)
+	cases := map[string]struct {
+		err  error
+		code string
+		then outcome
+		txid string
+	}{
+		"reject with txid": {
+			fmt.Errorf("create action failed: %w", pkgerrors.NewProcessActionError(nil, nil).WithTx(someTxID, nil).Wrap(errors.New("arcade said no"))),
+			"reject", outcomeSpend, someTxID,
+		},
+		"reject without txid": {
+			// As storage raises it after a broadcast it then failed to record.
+			fmt.Errorf("cannot update single tx after broadcast: %w", pkgerrors.NewProcessActionError(nil, nil).Wrap(pkgerrors.NewTransactionErrorFromTxIDHex(someTxID))),
+			"reject:unknown", outcomeHold, "",
+		},
+		"reject wrapping not-enough-funds": {
+			// ProcessActionError.Is also matches its cause; it is still a reject.
+			pkgerrors.NewProcessActionError(nil, nil).WithTx(someTxID, nil).Wrap(wdk.ErrNotEnoughFunds),
+			"reject", outcomeSpend, someTxID,
+		},
+		"action deadline": {
+			fmt.Errorf("create action failed: failed to process created action: %w", context.DeadlineExceeded),
+			"timeout", outcomeHold, "",
+		},
+		"underfunded": {
+			fmt.Errorf("create action failed: failed to create transaction: %w", wdk.ErrNotEnoughFunds),
+			"underfunded", outcomeRelease, "",
+		},
+		"other": {errors.New("failed to verify beef"), "create", outcomeRelease, ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			code, then, txid := classifyCreateError(tc.err)
+			assert.Equal(t, tc.code, code)
+			assert.Equal(t, tc.then, then)
+			assert.Equal(t, tc.txid, txid)
+		})
+	}
+}
 
-	code, txid = classifyCreateError(fmt.Errorf("create action failed: %w", pkgerrors.NewProcessActionError(nil, nil)))
-	assert.Equal(t, "reject", code)
-	assert.Empty(t, txid, "a process error without a txid carries none")
+// TestToolboxServicesConfigIsolated checks that only the command line's
+// arcade and chaintracks are enabled: no failover broadcaster or header
+// source could move a run off the system under test.
+func TestToolboxServicesConfigIsolated(t *testing.T) {
+	o := toolboxTestOptions(t)
+	o.arcadeURL = "https://arcade.invalid"
+	o.chaintracks = "https://chaintracks.invalid"
+	id := "02" + strings.Repeat("11", 32)
+	for _, network := range []defs.BSVNetwork{defs.NetworkTTN, defs.NetworkMainnet, defs.NetworkTestnet} {
+		s, err := servicesConfig(o, network, id)
+		require.NoError(t, err, network)
+		assert.True(t, s.Arcade.Enabled, network)
+		assert.Equal(t, o.arcadeURL, s.Arcade.URL, network)
+		assert.Equal(t, wdk.DeriveArcadeCallbackToken(id), s.Arcade.CallbackToken, network)
+		assert.True(t, s.ChaintracksClient.Enabled, network)
+		assert.Equal(t, defs.ChaintracksClientModeRemote, s.ChaintracksClient.Mode, network)
+		assert.Equal(t, o.chaintracks, s.ChaintracksClient.RemoteURL, network)
+		assert.False(t, s.ArcConfig.Enabled, network)
+		assert.False(t, s.ArcGorillaPoolConfig.Enabled, network)
+		assert.False(t, s.WhatsOnChain.Enabled, network)
+		assert.False(t, s.Bitails.Enabled, network)
+	}
+}
 
-	// ProcessActionError.Is also matches its cause; a reject wrapping
-	// not-enough-funds is still a reject.
-	code, _ = classifyCreateError(pkgerrors.NewProcessActionError(nil, nil).Wrap(wdk.ErrNotEnoughFunds))
-	assert.Equal(t, "reject", code)
+// TestToolboxActionArgsP2PKHConstraints checks that a P2PKH reservation's
+// constraints reach the createAction call: tx version and lockTime on the
+// args, sequence on the input. The values differ from every default so a
+// dropped constraint cannot pass.
+func TestToolboxActionArgsP2PKHConstraints(t *testing.T) {
+	txid := storetest.NewTxID()
+	res := &wire.ReserveResponse{
+		Token: "tok",
+		Outputs: []wire.Output{{
+			TxID: txid.String(), Vout: 3, Outpoint: txid.String() + ":3", Satoshis: 50,
+			Unlock: wire.Unlock{Mode: "p2pkh", Script: strings.Repeat("01", 107), Length: 107},
+		}},
+		Constraints: &wire.Constraints{TxVersion: 2, LockTime: 600000, Sequence: 0xfffffffe},
+	}
+	inputs, err := client.CreateActionInputs(res, toolboxInputDescription)
+	require.NoError(t, err)
+	tr := &toolboxRunner{memo: []byte{0x00, 0x6a}}
+	args := tr.actionArgs(res, []byte("beef"), inputs[0])
 
-	code, txid = classifyCreateError(fmt.Errorf("create action failed: failed to create transaction: %w", wdk.ErrNotEnoughFunds))
-	assert.Equal(t, "underfunded", code)
-	assert.Empty(t, txid)
+	require.NotNil(t, args.Version)
+	require.NotNil(t, args.LockTime)
+	assert.Equal(t, uint32(2), *args.Version)
+	assert.Equal(t, uint32(600000), *args.LockTime)
+	require.Len(t, args.Inputs, 1)
+	require.NotNil(t, args.Inputs[0].SequenceNumber)
+	assert.Equal(t, uint32(0xfffffffe), *args.Inputs[0].SequenceNumber)
+	assert.Equal(t, uint32(3), args.Inputs[0].Outpoint.Index)
 
-	code, txid = classifyCreateError(errors.New("failed to verify beef"))
-	assert.Equal(t, "create", code)
-	assert.Empty(t, txid)
+	// Puzzle mode: no constraints, wallet defaults.
+	res.Constraints = nil
+	inputs, err = client.CreateActionInputs(res, toolboxInputDescription)
+	require.NoError(t, err)
+	args = tr.actionArgs(res, []byte("beef"), inputs[0])
+	assert.Nil(t, args.Version)
+	assert.Nil(t, args.LockTime)
+	assert.Nil(t, args.Inputs[0].SequenceNumber)
+}
+
+// fakeCreator is an actionCreator that always fails with err.
+type fakeCreator struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (f *fakeCreator) CreateAction(context.Context, sdk.CreateActionArgs, string) (*sdk.CreateActionResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return nil, f.err
+}
+
+// TestToolboxHoldsOutputsOfUnknownFate checks that an output whose
+// broadcast fate is unknown (a txid-less process error, or the action's own
+// deadline) is neither released nor reported spent: it stays reserved for
+// the reaper's quarantine + oracle path, so no other worker can reserve an
+// output that may already be on the network.
+func TestToolboxHoldsOutputsOfUnknownFate(t *testing.T) {
+	cases := map[string]struct {
+		err  error
+		code string
+	}{
+		"reject without txid": {pkgerrors.NewProcessActionError(nil, nil).Wrap(errors.New("cannot update single tx after broadcast")), "reject:unknown"},
+		"timeout":             {fmt.Errorf("create action failed: %w", context.DeadlineExceeded), "timeout"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv, st, rows, _ := newToolboxFKEnv(t, 6)
+			fk, err := client.New(srv.URL)
+			require.NoError(t, err)
+			rep := newReport("toolbox", "test", 1)
+			tr := &toolboxRunner{fk: fk, w: &fakeCreator{err: tc.err}, pool: "main", batch: 3, rep: rep, memo: []byte{0x00, 0x6a}}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			tr.worker(ctx, 0)
+
+			assert.Zero(t, rep.Sent)
+			assert.Equal(t, int64(6), rep.Failed[tc.code], "every output tried exactly once: %v", rep.Failed)
+			got, err := st.GetRows(context.Background(), "main", storetest.Ops(rows))
+			require.NoError(t, err)
+			for _, r := range got {
+				assert.Equal(t, store.StateReserved, r.State, "an output of unknown fate must stay reserved")
+			}
+		})
+	}
+}
+
+// TestToolboxPausesAfterFailedBatch checks that a batch with no success
+// pauses before the next reserve, so a persistent create failure does not
+// hot-loop reserve/release.
+func TestToolboxPausesAfterFailedBatch(t *testing.T) {
+	srv, st, rows, _ := newToolboxFKEnv(t, 30)
+	fk, err := client.New(srv.URL)
+	require.NoError(t, err)
+	rep := newReport("toolbox", "test", 1)
+	tr := &toolboxRunner{fk: fk, w: &fakeCreator{err: errors.New("boom")}, pool: "main", batch: 3, rep: rep, memo: []byte{0x00, 0x6a}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	tr.worker(ctx, 0)
+
+	assert.Positive(t, rep.Reserves)
+	assert.LessOrEqual(t, rep.Reserves, int64(8), "300 ms at one reserve per >= 50 ms pause")
+	got, err := st.GetRows(context.Background(), "main", storetest.Ops(rows))
+	require.NoError(t, err)
+	for _, r := range got {
+		assert.Equal(t, store.StateAvailable, r.State, "a pre-broadcast failure releases its output")
+	}
 }
 
 // mintMinedPuzzleShard mints (and inserts) one mined shard of n real
@@ -260,6 +416,31 @@ func (f *fakeArcade) received() []*transaction.Transaction {
 	return append([]*transaction.Transaction(nil), f.txs...)
 }
 
+// newToolboxFKEnv runs an in-process FuelKeeper (memory store, trust spend
+// policy, a clock that never advances so reservations never expire) over one
+// mined shard of n real hash-puzzle rows (see mintMinedPuzzleShard). It
+// returns the server, the store, the rows and the shard's merkle root.
+func newToolboxFKEnv(t *testing.T, n int) (*httptest.Server, store.Store, []store.Row, chainhash.Hash) {
+	t.Helper()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	rows, root := mintMinedPuzzleShard(t, st, "main", n)
+
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.SpendPolicy = pool.SpendTrust
+	pc.MinTTL = time.Second
+	require.NoError(t, pc.Validate())
+	ic := pool.DefaultInstanceConfig()
+	ic.InstanceID = "fueldemo-toolbox-test"
+	p := pool.NewPool(st, pc, ic, pool.ClockFunc(clk.Now), slog.New(slog.DiscardHandler))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = p.Run(ctx) }()
+	srv := httptest.NewServer(api.NewHandler(api.Deps{Pools: []api.PoolService{p}, Store: st}))
+	t.Cleanup(func() { srv.Close(); cancel(); <-done })
+	return srv, st, rows, root
+}
+
 // TestToolboxEndToEndOffline proves the whole BRC-100 path offline: a real
 // go-wallet-toolbox wallet on a temp sqlite, holding no funds of its own,
 // reserves fuel from an in-process FuelKeeper (memory store, one mined shard
@@ -273,27 +454,12 @@ func TestToolboxEndToEndOffline(t *testing.T) {
 	if testing.Short() {
 		t.Skip("opens a full toolbox stack")
 	}
-	clk := storetest.NewClock(storetest.Start)
-	st := memory.New(memory.WithClock(clk.Now))
-	rows, root := mintMinedPuzzleShard(t, st, "main", 1000) // outlasts a 2 s run (~550 sends without -race); GetRows caps at 1000
+	fkSrv, st, rows, root := newToolboxFKEnv(t, 1000) // GetRows caps at 1000; the rate limit below keeps a run well inside it
 	fuelOutpoints := make(map[string]bool, len(rows))
 	for _, r := range rows {
 		op := r.Outpoint
 		fuelOutpoints[op.String()] = true
 	}
-
-	pc := pool.DefaultPoolConfig("main", 50)
-	pc.SpendPolicy = pool.SpendTrust
-	pc.MinTTL = time.Second
-	require.NoError(t, pc.Validate())
-	ic := pool.DefaultInstanceConfig()
-	ic.InstanceID = "fueldemo-toolbox-test"
-	p := pool.NewPool(st, pc, ic, pool.ClockFunc(clk.Now), slog.New(slog.DiscardHandler))
-	pctx, pcancel := context.WithCancel(context.Background())
-	pdone := make(chan struct{})
-	go func() { defer close(pdone); _ = p.Run(pctx) }()
-	fkSrv := httptest.NewServer(api.NewHandler(api.Deps{Pools: []api.PoolService{p}, Store: st}))
-	t.Cleanup(func() { fkSrv.Close(); pcancel(); <-pdone })
 
 	arc := &fakeArcade{}
 	arcSrv := httptest.NewServer(arc)
@@ -306,6 +472,7 @@ func TestToolboxEndToEndOffline(t *testing.T) {
 	o.arcadeURL = arcSrv.URL
 	o.chaintracks = ct.URL
 	o.duration = 2 * time.Second
+	o.rateLim = 200 // at most ~400 sends: a fast machine cannot exhaust the fixture
 	rep := newReport("toolbox", "ttn", o.workers)
 
 	require.NoError(t, newToolboxRunner(context.Background(), o, fk, rep))
