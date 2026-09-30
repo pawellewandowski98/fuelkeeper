@@ -60,13 +60,17 @@ func WithClock(now func() time.Time) Option { return func(s *Store) { s.now = no
 
 // DSN builds the modernc DSN. Only the _pragma=name(value) form is honoured by
 // modernc; mattn-style keys (_journal_mode=WAL) are silently ignored, which is
-// why Open reads the pragmas back.
+// why Open reads the pragmas back. _txlock=immediate makes every
+// database/sql BeginTx on this connection issue BEGIN IMMEDIATE, so a
+// conflicting writer sees SQLITE_BUSY up front instead of partway through the
+// transaction (see write below).
 func DSN(path string, sync Sync) string {
 	if sync == "" {
 		sync = SyncFull
 	}
 	return "file:" + path +
-		"?_pragma=busy_timeout(5000)" +
+		"?_txlock=immediate" +
+		"&_pragma=busy_timeout(5000)" +
 		"&_pragma=journal_mode(WAL)" +
 		"&_pragma=synchronous(" + string(sync) + ")" +
 		"&_pragma=foreign_keys(ON)"
@@ -133,12 +137,12 @@ func Open(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 }
 
 // migrate applies every not-yet-applied schema version, tracked via PRAGMA
-// user_version, inside one BEGIN IMMEDIATE transaction on the single writer
-// connection: a crash mid-migration never leaves user_version bumped without
-// its DDL having actually run, or vice versa, since both are ordinary writes
-// inside the same transaction (see schema.go).
+// user_version, inside one write transaction: a crash mid-migration never
+// leaves user_version bumped without its DDL having actually run, or vice
+// versa, since both are ordinary writes inside the same transaction (see
+// schema.go).
 func (s *Store) migrate(ctx context.Context) error {
-	return s.write(ctx, func(c *sql.Conn) error {
+	return s.write(ctx, func(c querier) error {
 		var version int
 		if err := c.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 			return fmt.Errorf("sqlite: read schema version: %w", err)
@@ -232,6 +236,20 @@ func (s *Store) Close() error {
 	return s.closeErr
 }
 
+// querier is the subset of *sql.Tx that write's fn and the read helpers in
+// rows.go/shards.go need. Using an interface here, rather than *sql.Tx
+// directly, is what lets wrap_test.go's fakeCoder-style unit tests stay
+// decoupled from the concrete type; every production caller passes a real
+// *sql.Tx.
+type querier interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
+}
+
+var _ querier = (*sql.Tx)(nil)
+
 // sqliteCoder is satisfied by *modernc.org/sqlite.Error (whose Code method
 // returns the underlying C-level SQLite result code) and, in wrap_test.go, by
 // a fake used to exercise every code path deterministically: Error's own
@@ -283,45 +301,39 @@ func wrap(err error) error {
 	return err
 }
 
-// write runs fn inside BEGIN IMMEDIATE on the single writer connection,
-// retrying a busy/locked begin a few times. Because writer has exactly one
-// connection, at most one write transaction is ever in flight: a second
-// concurrent call to write blocks in s.writer.Conn(ctx) until the first's
-// connection is released (COMMIT or ROLLBACK), never at the SQL engine level.
-// fn therefore never races another write's statements, including the
-// read-then-write sequences in shards.go (RenewShard, ReleaseShard,
-// RetireShard): nothing else can run between the SELECT and the following
-// UPDATE within the same fn.
-func (s *Store) write(ctx context.Context, fn func(*sql.Conn) error) error {
-	conn, err := s.writer.Conn(ctx)
+// write runs fn inside one transaction on the single writer *sql.DB. Because
+// writer has exactly one connection, at most one write transaction is ever in
+// flight: a second concurrent call blocks in BeginTx until the first's
+// connection is released, never at the SQL engine level, so fn never races
+// another write's statements -- including the read-then-write sequences in
+// shards.go (RenewShard, ReleaseShard, RetireShard): nothing else can run
+// between a SELECT and its following UPDATE within the same fn.
+//
+// Using *sql.Tx here, rather than a raw *sql.Conn plus hand-written "BEGIN"/
+// "COMMIT"/"ROLLBACK" statements, is what makes this safe under a cancelled
+// context: database/sql guarantees that once BeginTx succeeds, either Commit
+// or Rollback actually runs against the connection -- via its own background
+// watcher issuing a real rollback the moment ctx is done, even when our own
+// later Commit/Rollback call short-circuits on the already-cancelled context
+// -- before the connection goes back to the pool. A hand-written "COMMIT"
+// sent through ExecContext(ctx, ...) has no such guarantee: once ctx is
+// cancelled it never reaches the server at all, leaving the connection wedged
+// inside an open transaction when it's returned to the pool, so every later
+// write then fails with SQLite's non-transient "cannot start a transaction
+// within a transaction" -- and because that error isn't transient, callers
+// never retry their way out of it either. (BEGIN IMMEDIATE semantics for
+// BeginTx itself follow from the DSN's _txlock=immediate, see DSN below.)
+func (s *Store) write(ctx context.Context, fn func(querier) error) error {
+	tx, err := s.writer.BeginTx(ctx, nil)
 	if err != nil {
 		return wrap(err)
 	}
-	defer func() { _ = conn.Close() }()
-	var begun bool
-	for attempt, backoff := 0, 20*time.Millisecond; attempt < 4; attempt, backoff = attempt+1, backoff*2 {
-		if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err == nil {
-			begun = true
-			break
-		}
-		if !errors.Is(wrap(err), store.ErrUnavailable) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
-		}
-	}
-	if !begun {
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
 		return wrap(err)
 	}
-	if err := fn(conn); err != nil {
-		_, _ = conn.ExecContext(ctx, "ROLLBACK")
-		return wrap(err)
-	}
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
 		return wrap(err)
 	}
 	return nil

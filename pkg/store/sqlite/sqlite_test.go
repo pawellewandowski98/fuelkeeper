@@ -23,7 +23,7 @@ func TestConformance(t *testing.T) {
 
 func TestDSNAndPragmas(t *testing.T) {
 	dsn := sqlite.DSN("/tmp/x.sqlite", sqlite.SyncFull)
-	require.Equal(t, "file:/tmp/x.sqlite?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)", dsn)
+	require.Equal(t, "file:/tmp/x.sqlite?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)", dsn)
 	require.Contains(t, sqlite.DSN("/tmp/x.sqlite", sqlite.SyncNormal), "synchronous(NORMAL)")
 
 	s, err := sqlite.Open(context.Background(), sqlite.Config{Path: filepath.Join(t.TempDir(), "p.sqlite")})

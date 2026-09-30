@@ -18,7 +18,7 @@ func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl 
 	now := s.now()
 	exp := now.Add(ttl)
 	var got time.Time
-	err := s.write(ctx, func(c *sql.Conn) error {
+	err := s.write(ctx, func(c querier) error {
 		var curHolder string
 		var curExp int64
 		err := c.QueryRowContext(ctx, `SELECT holder, expires_at FROM fuel_leases WHERE name = ?`, name).Scan(&curHolder, &curExp)
@@ -53,7 +53,7 @@ func (s *Store) ReleaseLease(ctx context.Context, name, holder string) error {
 	if err := store.ValidateHolder(holder); err != nil {
 		return err
 	}
-	return s.write(ctx, func(c *sql.Conn) error {
+	return s.write(ctx, func(c querier) error {
 		_, err := c.ExecContext(ctx, `DELETE FROM fuel_leases WHERE name = ? AND holder = ?`, name, holder)
 		return err
 	})
