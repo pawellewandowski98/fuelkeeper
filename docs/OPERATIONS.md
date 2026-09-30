@@ -21,10 +21,14 @@ All YAML keys are strict (typos are rejected). Environment variables are expande
 instance:
   instance_id: myhost          # Default: system hostname; used in logs and shard adoption
   max_shards: 8                # Max shards this instance can own; default 8
-  low_water_rows: 5000         # Adoption threshold: adopt a new shard when in-memory rows < this; default 5000
-  lease_ttl: 30s               # Duration the instance holds its shard leases; default 30s; must be > longest job interval
+  low_water_rows: 5000         # When in-memory rows fall below this, adopt a new shard; default 5000
+  lease_ttl: 30s               # Duration the instance holds shard leases; must exceed rescan_interval; default 30s
   rescan_interval: 5s          # How often to rescan the store for new shards; default 5s
   reserve_timeout: 2s          # Max time a single reserve request can take; default 2s
+  flush_window: 0              # Time to batch row state changes before persisting; default 0 (no batching)
+  max_batch: 0                 # Max rows to batch before flushing; default 0 (no limit)
+  flush_timeout: 5s            # Max time to hold a partial batch before flushing; default 5s
+  adopt_timeout: 200ms         # Max time a reserve request waits for shard adoption; default 200ms
 
 # Store backend (memory, sqlite, postgres; pebble/mongodb/aerospike in Plan 4)
 store:
@@ -43,7 +47,7 @@ pools:
     lock_mode: puzzle                # puzzle (default) | p2pkh; unlock mode
     split_size: 500                  # Outputs per split transaction (shard); default 500; must be 1..10000
     target_available: 100000         # Target number of available rows to maintain; default 100000
-    low_water: 60000                 # Adoption trigger: mint when rows < this; 0 = always refill below target; default 60000
+    low_water: 60000                 # Minter refill trigger: mint when rows < this; 0 = always refill below target; default 60000
     serve_policy: mined_only         # mined_only (default) | any; return only mined splits or any splits
     default_ttl: 2m                  # Reservation TTL when client doesn't specify; default 2m
     min_ttl: 30s                     # Minimum allowed TTL; default 30s
@@ -53,28 +57,28 @@ pools:
     spend_policy: verify             # trust | verify (default unless oracle.kind: none); verify spent outputs via oracle
     expected_tps: 0                  # Expected transactions per second (for capacity validation); no check if 0
 
-# Background jobs (disabled by default in development)
+# Background jobs (enabled by default)
 jobs:
-  enabled: true                      # Run jobs or not
-  lease_ttl: 90s                     # Lease TTL for job coordination; must be > 2× longest job interval
+  enabled: true                      # Run jobs or not; default true
+  lease_ttl: 90s                     # Job lease TTL; must exceed 2× longest job interval; only matters when enabled
   
   reaper:
     interval: 1s                     # How often to scan for expired/quarantined rows; default 1s
-    grace: 10s                       # Grace period before retiring an expired reservation; default 10s
-    quarantine_min_age: 30s          # Min age before a quarantined row can be verified; default 30s
-    min_unspent_age: 30s             # Min time a row must be "unspent" before being re-handed out; default 30s
-    hint_patience: 10m               # How long to trust a "spent" hint before re-checking; default 10m
-    batch: 500                       # Max rows per reaper query batch; default 500
-    max_pages: 10                    # Max store pages to scan per run; default 10
-    quarantine_batch: 1000           # Max quarantined rows per oracle verification batch; default 1000
-    oracle_batch: 200                # Max rows to send to oracle in one request; default 200
+    grace: 10s                       # Clock-skew guard before quarantining an expired reservation; default 10s
+    quarantine_min_age: 30s          # Wait before the first oracle check on a quarantined row; default 30s
+    min_unspent_age: 30s             # Quarantine age before an unhinted Unspent row is requeued; default 30s
+    hint_patience: 10m               # Quarantine age before a hinted Unspent row is requeued; default 10m
+    batch: 500                       # ListQuarantined page size; default 500
+    max_pages: 10                    # Max ListQuarantined pages per tick; default 10
+    quarantine_batch: 1000           # Rows moved per Store.Quarantine call; default 1000
+    oracle_batch: 200                # Outpoints per oracle call; default 200
 
   watcher:
     interval: 10s                    # How often to check unmined shards; default 10s
     rebroadcast_after: 5m            # Rebroadcast unmined splits after this time; default 5m
     alert_after: 6h                  # Log alerts for unmined splits after this time; default 6h
-    limit: 5000                      # Max unmined shards to track; default 5000; must exceed jobs.minter.max_pending_shards
-    max_checks_per_tick: 500         # Max shards to oracle-check per interval; default 500
+    limit: 5000                      # Unmined shards fetched per tick; default 5000; must exceed jobs.minter.max_pending_shards
+    max_checks_per_tick: 500         # Oracle calls bounded per tick; default 500
 
   minter:
     interval: 30s                    # How often to mint new shards; default 30s
@@ -97,12 +101,13 @@ treasury:
 # HTTP API listener
 api:
   listen: ":8080"                    # Host:port to bind; default :8080
-  api_keys: []                       # Bearer tokens for /v1/ endpoints; empty = open (dev only)
+  insecure: false                    # Allow access without API keys (non-loopback listen requires explicit insecure: true)
+  api_keys: []                       # Bearer tokens for /v1/ endpoints; cannot be empty if omitted
   admin_keys: []                     # Bearer tokens for admin endpoints; empty = use fuel keys
   read_timeout: 10s                  # HTTP read timeout; default 10s
   write_timeout: 30s                 # HTTP write timeout; default 30s
   idle_timeout: 120s                 # HTTP idle keep-alive timeout; default 120s
-  max_body_bytes: 1048576            # Max request/response body size (1 MiB default)
+  max_body_bytes: 1048576            # Max request body size; limits input only (1 MiB default)
   request_timeout: 10s               # Max time per HTTP request; must exceed instance.reserve_timeout; default 10s
 
 # Logging
@@ -146,24 +151,26 @@ On startup, FuelKeeper validates the configuration:
 
 ## Jobs and Leases
 
-Three background jobs run under store leases for coordination:
+Three background jobs run under store leases for coordination. The `instance.lease_ttl` is separate and manages shard ownership: a crashed instance's shards are re-adopted by others after `instance.lease_ttl` expires (must exceed `instance.rescan_interval`).
+
+When jobs are enabled, `jobs.lease_ttl` coordinates which instance runs each job; it must exceed twice the longest job interval to avoid rapid leader flaps.
 
 ### Reaper
 
 Runs every `reaper.interval`. Responsibilities:
 
 - Expire old reservations (`>= ttl_seconds` old) and move them to quarantine
-- Move old quarantined rows to "spent" if the oracle confirms they are spent
-- Move very old quarantined rows back to "available" (safety fallback when oracle is unavailable)
+- Move quarantined rows to "spent" only after the oracle confirms a MINED spend
+- Requeue rows marked Unspent by the oracle (after `min_unspent_age` for unhinted rows, or `hint_patience` for hinted rows)
 
 ### Watcher
 
 Runs every `watcher.interval`. Responsibilities:
 
-- Check unmined shards with the oracle, update status to "mined" when confirmed
+- Fetch up to `limit` unmined shards and check them with the oracle, update status to "mined" when confirmed
 - Rebroadcast shards older than `rebroadcast_after`
 - Alert (log warnings) for shards older than `alert_after`
-- Ensure the unmined shard count stays below `limit`
+- Make up to `max_checks_per_tick` oracle calls per tick; old unknown shards cannot starve newer ones
 
 ### Minter
 
@@ -173,18 +180,15 @@ Runs every `minter.interval`. Responsibilities:
 - Stop minting when unmined shards exceed `max_pending_shards`
 - Retire shards if the treasury rejects them (terminal failure)
 
-All jobs are leased to one instance at a time. The lease TTL must exceed the longest job interval plus its runtime, or leadership flaps. Overlapping runs during hand-over are harmless because every job write is a compare-and-set.
-
 ## Adoption Behavior
 
-An instance adopts shards to replenish in-memory rows:
+The shard manager per instance (not the minter) owns shards and replenishes in-memory rows:
 
 - Adopts one shard at a time when in-memory rows < `low_water_rows` and owned shards < `max_shards`
-- The adoption slot is shared between background feeding (minter) and on-demand reserve-path adoption
-- A reserve request waits at most `instance.adopt_timeout` for the adoption to complete
+- A reserve request waits at most `instance.adopt_timeout` for adoption to complete
 - A crashed instance's shards are re-adopted by others after `instance.lease_ttl` expires
 
-The metric `fuelkeeper_cas_missed_total` counts brief moments when two instances are serving the same shard; it clears within one rescan cycle.
+The metric `fuelkeeper_cas_missed_total` counts brief moments when two instances briefly serve the same shard; it clears within one rescan cycle.
 
 ## Development Mode (Nullnet)
 

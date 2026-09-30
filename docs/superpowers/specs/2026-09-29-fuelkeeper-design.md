@@ -439,8 +439,8 @@ retry_after?}` with stable codes.
 ### Go client (`pkg/client`)
 
 `Reserve/Release/Spend`, keep-alive HTTP, per-shard BEEF cache with ETag,
-helpers `ToCreateActionInputs(reservation)`, `InputBEEF(reservation)` (merged
-BEEF), `FeeFor(sizeBytes, satPerKB)` and `AbsorbSurplus` for wallets that must
+helpers `CreateActionInputs(reservation, description)`, `InputBEEF(reservation)` (merged
+BEEF), `Surplus(denomination, sizeBytes, satPerKB)` for wallets that must
 not emit change.
 
 ### CLI (`cmd/fuelkeeper`)
