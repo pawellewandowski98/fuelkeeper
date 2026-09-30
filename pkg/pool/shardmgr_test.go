@@ -1328,3 +1328,127 @@ func TestReleaseDoesNotReAddRowsHandedOutDuringItsRead(t *testing.T) {
 	require.Len(t, queued, 1)
 	assert.Equal(t, ops[1], queued[0].Outpoint)
 }
+
+// gatedRescanStore blocks every ListAvailable call for one shard after the
+// first (the adoption load), until gate is closed or the call's ctx ends:
+// the first rescan of that shard then stands in for a slow store read (such
+// as a Pebble read waiting for the WAL fsync of a batch it observed).
+type gatedRescanStore struct {
+	store.Store
+	txid    chainhash.Hash
+	calls   atomic.Int32
+	blocked chan struct{} // closed when the first gated call starts waiting
+	once    sync.Once
+	gate    chan struct{}
+}
+
+func (w *gatedRescanStore) ListAvailable(ctx context.Context, pool string, txid chainhash.Hash, fromVout uint32, limit int) ([]store.Row, error) {
+	if txid == w.txid && w.calls.Add(1) > 1 {
+		w.once.Do(func() { close(w.blocked) })
+		select {
+		case <-w.gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return w.Store.ListAvailable(ctx, pool, txid, fromVout, limit)
+}
+
+// TestRunAdoptsWhileRescanIsSlow pins that hunger-driven adoption does not
+// wait behind a slow RescanOnce. RescanOnce reads every owned shard in turn,
+// so its duration is owned shards times the store's read latency; a Run
+// loop that also served hunger could not adopt at all while it ran. Under
+// sustained multi-output demand on Pebble (reads wait for the WAL fsync
+// chain, ~30-60 ms each) the loop spent most of its time rescanning, and the
+// allocator drained to zero between adoptions: ~5-20% "exhausted" reserves
+// with the store holding 150k+ available rows.
+func TestRunAdoptsWhileRescanIsSlow(t *testing.T) {
+	const poolName = "slow-rescan"
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	first, _ := storetest.MintShard(t, base, poolName, 10, store.ShardMined)
+	wrapped := &gatedRescanStore{Store: base, txid: first.TxID, blocked: make(chan struct{}), gate: make(chan struct{})}
+	cfg := testInstanceConfig()
+	cfg.MaxShards = 4
+	cfg.LowWaterRows = 1000 // always hungry
+	cfg.LeaseTTL = time.Hour
+	cfg.RescanInterval = 20 * time.Millisecond
+	m, alloc := newMgr(t, wrapped, clk, cfg, pc)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx) }()
+	defer func() {
+		cancel()
+		require.NoError(t, <-done)
+	}()
+
+	require.Eventually(t, func() bool { return alloc.Has(first.TxID) }, 2*time.Second, 5*time.Millisecond, "Run adopts the first shard")
+	select {
+	case <-wrapped.blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RescanOnce never reached the gated ListAvailable")
+	}
+
+	second, _ := storetest.MintShard(t, base, poolName, 10, store.ShardMined)
+	m.Hungry() // what Reserve does below LowWaterRows
+	assert.Eventually(t, func() bool { return alloc.Has(second.TxID) && alloc.ShardAvailable(second.TxID) == 10 },
+		time.Second, 5*time.Millisecond, "adoption must proceed while a rescan is blocked on a slow read")
+	close(wrapped.gate)
+}
+
+// TestRescanRetiresSpentOutShardWhenDroppingIt pins that a shard consumed
+// while owned is retired when RescanOnce drops it, not left mined for a later
+// adoption to retire. Left mined, every consumed shard came back at the head
+// of AcquireShard's oldest-first order once its emptyExclusion window ran
+// out, so each live adoption paid for a dead one first (acquire, listing,
+// GetRows, retire, release); after an idle minute the whole backlog came due
+// at once and adoption stalled behind it long enough to drain the allocator.
+// A drained shard with a row still reserved is dropped as "empty" as before.
+func TestRescanRetiresSpentOutShardWhenDroppingIt(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "rescan-retire"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, _ := mintN(t, st, clk, poolName, 2, 3)
+	cfg := testInstanceConfig() // MaxShards=2
+	cfg.LowWaterRows = 100
+	m, alloc := newMgr(t, st, clk, cfg, pc)
+	require.NoError(t, m.FeedOnce(ctx))
+	require.True(t, alloc.Has(shards[0].TxID) && alloc.Has(shards[1].TxID))
+
+	tok, popped := drainAll(t, st, clk, poolName, alloc)
+	var spend, keep []store.Outpoint
+	for _, r := range popped {
+		if r.TxID == shards[1].TxID && len(keep) == 0 {
+			keep = append(keep, r.Outpoint) // shard 1 keeps one reserved row
+			continue
+		}
+		spend = append(spend, r.Outpoint)
+	}
+	n, err := st.Spend(ctx, poolName, tok, spend, storetest.NewTxID(), true)
+	require.NoError(t, err)
+	require.Equal(t, len(spend), n)
+
+	emptyBefore, retiredBefore := dropsEmpty(poolName), dropsRetired(poolName)
+	for range 2 { // emptyRescansMax consecutive empty rescans
+		require.NoError(t, m.RescanOnce(ctx))
+	}
+
+	got, err := st.GetShard(ctx, poolName, shards[0].TxID)
+	require.NoError(t, err)
+	assert.Equal(t, store.ShardRetired, got.Status, "spent-out shard retired on drop")
+	assert.Empty(t, got.Owner, "lease released")
+	assert.False(t, m.RecentlyEmpty(shards[0].TxID), "a retired shard needs no exclusion entry")
+	assert.False(t, alloc.Has(shards[0].TxID))
+
+	got, err = st.GetShard(ctx, poolName, shards[1].TxID)
+	require.NoError(t, err)
+	assert.Equal(t, store.ShardMined, got.Status, "a shard with a reserved row is not retired")
+	assert.Empty(t, got.Owner, "lease released")
+	assert.True(t, m.RecentlyEmpty(shards[1].TxID))
+
+	assert.InDelta(t, retiredBefore+1, dropsRetired(poolName), 0)
+	assert.InDelta(t, emptyBefore+1, dropsEmpty(poolName), 0)
+}

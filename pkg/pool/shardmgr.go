@@ -34,6 +34,7 @@ const (
 
 type ownedState struct {
 	head         store.ShardHead
+	size         int // store.Shard.Size at adoption, for retireIfSpentOut on drop
 	leaseUntil   time.Time
 	emptyRescans int
 	rescanNow    bool
@@ -60,6 +61,7 @@ type ShardManager struct {
 	bg            sync.WaitGroup              // background lease releases; Run waits for them before returning
 	closed        bool
 	hungry        chan struct{}
+	flagged       chan struct{} // NoteCASMiss wakes the maintenance loop's rescanFlagged
 	adoptSem      chan struct{} // capacity 1; serializes adopt+load across FeedOnce and EnsureRows
 
 	// Metric children for this pool, fetched once here instead of calling
@@ -94,6 +96,7 @@ func NewShardManager(st store.Store, pc Config, cfg InstanceConfig, alloc *Alloc
 		recentlyEmpty: map[chainhash.Hash]time.Time{},
 		releasing:     map[chainhash.Hash]struct{}{},
 		hungry:        make(chan struct{}, 1),
+		flagged:       make(chan struct{}, 1),
 		adoptSem:      make(chan struct{}, 1),
 
 		adoptionsOK:          shardAdoptions.WithLabelValues(pc.Name, "ok"),
@@ -425,7 +428,7 @@ func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 		m.alloc.UpdateHead(sh.TxID, sh.Status, sh.Version)
 		return true, nil
 	default:
-		m.owned[sh.TxID] = &ownedState{head: store.ShardHead{Status: sh.Status, Version: sh.Version}, leaseUntil: until}
+		m.owned[sh.TxID] = &ownedState{head: store.ShardHead{Status: sh.Status, Version: sh.Version}, size: sh.Size, leaseUntil: until}
 		m.mu.Unlock()
 	}
 
@@ -455,7 +458,9 @@ func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 
 // retireIfSpentOut marks a mined shard retired (store.ShardRetired: all rows
 // terminal) when every one of its rows is spent or invalid, and reports
-// whether the shard is now terminal. Nothing else ever retires a shard whose
+// whether the shard is now terminal. It runs on an adoption that found the
+// shard empty (AdoptOnce) and when RescanOnce drops an owned shard it found
+// empty (retireDrained). Nothing else ever retires a shard whose
 // fuel has been consumed, and AcquireShard hands out the oldest adoptable
 // shard first, so without this spent-out shards stay mined forever and pile
 // up ahead of every shard that still has rows. The recently-empty exclusion
@@ -720,6 +725,13 @@ func (m *ShardManager) servable(s store.ShardStatus) bool {
 // empty scans avoids churn while the instance is not starved; a drained shard
 // that blocks adoption at MaxShards is instead rotated out at once by
 // rotateDrained.
+//
+// A shard dropped here whose rows are all terminal is retired on the spot
+// (retireDrained) rather than excluded: left mined, it would come back at the
+// head of AcquireShard's oldest-first order once its emptyExclusion window
+// ran out, and some later adoption would have to acquire, list, check and
+// retire it before reaching a live shard -- one dead adoption for every shard
+// this instance consumed, all coming due together after an idle minute.
 func (m *ShardManager) RescanOnce(ctx context.Context) error {
 	var firstErr error
 	for _, txid := range m.ownedIDs() {
@@ -745,11 +757,38 @@ func (m *ShardManager) RescanOnce(ctx context.Context) error {
 		empty := st.emptyRescans >= emptyRescansMax
 		m.mu.Unlock()
 		if empty {
+			if m.retireDrained(ctx, txid) {
+				continue
+			}
 			m.log.Debug("dropping drained shard", "txid", txid.String())
 			m.drop(ctx, txid, true, "empty")
 		}
 	}
 	return firstErr
+}
+
+// retireDrained retires an owned shard that reads empty when every one of its
+// rows is terminal (see retireIfSpentOut), then drops it with reason
+// "retired" and releases its lease, with no exclusion entry since
+// AcquireShard never returns a retired shard. It reports whether it did; a
+// shard that is not spent out (a row still reserved or quarantined, or any
+// store error) is left owned for the caller to drop as empty.
+func (m *ShardManager) retireDrained(ctx context.Context, txid chainhash.Hash) bool {
+	m.mu.Lock()
+	st := m.owned[txid]
+	var sh store.Shard
+	if st != nil {
+		sh = store.Shard{TxID: txid, Status: st.head.Status, Version: st.head.Version, Size: st.size}
+	}
+	m.mu.Unlock()
+	if st == nil || !m.retireIfSpentOut(ctx, &sh) {
+		return false
+	}
+	m.log.Debug("dropping spent-out shard", "txid", txid.String())
+	if m.drop(ctx, txid, false, "retired") {
+		m.releaseLease(ctx, txid)
+	}
+	return true
 }
 
 // rescanFlagged renews and reloads only shards flagged by NoteCASMiss, ahead
@@ -816,13 +855,18 @@ func (m *ShardManager) rescanFlagged(ctx context.Context) error {
 }
 
 // NoteCASMiss flags a shard for an immediate rescan (another holder may be
-// serving it) and wakes the run loop.
+// serving it) and wakes both Run loops: maintenance, for rescanFlagged, and
+// adoption, since the miss may have left this instance short of rows.
 func (m *ShardManager) NoteCASMiss(txid chainhash.Hash) {
 	m.mu.Lock()
 	if st := m.owned[txid]; st != nil {
 		st.rescanNow = true
 	}
 	m.mu.Unlock()
+	select {
+	case m.flagged <- struct{}{}:
+	default:
+	}
 	m.Hungry()
 }
 
@@ -880,9 +924,18 @@ func (m *ShardManager) ReleaseAll(ctx context.Context) error {
 	return firstErr
 }
 
-// Run drives FeedOnce on hunger, RenewOnce roughly every LeaseTTL/3 and
-// RescanOnce every RescanInterval, until ctx is done; then it releases all
-// owned shards before returning.
+// Run drives FeedOnce on hunger, and RenewOnce roughly every LeaseTTL/3,
+// RescanOnce every RescanInterval and rescanFlagged on NoteCASMiss, until ctx
+// is done; then it releases all owned shards before returning.
+//
+// Adoption runs in its own goroutine, apart from that maintenance loop:
+// RescanOnce reads every owned shard in turn, so it takes owned shards times
+// the store's read latency, and a single loop could not adopt at all while
+// it ran. On a store whose reads are slow under write load (Pebble reads wait
+// for the WAL fsync of any batch they observed) that starved adoption and let
+// the allocator drain to zero with the store still full. The two loops'
+// interleavings already occur between EnsureRows (request path) and the
+// maintenance loop; FeedOnce and EnsureRows stay serialized on adoptSem.
 func (m *ShardManager) Run(ctx context.Context) error {
 	renewEvery := m.cfg.LeaseTTL / 3
 	if renewEvery <= 0 {
@@ -892,21 +945,24 @@ func (m *ShardManager) Run(ctx context.Context) error {
 	defer renew.Stop()
 	rescan := time.NewTicker(m.cfg.RescanInterval)
 	defer rescan.Stop()
+	feeding := make(chan struct{})
+	go func() {
+		defer close(feeding)
+		m.feedLoop(ctx)
+	}()
 	m.Hungry()
 	for {
 		select {
 		case <-ctx.Done():
+			<-feeding // no adoption may still be running once leases are released
 			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
 			err := m.ReleaseAll(rctx)
 			m.bg.Wait() // background lease releases from request-path rotation
 			return err
-		case <-m.hungry:
+		case <-m.flagged:
 			if err := m.rescanFlagged(ctx); err != nil && ctx.Err() == nil {
 				m.log.Warn("rescan flagged", "err", err)
-			}
-			if err := m.FeedOnce(ctx); err != nil && ctx.Err() == nil {
-				m.log.Warn("adopt", "err", err)
 			}
 		case <-renew.C:
 			if err := m.RenewOnce(ctx); err != nil && ctx.Err() == nil {
@@ -921,6 +977,21 @@ func (m *ShardManager) Run(ctx context.Context) error {
 			}
 			if m.isHungry() {
 				m.Hungry()
+			}
+		}
+	}
+}
+
+// feedLoop is Run's adoption goroutine: FeedOnce on every hunger signal until
+// ctx is done.
+func (m *ShardManager) feedLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.hungry:
+			if err := m.FeedOnce(ctx); err != nil && ctx.Err() == nil {
+				m.log.Warn("adopt", "err", err)
 			}
 		}
 	}
