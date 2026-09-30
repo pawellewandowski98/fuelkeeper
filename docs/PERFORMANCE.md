@@ -8,7 +8,10 @@ microbenchmarks are from commit `236642c` (2026-09-30); the API
 (2026-09-30), re-run after three fixes landed on top of the `236642c` API
 numbers this page originally published — see
 [`benchmarks/20260930-api-single.md`](benchmarks/20260930-api-single.md)'s
-"Before the fixes" appendix for what changed and why.
+"Before the fixes" appendix for what changed and why. Pebble's
+single-instance numbers were re-run a second time at **`8f3bb20`** after a
+fourth fix cleared a shard-adoption problem specific to that shape (see
+"Summary" below).
 
 ## Method
 
@@ -76,7 +79,7 @@ the `-rate` caps some shapes needed are in
 |---|---|---|---|---|
 | memory | 24364 | 19311 (rate-capped 4000/s) | n/a (single-process only) | 7 ms |
 | sqlite | 707 | 3030 | n/a (single-process only) | 144 ms |
-| pebble | 716 | 2489 | n/a (single-process only) | 158 ms |
+| pebble | 675 | 2919 | n/a (single-process only) | 201 ms |
 | postgres | 880 | 5505 | 1012 | 90 ms |
 | mongodb | 970 | 6669 | n/a (not benchmarked clustered) | 85 ms |
 | aerospike | 24726 | 15000 (rate-capped 1500/s) | n/a (not benchmarked clustered) | 5 ms |
@@ -88,12 +91,16 @@ counts `Stats` also returns stay O(shards), unchanged) and `ba55a6f`/
 `a22be74` (shard retirement); aerospike benefited from `ba55a6f`/`a22be74`
 only -- `34512a0` is specific to `pkg/store/memory` and does not touch
 aerospike. **sqlite and pebble moved from the slowest backends by one
-order of magnitude to a solid middle tier** (700+ reserves/s at `w64-c1`,
-p50 in the tens of milliseconds -- 47.84/42.56 ms -- though p99 is still
-144/158 ms, down from hundreds of milliseconds for both percentiles) once
+order of magnitude to a solid middle tier** (675+ reserves/s at `w64-c1`,
+p50 in the tens of milliseconds -- 47.84/43.01 ms -- though p99 is still
+144/201 ms, down from hundreds of milliseconds for both percentiles) once
 `fd4dc56`/`91e1331` replaced one-`fsync`-per-writer with group commit —
 they are still bound by their single-writer lock relative to the
-multi-process backends, just no longer catastrophically so. **Postgres is the only
+multi-process backends, just no longer catastrophically so (pebble's
+`w64-c10` needed a second fix, `e339617`/`8f3bb20`, on top of group commit
+to clear a shard-adoption problem group commit's higher throughput exposed
+-- see [`benchmarks/20260930-api-single.md`](benchmarks/20260930-api-single.md)
+for the full mechanism). **Postgres is the only
 backend measured clustered** (the benchmark cluster's fixed config,
 `deploy/fuelkeeper-bench.yaml`, only stands up a Postgres-backed cluster);
 it and mongodb are the two multi-process backends most likely to be run in
@@ -272,15 +279,28 @@ table).
   list — if more than 256 such shards precede the live ones, adoption can
   still cycle. The planned fix, per `docs/OPERATIONS.md`, is a store-side
   `AcquireShard` that skips row-less shards server-side instead of relying
-  on a bounded client-side exclusion list. **Pebble's `w64-c10` shape
-  showed errors in the re-run** (see
+  on a bounded client-side exclusion list. **Pebble's `w64-c10` shape's
+  errors (fixed by `e339617`/`8f3bb20`) were a separate, second mechanism,
+  not this residual limit**: Pebble's slow reads under write load (a read
+  waits for the WAL fsync of any batch it may have observed) exposed two
+  shard-manager problems -- adoption sharing one goroutine with a
+  per-owned-shard rescan pass (starving adoption below consumption), and a
+  shard consumed while owned only being retired much later, once some
+  future adoption happened to re-acquire it. Neither is the drained-but-
+  not-terminal exclusion-list case above (which accounted for at most ~2%
+  of acquisitions in the traced run), nor Pebble's `AcquireShard` scan cost
+  (measured at the same order as sqlite's there, not a differentiator). See
   [`benchmarks/20260930-api-single.md`](benchmarks/20260930-api-single.md)'s
-  "Rate caps used, and why" section for the exact counts) whose cause is a
-  separate, currently open investigation — it is not yet established
-  whether this residual limit, pebble's `AcquireShard` cost (see
-  [`benchmarks/20260930-store-micro.md`](benchmarks/20260930-store-micro.md)),
-  or something else entirely is responsible; this page will be updated once
-  that investigation concludes.
+  "Rate caps used, and why" section for the full mechanism and the fixed
+  numbers.
+- **A separate, still-unfixed coalescer artifact can stall reserves for
+  several seconds at a load-shape transition.** When many abandoned
+  in-flight reservations are released at once (e.g. `fuelbench` switching
+  load shapes, or many clients timing out together), the coalescer releases
+  each one with its own store `Release` call while holding the pool's
+  single flush slot, so new reserves queue up behind that one-by-one
+  sequence and can hit `reserve_timeout` -- see `docs/OPERATIONS.md`'s
+  "Known Limits" for the mechanism. This is documented, not fixed.
 
 ## Keeping this current
 

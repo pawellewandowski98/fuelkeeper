@@ -155,6 +155,24 @@ hot path.
   shard that is merely drained but not yet terminal (rows still reserved or
   quarantined) is not covered by this fix -- see `docs/OPERATIONS.md`'s
   "Known Limits".
+- **Adoption could starve behind rescans on a store with slow reads under
+  write load** (Pebble: a read waits for the WAL fsync of any batch it may
+  have observed, ~35-60 ms per `ListAvailable` under load vs. ~2.5 ms on
+  SQLite). One goroutine drove both adoption and the per-`rescan_interval`
+  reload of every owned shard; at 20-50 owned shards a rescan pass took
+  1-3.5 s, so the loop spent the large majority of its time rescanning and
+  adopted fewer shards than sustained multi-output reserves consumed, and
+  the allocator drained to zero with the store still full. Compounding it,
+  a shard consumed while owned was dropped as `"empty"` (left `mined`) and
+  only retired once some later adoption re-acquired it after its 60 s
+  exclusion, so roughly every other acquisition was a dead shard, with the
+  backlog coming due all at once after an idle period. Adoption now runs on
+  its own goroutine, separate from renew/rescan/flagged-rescan; a rescan or
+  `max_shards` rotation that drops a fully spent-out shard retires it
+  outright (`reason="retired"`, no exclusion entry) the same way adoption
+  already did, instead of leaving it `"empty"` for a later adoption to find.
+  See `docs/ARCHITECTURE.md`'s "Shard manager" and `docs/OPERATIONS.md`'s
+  "Adoption Behavior".
 - **A background rescan could re-add a row already handed out by a
   concurrent `Reserve`**, inflating `fuelkeeper_cas_missed_total` with
   self-inflicted misses rather than genuine cross-instance overlap. Store

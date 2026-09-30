@@ -235,7 +235,9 @@ state transition is a compare-and-set on the row's current state (and, for
 ## Sharded Ownership and the Reserve Request Flow
 
 **Shard manager** (`pkg/pool/shardmgr.go`, per instance): adopts shards
-pull-based, one at a time, while in-memory available rows are below
+pull-based, one at a time, on its own goroutine separate from the
+maintenance loop (renewal, rescan, flagged rescans) so adoption is never
+blocked behind a rescan pass, while in-memory available rows are below
 `low_water_rows` and owned shards are below `max_shards`. `AcquireShard`
 picks the oldest adoptable shard (by `created_at`, then txid) whose status is
 in the serve set and whose lease is free, excluding shards this instance
@@ -246,21 +248,27 @@ a status no longer in the serve set, or on a lease stale for more than one
 full TTL under a persistent renew error; a CAS miss on a shard's row
 (`NoteCASMiss`) triggers an immediate targeted rescan of just that shard
 ahead of its regular turn. A shard that rescans empty
-`emptyRescansMax` (2) times in a row is dropped and excluded from
-re-adoption for 60 seconds. Graceful shutdown releases every owned shard.
+`emptyRescansMax` (2) times in a row is retired outright (see
+`retireIfSpentOut` below) when every one of its rows is terminal, with no
+exclusion entry, or otherwise dropped and excluded from re-adoption for 60
+seconds. Graceful shutdown releases every owned shard.
 
-A shard adopted with zero available rows to load (`AdoptOnce`) is checked
-by `retireIfSpentOut` before falling back to the 60-second exclusion above:
-when every one of its rows (vouts `0..Size-1`) is already terminal (spent
-or invalid) and the shard is `mined`, it is marked `retired`
-(`UpdateShard(..., store.ShardRetired, nil)`) and dropped with reason
-`"retired"` (`fuelkeeper_shard_drops_total`) instead of `"empty"` -- out of
-the serve set for good, so it needs no exclusion entry at all (unlike
-`"empty"`, which only holds for 60 seconds). Terminal row states never
-change, so the check cannot race a row coming back; it is skipped (leaving
-the shard to the ordinary `"empty"`/60-second path) on any store error, a
-non-mined shard, or a row that is not yet terminal. This closes a gap where
-a spent-out shard stayed `mined` and adoptable forever: `AcquireShard`
+`retireIfSpentOut` runs at three points a shard can be found empty --
+adoption (`AdoptOnce`, zero available rows to load), a rescan that drops an
+owned shard (`RescanOnce`/`retireDrained`), and rotation at `max_shards`
+(`rotateDrained`) -- so a shard consumed while owned is retired the moment
+any of these three paths next notices it, not only when some later
+adoption happens to re-acquire it after its exclusion window. In every
+case: when every one of the shard's rows (vouts `0..Size-1`) is already
+terminal (spent or invalid) and the shard is `mined`, it is marked
+`retired` (`UpdateShard(..., store.ShardRetired, nil)`) and dropped with
+reason `"retired"` (`fuelkeeper_shard_drops_total`) instead of `"empty"` --
+out of the serve set for good, so it needs no exclusion entry at all
+(unlike `"empty"`, which only holds for 60 seconds). Terminal row states
+never change, so the check cannot race a row coming back; it is skipped
+(leaving the shard to the ordinary `"empty"`/60-second path) on any store
+error, a non-mined shard, or a row that is not yet terminal. This closes a
+gap where a spent-out shard stayed `mined` and adoptable forever: `AcquireShard`
 always tries the oldest adoptable shard first, so without retirement, once
 more spent-out shards preceded the live ones than the (256-entry) exclusion
 list holds, an instance could answer `exhausted` indefinitely with fuel

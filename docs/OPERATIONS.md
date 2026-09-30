@@ -552,7 +552,8 @@ Runs every `minter.interval`. Responsibilities:
 
 The shard manager per instance (not the minter) owns shards and replenishes in-memory rows:
 
-- Adopts one shard at a time when in-memory rows < `low_water_rows` and owned shards < `max_shards`; at `max_shards` it rescans up to 2 drained shards (oldest first), keeps any whose rows are back, and for one the store shows empty either **retires it outright** -- every row already terminal (spent or invalid), so the shard is marked `retired` for good (`fuelkeeper_shard_drops_total{pool,reason="retired"}`), needing no exclusion entry -- or, when some rows are merely not yet available again (still reserved or quarantined), releases it excluded from re-adoption by this instance for 60 s instead (`reason="empty"`); then adopts into the freed slots
+- Adopts one shard at a time when in-memory rows < `low_water_rows` and owned shards < `max_shards`, on its own goroutine so adoption never waits behind a rescan; at `max_shards` it rescans up to 2 drained shards (oldest first), keeps any whose rows are back, and releases one the store shows empty — retired outright if every row is terminal (`fuelkeeper_shard_drops_total{reason="retired"}`), otherwise excluded from re-adoption by this instance for 60 s (`reason="empty"`) — then adopts into the freed slots
+- Every `rescan_interval` it reloads owned shards' rows; a shard that stays empty for two rescans is retired outright if every row is terminal (spent or invalid; no exclusion entry), otherwise released with the 60 s exclusion. An adoption that finds a shard empty applies the same check.
 - A reserve request waits at most `instance.adopt_timeout` for adoption to complete; lease releases from that rotation run in the background (each bounded at 1 s) and are not charged to the request
 - A crashed instance's shards are re-adopted by others after `instance.lease_ttl` expires
 
@@ -606,6 +607,14 @@ rescan cycle once the overlap resolves.
   `fuelkeeper_coalescer_batch_size` against `count` to see which side is
   paying more per output in a given deployment, rather than assuming a
   fixed multiplier.
+- **Abandoned reservations are released inside the reserve flush.** When
+  many clients abandon in-flight reserves at once (client timeouts, a load
+  generator stopping), the coalescer releases each abandoned request's rows
+  with its own store `Release` -- one durable write each -- while holding
+  the pool's single flush slot (`pkg/pool/coalescer.go` `deliver`/
+  `releaseByToken`). On a store with a fsync-bound write path this can hold
+  every new reserve for several seconds, so each waiting request fails with
+  `unavailable` at `reserve_timeout`.
 
 ## Development Mode (Nullnet)
 
