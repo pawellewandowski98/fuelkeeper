@@ -80,23 +80,13 @@ func (m *ShardManager) isHungry() bool {
 	return n < m.cfg.MaxShards && m.alloc.Available() < m.cfg.LowWaterRows
 }
 
-// FeedOnce checks hunger once (owned < MaxShards and available rows below
-// LowWaterRows) and, if hungry, adopts shards up to MaxShards (bounded by
-// adoptAttempts per call). Unlike the initial gate, the loop itself does not
-// re-check the row threshold: once a refill is warranted the manager tops up
-// owned shard capacity rather than stopping as soon as one large shard
-// happens to clear LowWaterRows.
+// FeedOnce adopts shards while hungry, bounded by adoptAttempts per call.
+// Hunger is re-checked after every adoption (owned < MaxShards and available
+// rows below LowWaterRows): an instance stops pulling shards the moment it is
+// no longer hungry, one shard at a time, so a single instance cannot hoard
+// shards up to MaxShards when another instance may also need one.
 func (m *ShardManager) FeedOnce(ctx context.Context) error {
-	if !m.isHungry() {
-		return nil
-	}
-	for i := 0; i < adoptAttempts; i++ {
-		m.mu.Lock()
-		full := len(m.owned) >= m.cfg.MaxShards
-		m.mu.Unlock()
-		if full {
-			return nil
-		}
+	for i := 0; i < adoptAttempts && m.isHungry(); i++ {
 		adopted, err := m.AdoptOnce(ctx)
 		if err != nil {
 			return err

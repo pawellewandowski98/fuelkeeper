@@ -66,6 +66,30 @@ func TestShardManagerAdoptsOldestMinedAndLoadsRows(t *testing.T) {
 	assert.Len(t, alloc.Shards(), 2)
 }
 
+// TestShardManagerFeedOnceStopsWhenNoLongerHungry pins the fairness semantics
+// against a future regression: FeedOnce adopts one shard at a time and stops
+// as soon as the instance is no longer hungry (available rows >=
+// LowWaterRows), even when MaxShards has headroom and another adoptable
+// shard exists. Filling up to MaxShards on a single hunger event would let
+// one instance hoard shards that other instances need.
+func TestShardManagerFeedOnceStopsWhenNoLongerHungry(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig("main", 50)
+	first, _ := storetest.MintShard(t, st, "main", 5, store.ShardMined)
+	clk.Advance(time.Second)
+	second, _ := storetest.MintShard(t, st, "main", 5, store.ShardMined)
+	cfg := testInstanceConfig() // MaxShards=2, LowWaterRows=3
+	m, alloc := newMgr(t, st, clk, cfg, pc)
+
+	require.NoError(t, m.FeedOnce(ctx))
+	assert.True(t, alloc.Has(first.TxID), "oldest mined shard adopted first")
+	assert.False(t, alloc.Has(second.TxID), "no longer hungry after the first 5-row shard clears LowWaterRows=3; MaxShards headroom is not used up-front")
+	assert.Len(t, alloc.Shards(), 1)
+	assert.Equal(t, 5, alloc.Available())
+}
+
 func TestShardManagerRenewDropsLostAndRetiredShards(t *testing.T) {
 	ctx := context.Background()
 	clk := storetest.NewClock(storetest.Start)
@@ -75,6 +99,7 @@ func TestShardManagerRenewDropsLostAndRetiredShards(t *testing.T) {
 	clk.Advance(time.Second)
 	b, _ := storetest.MintShard(t, st, "main", 3, store.ShardMined)
 	cfg := testInstanceConfig()
+	cfg.LowWaterRows = 10 // stay hungry past the first 3-row adopt so one FeedOnce fills both shards
 	m, alloc := newMgr(t, st, clk, cfg, pc)
 	require.NoError(t, m.FeedOnce(ctx))
 	require.Len(t, alloc.Shards(), 2)
