@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"os"
 	"strings"
 
@@ -56,6 +55,55 @@ func extractSubcommand(args []string) (sub string, rest []string) {
 	return sub, rest
 }
 
+// parseOutpoints splits raw's comma-separated "txid:vout" list, trimming
+// whitespace around each item and dropping any that end up empty (a stray
+// leading/trailing/doubled comma), so "a:0, b:1 ,," is exactly equivalent to
+// "a:0,b:1". An empty or all-whitespace raw returns nil.
+func parseOutpoints(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// validateAdminArgs checks the flags each subcommand requires before any
+// network call is made, so a missing flag fails fast as a usage error (main
+// exits 2) instead of a confusing server-side error. quarantineSub is only
+// meaningful when name == "quarantine".
+func validateAdminArgs(name, quarantineSub, token, txid string, outpoints []string) error {
+	switch name {
+	case "release":
+		if token == "" {
+			return usageErrorf("release: --token is required")
+		}
+		if len(outpoints) == 0 {
+			return usageErrorf("release: --outpoints is required")
+		}
+	case "quarantine":
+		switch quarantineSub {
+		case "list":
+		case "requeue":
+			if len(outpoints) == 0 {
+				return usageErrorf("quarantine requeue: --outpoints is required")
+			}
+		case "retire":
+			if txid == "" {
+				return usageErrorf("quarantine retire: --txid is required")
+			}
+		default:
+			return usageErrorf("quarantine: unknown subcommand %q (want list|requeue|retire)", quarantineSub)
+		}
+	}
+	return nil
+}
+
 // adminCmd runs one admin subcommand (pools|shards|quarantine|release)
 // against the FuelKeeper HTTP API and prints its result as indented JSON on
 // stdout.
@@ -78,6 +126,10 @@ func adminCmd(ctx context.Context, name string, args []string) error {
 	outpoints := fs.String("outpoints", "", "comma-separated outpoints txid:vout")
 	txid := fs.String("txid", "", "shard txid")
 	if err := fs.Parse(args); err != nil {
+		return wrapUsageError(err)
+	}
+	parsedOutpoints := parseOutpoints(*outpoints)
+	if err := validateAdminArgs(name, sub, *token, *txid, parsedOutpoints); err != nil {
 		return err
 	}
 
@@ -87,12 +139,6 @@ func adminCmd(ctx context.Context, name string, args []string) error {
 	}
 	out := json.NewEncoder(os.Stdout)
 	out.SetIndent("", "  ")
-	splitOutpoints := func() []string {
-		if *outpoints == "" {
-			return nil
-		}
-		return strings.Split(*outpoints, ",")
-	}
 
 	switch name {
 	case "pools":
@@ -108,15 +154,15 @@ func adminCmd(ctx context.Context, name string, args []string) error {
 		}
 		return out.Encode(v)
 	case "release":
-		n, err := c.Release(ctx, *poolName, *token, splitOutpoints())
+		n, err := c.Release(ctx, *poolName, *token, parsedOutpoints)
 		if err != nil {
 			return err
 		}
 		return out.Encode(map[string]int{"released": n})
 	case "quarantine":
-		return quarantineCmd(ctx, c, out, sub, *poolName, *limit, splitOutpoints(), *txid)
+		return quarantineCmd(ctx, c, out, sub, *poolName, *limit, parsedOutpoints, *txid)
 	default:
-		return fmt.Errorf("unknown command %q", name)
+		return usageErrorf("unknown command %q", name)
 	}
 }
 
@@ -142,6 +188,8 @@ func quarantineCmd(ctx context.Context, c *client.Client, out *json.Encoder, sub
 		}
 		return out.Encode(map[string]int{"retired": n})
 	default:
-		return fmt.Errorf("unknown quarantine subcommand %q (want list|requeue|retire)", sub)
+		// Unreachable in practice: validateAdminArgs already rejected an
+		// unknown subcommand before adminCmd ever called quarantineCmd.
+		return usageErrorf("quarantine: unknown subcommand %q (want list|requeue|retire)", sub)
 	}
 }

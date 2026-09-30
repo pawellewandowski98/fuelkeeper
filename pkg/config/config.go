@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/jobs"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/store/sqlite"
 )
 
 // Config is the whole file.
@@ -78,6 +80,12 @@ type APIConfig struct {
 	// RequestTimeout bounds a single HTTP request end-to-end; it must exceed
 	// instance.reserve_timeout (see Validate).
 	RequestTimeout time.Duration `yaml:"request_timeout"`
+	// Insecure allows the server to start with no api_keys configured while
+	// api.listen is not loopback-only. Without it, Validate refuses such a
+	// config outright: an open /v1/ surface reachable from outside the host
+	// is almost always a mistake. Running open on loopback needs no flag (the
+	// caller logs a Warn instead); see Validate and runServe.
+	Insecure bool `yaml:"insecure"`
 }
 
 // LogConfig configures slog.
@@ -239,6 +247,18 @@ func Parse(data []byte) (*Config, error) {
 	if err := dec.Decode(&raw); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("config: parse: %w", err)
 	}
+	// A YAML stream may contain more than one "---"-separated document; only
+	// the first was decoded above. Decoding again must hit end of stream --
+	// anything else (a second document decoded successfully, or a read
+	// error) means the file is not the single document Load/Parse expect.
+	var extra yaml.Node
+	switch err := dec.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+	case err == nil:
+		return nil, errors.New("config: parse: multiple YAML documents are not allowed")
+	default:
+		return nil, fmt.Errorf("config: parse: %w", err)
+	}
 	c.Instance, c.Store, c.Jobs = raw.Instance, raw.Store, raw.Jobs
 	c.Oracle, c.Treasury, c.API, c.Log = raw.Oracle, raw.Treasury, raw.API, raw.Log
 	c.Pools = make([]pool.Config, len(raw.Pools))
@@ -303,6 +323,15 @@ func (c *Config) Validate() error {
 	case factory.BackendSQLite:
 		if c.Store.SQLite.Path == "" {
 			return errors.New("config: store.sqlite.path is required")
+		}
+		switch strings.ToUpper(string(c.Store.SQLite.Sync)) {
+		case "", "FULL", "NORMAL":
+			// Normalize to the canonical uppercase form the sqlite package
+			// compares case-sensitively, so an operator-friendly lowercase
+			// "full"/"normal" in YAML does not fail later at store-open time.
+			c.Store.SQLite.Sync = sqlite.Sync(strings.ToUpper(string(c.Store.SQLite.Sync)))
+		default:
+			return fmt.Errorf("config: store.sqlite.sync %q must be \"\", \"full\" or \"normal\" (case-insensitive)", c.Store.SQLite.Sync)
 		}
 	case factory.BackendPostgres:
 		if c.Store.Postgres.DSN == "" {
@@ -387,8 +416,29 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("config: log.format %q is not one of text|json", c.Log.Format)
 	}
-	if _, _, err := net.SplitHostPort(c.API.Listen); err != nil {
+	host, portStr, err := net.SplitHostPort(c.API.Listen)
+	if err != nil {
 		return fmt.Errorf("config: api.listen %q is invalid: %w", c.API.Listen, err)
+	}
+	// 0 is accepted alongside 1..65535: it asks the OS for an ephemeral port
+	// (net.Listen's usual meaning), which tests (and "just give me a free
+	// port" deployments) rely on.
+	if port, perr := strconv.Atoi(portStr); perr != nil || port < 0 || port > 65535 {
+		return fmt.Errorf("config: api.listen %q has an invalid port (must be numeric 0..65535)", c.API.Listen)
+	}
+	for _, k := range c.API.APIKeys {
+		if k == "" {
+			return errors.New("config: api.api_keys must not contain an empty string (check for an unset ${VAR:-} default)")
+		}
+	}
+	for _, k := range c.API.AdminKeys {
+		if k == "" {
+			return errors.New("config: api.admin_keys must not contain an empty string (check for an unset ${VAR:-} default)")
+		}
+	}
+	if len(c.API.APIKeys) == 0 && !IsLoopbackHost(host) && !c.API.Insecure {
+		return fmt.Errorf("config: api.listen %q has no api_keys and is not loopback-only; "+
+			"set api.insecure: true to allow this, or configure api.api_keys", c.API.Listen)
 	}
 	if c.API.MaxBodyBytes <= 0 {
 		return errors.New("config: api.max_body_bytes must be > 0")
@@ -404,4 +454,24 @@ func (c *Config) Validate() error {
 			c.API.RequestTimeout, c.Instance.ReserveTimeout)
 	}
 	return nil
+}
+
+// IsLoopbackHost reports whether host (the host part of an api.listen
+// "host:port") only accepts local connections: "127.0.0.1", "::1",
+// "localhost", or their bracketed/other textual forms recognized by
+// net.ParseIP. An empty host (":8080", meaning "every interface") is not
+// loopback: it is reachable from outside the machine. Exported so callers
+// (e.g. cmd/fuelkeeper) can log a runtime warning consistent with what
+// Validate enforces, instead of duplicating the loopback check.
+func IsLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }

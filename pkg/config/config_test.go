@@ -14,6 +14,7 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/store/sqlite"
 )
 
 func TestLoadMinimalAppliesDefaults(t *testing.T) {
@@ -178,11 +179,102 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 	c.Treasury.Mock.ConfirmAfter = -time.Second
 	require.ErrorContains(t, c.Validate(), "treasury.mock.confirm_after")
 
+	// Insecure-listener guard: no api_keys on a non-loopback listen is
+	// refused unless api.insecure is set; loopback needs no such flag; a
+	// non-empty api_keys list never needs it either.
+	c = base()
+	c.API.Insecure = false
+	c.API.Listen = ":8080"
+	err = c.Validate()
+	require.ErrorContains(t, err, "api.listen")
+	require.ErrorContains(t, err, "insecure")
+
+	c = base()
+	c.API.Insecure = false
+	c.API.Listen = "0.0.0.0:8080"
+	require.ErrorContains(t, c.Validate(), "insecure")
+
+	c = base()
+	c.API.Insecure = false
+	c.API.Listen = "127.0.0.1:8080"
+	require.NoError(t, c.Validate(), "loopback needs no insecure flag")
+
+	c = base()
+	c.API.Insecure = false
+	c.API.Listen = "localhost:8080"
+	require.NoError(t, c.Validate(), "localhost is loopback")
+
+	c = base()
+	c.API.Insecure = false
+	c.API.Listen = ":8080"
+	c.API.APIKeys = []string{"k1"}
+	require.NoError(t, c.Validate(), "a configured api_keys list never needs the insecure flag")
+
+	c = base()
+	c.API.Insecure = true
+	c.API.Listen = ":8080"
+	require.NoError(t, c.Validate(), "insecure: true allows an open non-loopback listener")
+
+	// Empty api_keys/admin_keys entries (e.g. an unset "${K:-}") are rejected
+	// outright rather than silently admitting an empty bearer token.
+	c = base()
+	c.API.APIKeys = []string{"k1", ""}
+	require.ErrorContains(t, c.Validate(), "api.api_keys")
+
+	c = base()
+	c.API.APIKeys = []string{"k1"}
+	c.API.AdminKeys = []string{""}
+	require.ErrorContains(t, c.Validate(), "api.admin_keys")
+
+	// api.listen's port must be numeric and in range.
+	c = base()
+	c.API.Listen = "127.0.0.1:0"
+	require.NoError(t, c.Validate(), "port 0 lets the OS pick an ephemeral port; used by tests")
+
+	c = base()
+	c.API.Listen = "127.0.0.1:99999"
+	require.ErrorContains(t, c.Validate(), "port")
+
+	c = base()
+	c.API.Listen = "127.0.0.1:abc"
+	require.ErrorContains(t, c.Validate(), "port")
+
+	// store.sqlite.sync is validated case-insensitively and normalized.
+	c = base()
+	c.Store.Backend = "sqlite"
+	c.Store.SQLite.Path = "/tmp/does-not-need-to-exist.sqlite"
+	c.Store.SQLite.Sync = "full"
+	require.NoError(t, c.Validate())
+	assert.Equal(t, sqlite.SyncFull, c.Store.SQLite.Sync, "accepted lowercase is normalized to canonical case")
+
+	c = base()
+	c.Store.Backend = "sqlite"
+	c.Store.SQLite.Path = "/tmp/does-not-need-to-exist.sqlite"
+	c.Store.SQLite.Sync = "NoRmAl"
+	require.NoError(t, c.Validate())
+	assert.Equal(t, sqlite.SyncNormal, c.Store.SQLite.Sync)
+
+	c = base()
+	c.Store.Backend = "sqlite"
+	c.Store.SQLite.Path = "/tmp/does-not-need-to-exist.sqlite"
+	c.Store.SQLite.Sync = "eventually"
+	require.ErrorContains(t, c.Validate(), "store.sqlite.sync")
+
 	_, err = config.Load("testdata/does-not-exist.yaml")
 	require.Error(t, err)
 
 	_, err = config.Parse([]byte("pools: [\n"))
 	require.ErrorContains(t, err, "parse")
+}
+
+// TestParseRejectsSecondYAMLDocument guards against a "---"-separated second
+// document silently being ignored: only the first document in the stream is
+// ever decoded, so a second one (whatever it contains) is a config error, not
+// something Parse quietly drops.
+func TestParseRejectsSecondYAMLDocument(t *testing.T) {
+	_, err := config.Parse([]byte("store:\n  backend: memory\napi:\n  insecure: true\npools:\n" +
+		"  - name: main\n    denomination: 50\n---\nstore:\n  backend: memory\n"))
+	require.ErrorContains(t, err, "multiple YAML documents")
 }
 
 // TestPoolDefaultsPreserveExplicitZero guards against a fill-if-zero
@@ -192,7 +284,7 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 // (documented as "always refill below target") must survive, while an
 // omitted field (split_size) still gets its default.
 func TestPoolDefaultsPreserveExplicitZero(t *testing.T) {
-	c, err := config.Parse([]byte("store:\n  backend: memory\npools:\n" +
+	c, err := config.Parse([]byte("store:\n  backend: memory\napi:\n  insecure: true\npools:\n" +
 		"  - name: main\n    denomination: 50\n    low_water: 0\n"))
 	require.NoError(t, err)
 	require.Len(t, c.Pools, 1)
@@ -202,7 +294,7 @@ func TestPoolDefaultsPreserveExplicitZero(t *testing.T) {
 	// instance.low_water_rows: 0 already survived before this change (Instance
 	// is a single struct decoded onto its already-defaulted value, not a
 	// freshly zeroed slice element) -- this is a regression guard, not a fix.
-	c, err = config.Parse([]byte("instance:\n  low_water_rows: 0\nstore:\n  backend: memory\npools:\n" +
+	c, err = config.Parse([]byte("instance:\n  low_water_rows: 0\nstore:\n  backend: memory\napi:\n  insecure: true\npools:\n" +
 		"  - name: main\n    denomination: 50\n"))
 	require.NoError(t, err)
 	assert.Equal(t, 0, c.Instance.LowWaterRows, "explicit instance.low_water_rows: 0 must survive")
@@ -271,6 +363,10 @@ func TestApplyPoolDefaultsForProgrammaticConfig(t *testing.T) {
 	require.Equal(t, pool.SpendVerify, p.SpendPolicy, "DefaultPoolConfig assumes an oracle")
 	config.ApplyPoolDefaults(&p, c.Oracle.Kind) // c.Oracle.Kind == "none"
 	c.Pools = []pool.Config{p}
+	// Default().API.Listen (":8080") is not loopback-only and carries no
+	// api_keys; opt into the insecure guard here since this test is about
+	// SpendPolicy resolution, not the listener.
+	c.API.Insecure = true
 	require.NoError(t, c.Validate())
 	assert.Equal(t, pool.SpendTrust, p.SpendPolicy)
 }

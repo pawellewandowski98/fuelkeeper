@@ -31,13 +31,19 @@ import (
 // pools, jobs and the store.
 const shutdownTimeout = 10 * time.Second
 
+// nullnetHintThreshold is how long a watcher/minter interval must be, with a
+// mock treasury, before runServeConfig logs a development hint: past this,
+// "first fuel" can take long enough that a developer polling readyz/reserve
+// might think the server is stuck.
+const nullnetHintThreshold = 5 * time.Second
+
 // serveCmd parses the "serve" subcommand's flags and runs the service until
 // ctx is cancelled.
 func serveCmd(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	cfgPath := fs.String("config", "fuelkeeper.yaml", "path to the YAML config")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return wrapUsageError(err)
 	}
 	return runServe(ctx, *cfgPath, nil)
 }
@@ -73,8 +79,8 @@ func buildOracle(c config.OracleConfig) (oracle.Oracle, *oracle.Mock, error) {
 
 // stoppable is implemented by a treasury.Treasury that owns background
 // timers which must be halted before the store closes (see
-// sendConfirmer/buildTreasury). runServe type-asserts for it during
-// shutdown; a treasury that owns no such timers need not implement it.
+// sendConfirmer/buildTreasury). runServeConfig type-asserts for it during
+// teardown; a treasury that owns no such timers need not implement it.
 type stoppable interface {
 	stopPendingTimers()
 }
@@ -130,8 +136,8 @@ func (c *sendConfirmer) Stop() {
 }
 
 // confirmingTreasury wraps a treasury.Treasury with the sendConfirmer that
-// backs its WithOnSend callback, so runServe can stop pending timers on
-// shutdown via the stoppable interface.
+// backs its WithOnSend callback, so runServeConfig can stop pending timers on
+// teardown via the stoppable interface.
 type confirmingTreasury struct {
 	treasury.Treasury
 	confirmer *sendConfirmer
@@ -146,7 +152,9 @@ var _ stoppable = (*confirmingTreasury)(nil)
 // WithOnSend so that, ConfirmAfter after a split is sent, mockOracle reports
 // it mined -- the "nullnet" pipeline that lets the watcher and minter run
 // against no real chain. mockOracle may be nil (oracle.kind: none), in which
-// case sends are never confirmed.
+// case sends are never confirmed. This never touches the store, so callers
+// can (and should) call it before opening one: an unsupported oracle/treasury
+// kind then fails fast without ever creating a sqlite file or postgres pool.
 func buildTreasury(c config.TreasuryConfig, mockOracle *oracle.Mock) (treasury.Treasury, error) {
 	switch c.Kind {
 	case "mock":
@@ -166,36 +174,104 @@ func buildTreasury(c config.TreasuryConfig, mockOracle *oracle.Mock) (treasury.T
 	}
 }
 
-// runServe loads cfgPath, wires config -> store -> pools -> jobs -> API, and
-// serves until ctx is cancelled or the server fails. onListen, if non-nil, is
-// called once with the bound address ("host:port") right after the listener
-// is opened -- tests use it to discover the ephemeral port from
-// "127.0.0.1:0".
-//
-// Shutdown order: stop accepting HTTP, cancel the pools and wait for
-// Pool.Run to return (Pool.Run only returns once its coalescer has flushed
-// every in-flight request, so the pool is quiescent), cancel the job runner
-// and wait, stop any pending mock-treasury timers, then close the store
-// (deferred, so it always runs last -- including on every early-return error
-// path below).
+// logNullnetHint logs a one-line development nudge when a mock treasury is
+// paired with slow watcher/minter intervals: fuel can then take long enough
+// to mint-then-mine that a developer polling readyz/reserve might think the
+// server is stuck.
+func logNullnetHint(log *slog.Logger, cfg *config.Config) {
+	if cfg.Treasury.Kind != "mock" || !cfg.Jobs.Enabled {
+		return
+	}
+	if cfg.Jobs.Watcher.Interval <= nullnetHintThreshold && cfg.Jobs.Minter.Interval <= nullnetHintThreshold {
+		return
+	}
+	eta := (cfg.Treasury.Mock.ConfirmAfter + cfg.Jobs.Watcher.Interval).Round(time.Second)
+	log.Info(fmt.Sprintf("nullnet: first fuel in ~%ds; lower jobs.watcher.interval/minter.interval for development",
+		int(eta.Seconds())))
+}
+
+// warnInsecureListener logs a Warn when the API has no api_keys configured:
+// a reminder that is loud on loopback (harmless for local development, but
+// easy to forget about) and louder still for a non-loopback listener, which
+// only reaches this point at all because the operator explicitly set
+// api.insecure: true (config.Load refuses to start otherwise).
+func warnInsecureListener(log *slog.Logger, cfg *config.Config) {
+	if len(cfg.API.APIKeys) > 0 {
+		return
+	}
+	host, _, err := net.SplitHostPort(cfg.API.Listen)
+	if err != nil { // unreachable: config.Load already validated api.listen
+		return
+	}
+	if config.IsLoopbackHost(host) {
+		log.Warn("api: no api_keys configured; open access on a loopback listener is fine for local development",
+			"listen", cfg.API.Listen)
+		return
+	}
+	log.Warn("api: running with no api_keys on a non-loopback listener because api.insecure is true; "+
+		"make sure that is intentional", "listen", cfg.API.Listen)
+}
+
+// serveHooks lets tests observe or intercept points runServeConfig would
+// otherwise only expose via logs, real network I/O or a real store backend.
+type serveHooks struct {
+	// onListen, if non-nil, is called once with the bound HTTP address
+	// ("host:port") right after the listener opens -- tests use it to
+	// discover the ephemeral port from "127.0.0.1:0".
+	onListen func(string)
+	// newStore overrides how the store is constructed; nil means
+	// factory.New. Tests use it to inject a wrapped store (one that pauses a
+	// call, or fails outright) without needing a config-level knob for
+	// something that is purely a test seam.
+	newStore func(ctx context.Context, cfg factory.Config, now func() time.Time) (store.Store, error)
+}
+
+// runServe loads cfgPath and runs the service until ctx is cancelled or the
+// server fails. onListen, if non-nil, is called once with the bound address.
 func runServe(ctx context.Context, cfgPath string, onListen func(string)) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
 	}
+	return runServeConfig(ctx, cfg, serveHooks{onListen: onListen})
+}
+
+// runServeConfig wires cfg -> oracle/treasury -> store -> pools -> jobs ->
+// API and serves until ctx is cancelled or the server fails. It is runServe
+// with config loading factored out, so tests can exercise it against a
+// hand-built *config.Config (e.g. one with a deliberately invalid Jobs
+// config) or with hooks.newStore standing in for a real backend.
+//
+// Order is deliberate: the oracle and treasury are built, and their "kind"
+// validated, before the store is opened -- an unsupported kind then fails
+// fast without ever touching disk or a database. Shutdown order is the
+// mirror image and is the load-bearing part of this function: stop accepting
+// HTTP (srv.Shutdown, which drains in-flight requests) *before* cancelling
+// the pools and jobs that those in-flight requests still need, then close
+// the store only once everything above it has stopped touching it.
+//
+// poolCtx and jobCtx deliberately derive from context.WithoutCancel(ctx),
+// not ctx itself: ctx is the process's signal context, cancelled the instant
+// SIGTERM arrives, at exactly the same moment srv.Shutdown begins draining
+// in-flight requests. If the pools/jobs contexts were children of ctx, that
+// signal would cancel them immediately too -- releasing shard leases and
+// tearing down the coalescer out from under a request Shutdown is still
+// trying to let finish. Instead, cancelPools/cancelJobs are called
+// explicitly, in order, only after srv.Shutdown has returned.
+//
+// Every stage logs once it completes, at Info: "shutting down" (the decision
+// to stop has been made), "http drained" (Shutdown returned), "pools
+// stopped", "jobs stopped", "store closed" (or a store-close error, at
+// Error). Pools, jobs and any pending mock-treasury timers are torn down by
+// one deferred function, registered right after they start, so a listen
+// failure or a startJobs error also reaches it -- there is exactly one
+// teardown path, not one for the happy path and another for early errors.
+func runServeConfig(ctx context.Context, cfg *config.Config, hooks serveHooks) error {
 	log := newLogger(cfg.Log)
-	clock := pool.RealClock{}
+	logNullnetHint(log, cfg)
+	warnInsecureListener(log, cfg)
 
-	st, err := factory.New(ctx, cfg.Store, clock.Now)
-	if err != nil {
-		return fmt.Errorf("store: %w", err)
-	}
-	defer func() {
-		if cerr := st.Close(); cerr != nil {
-			log.Error("store close failed", "err", cerr)
-		}
-	}()
-
+	// Validate the oracle/treasury kind before the store is ever opened.
 	orc, mockOrc, err := buildOracle(cfg.Oracle)
 	if err != nil {
 		return err
@@ -204,6 +280,23 @@ func runServe(ctx context.Context, cfgPath string, onListen func(string)) error 
 	if err != nil {
 		return err
 	}
+
+	clock := pool.RealClock{}
+	newStore := hooks.newStore
+	if newStore == nil {
+		newStore = factory.New
+	}
+	st, err := newStore(ctx, cfg.Store, clock.Now)
+	if err != nil {
+		return fmt.Errorf("store: %w", err)
+	}
+	defer func() {
+		if cerr := st.Close(); cerr != nil {
+			log.Error("store close failed", "err", cerr)
+			return
+		}
+		log.Info("store closed")
+	}()
 
 	pools := make([]*pool.Pool, 0, len(cfg.Pools))
 	svcs := make([]api.PoolService, 0, len(cfg.Pools))
@@ -215,8 +308,8 @@ func runServe(ctx context.Context, cfgPath string, onListen func(string)) error 
 		names = append(names, pc.Name)
 	}
 
-	poolCtx, cancelPools := context.WithCancel(ctx)
-	defer cancelPools()
+	uncancelled := context.WithoutCancel(ctx)
+	poolCtx, cancelPools := context.WithCancel(uncancelled)
 	var poolWG sync.WaitGroup
 	for _, p := range pools {
 		poolWG.Add(1)
@@ -228,13 +321,26 @@ func runServe(ctx context.Context, cfgPath string, onListen func(string)) error 
 		}(p)
 	}
 
-	jobCtx, cancelJobs := context.WithCancel(ctx)
-	defer cancelJobs()
+	jobCtx, cancelJobs := context.WithCancel(uncancelled)
 	var jobWG sync.WaitGroup
+
+	// Single teardown path (see the doc comment above): from here on, every
+	// return -- the listen failure below, a startJobs error, or the normal
+	// post-Shutdown path at the end -- runs exactly this sequence once.
+	defer func() {
+		cancelPools()
+		poolWG.Wait()
+		log.Info("pools stopped")
+		cancelJobs()
+		jobWG.Wait()
+		log.Info("jobs stopped")
+		if s, ok := tr.(stoppable); ok {
+			s.stopPendingTimers()
+		}
+	}()
+
 	if cfg.Jobs.Enabled {
 		if err := startJobs(jobCtx, &jobWG, st, orc, tr, names, cfg, clock, log); err != nil {
-			cancelPools()
-			poolWG.Wait()
 			return err
 		}
 	}
@@ -254,15 +360,11 @@ func runServe(ctx context.Context, cfgPath string, onListen func(string)) error 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.API.Listen)
 	if err != nil {
-		cancelJobs()
-		jobWG.Wait()
-		cancelPools()
-		poolWG.Wait()
 		return fmt.Errorf("listen %s: %w", cfg.API.Listen, err)
 	}
 	log.Info("fuelkeeper listening", "addr", ln.Addr().String(), "version", version, "pools", names, "store", cfg.Store.Backend)
-	if onListen != nil {
-		onListen(ln.Addr().String())
+	if hooks.onListen != nil {
+		hooks.onListen(ln.Addr().String())
 	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
@@ -275,23 +377,22 @@ func runServe(ctx context.Context, cfgPath string, onListen func(string)) error 
 			retErr = err
 		}
 	}
+	log.Info("shutting down")
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
 	shutdownErr := srv.Shutdown(shutdownCtx)
 	cancelShutdown()
-	if retErr == nil && shutdownErr != nil && !errors.Is(shutdownErr, http.ErrServerClosed) {
-		retErr = shutdownErr
+	if shutdownErr != nil && !errors.Is(shutdownErr, http.ErrServerClosed) {
+		if retErr == nil {
+			retErr = shutdownErr
+		}
+	} else {
+		log.Info("http drained")
 	}
 
-	cancelPools()
-	poolWG.Wait()
-	cancelJobs()
-	jobWG.Wait()
-
-	if s, ok := tr.(stoppable); ok {
-		s.stopPendingTimers()
-	}
-
+	// The deferred teardown above now cancels the pools and jobs (only after
+	// HTTP has stopped accepting new work and drained what it already had),
+	// then the store-close defer runs last.
 	return retErr
 }
 

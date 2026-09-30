@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +16,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/client"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/config"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
 )
 
 // TestServeSmokeNullnet runs the full "nullnet" pipeline end to end: a memory
@@ -185,4 +190,179 @@ func TestAdminCmdParsesSubcommandBeforeOrAfterFlags(t *testing.T) {
 			assert.Equal(t, tt.wantRest, rest)
 		})
 	}
+}
+
+// shutdownTestConfig returns a minimal, valid nullnet config for the
+// shutdown-ordering tests below: serve_policy: any lets a freshly minted,
+// still-unmined row be reserved immediately, so the test does not also need
+// to wait out the watcher/mock-treasury confirm pipeline.
+func shutdownTestConfig(t *testing.T) *config.Config {
+	t.Helper()
+	cfg, err := config.Parse([]byte(`
+store:
+  backend: memory
+pools:
+  - name: main
+    denomination: 50
+    split_size: 20
+    target_available: 100
+    low_water: 40
+    min_ttl: 1s
+    serve_policy: any
+    spend_policy: trust
+    release_policy: trust
+jobs:
+  enabled: true
+  lease_ttl: 10s
+  reaper: {interval: 500ms, grace: 1s, quarantine_min_age: 1s, min_unspent_age: 1s}
+  watcher: {interval: 300ms}
+  minter: {interval: 100ms, max_per_round: 5, max_pending_shards: 10}
+oracle:
+  kind: none
+treasury:
+  kind: mock
+  mock: {confirm_after: 200ms}
+api:
+  listen: "127.0.0.1:0"
+log:
+  level: warn
+`))
+	require.NoError(t, err)
+	return cfg
+}
+
+// TestRunServeConfigDrainsInFlightRequestBeforeStoppingPools is the
+// regression test for the shutdown-ordering fix: poolCtx/jobCtx must not be
+// children of the signal context, or cancelling it (simulating SIGTERM) would
+// tear down the pools and jobs at the exact moment srv.Shutdown starts
+// draining in-flight requests, instead of only after it finishes. A
+// faultyStore (see faulty_store_test.go) pauses the Reserve call a real
+// request is blocked inside, so the test can cancel ctx while that call is
+// paused and confirm the request still completes with a normal 200 once
+// released, and that the store is only closed -- and starts failing every
+// call -- after everything has actually stopped.
+func TestRunServeConfigDrainsInFlightRequestBeforeStoppingPools(t *testing.T) {
+	cfg := shutdownTestConfig(t)
+
+	var fs *faultyStore
+	addr := make(chan string, 1)
+	hooks := serveHooks{
+		onListen: func(a string) { addr <- a },
+		newStore: func(ctx context.Context, storeCfg factory.Config, now func() time.Time) (store.Store, error) {
+			inner, err := factory.New(ctx, storeCfg, now)
+			if err != nil {
+				return nil, err
+			}
+			fs = newFaultyStore(inner)
+			return fs, nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() { errc <- runServeConfig(ctx, cfg, hooks) }()
+
+	var base string
+	select {
+	case base = <-addr:
+	case err := <-errc:
+		t.Fatalf("serve exited early: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve did not start")
+	}
+	c, err := client.New("http://" + base)
+	require.NoError(t, err)
+
+	// serve_policy: any lets the minter's very first (immediate) tick's rows
+	// be reserved right away, with no need to wait for mining.
+	require.Eventually(t, func() bool {
+		ps, perr := c.Pools(context.Background())
+		return perr == nil && len(ps) == 1 && ps[0].Stats.Available > 0
+	}, 10*time.Second, 50*time.Millisecond, "expected available fuel")
+
+	holding, release := fs.armReserveHold()
+
+	reserveErr := make(chan error, 1)
+	go func() {
+		_, rerr := c.Reserve(context.Background(), "main", client.ReserveRequest{Count: 1})
+		reserveErr <- rerr
+	}()
+
+	select {
+	case <-holding:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reserve did not reach the store in time")
+	}
+
+	// Simulate SIGTERM while that request is paused inside the store.
+	cancel()
+	// Give runServeConfig a moment to reach srv.Shutdown, which should now
+	// block draining our still-in-flight (held) request rather than racing
+	// ahead to cancel the pools underneath it.
+	time.Sleep(200 * time.Millisecond)
+
+	release()
+
+	select {
+	case rerr := <-reserveErr:
+		require.NoError(t, rerr, "an in-flight reserve must complete successfully even though shutdown began while it was paused")
+	case <-time.After(5 * time.Second):
+		t.Fatal("reserve did not complete after the hold was released")
+	}
+
+	select {
+	case err := <-errc:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServeConfig did not stop")
+	}
+
+	// Once everything has stopped, the store is closed: any further call
+	// fails, proving nothing can reach it post-shutdown.
+	require.ErrorIs(t, fs.Ping(context.Background()), errFaultyStoreClosed)
+}
+
+// TestRunServeConfigListenPortInUse checks that a bind failure produces a
+// clear, wrapped error instead of a bare net.OpError.
+func TestRunServeConfigListenPortInUse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+
+	cfg := shutdownTestConfig(t)
+	cfg.API.Listen = ln.Addr().String()
+	cfg.Jobs.Enabled = false // irrelevant to this test; keep it fast and quiet
+
+	err = runServeConfig(context.Background(), cfg, serveHooks{})
+	require.ErrorContains(t, err, "listen")
+	require.ErrorContains(t, err, ln.Addr().String())
+}
+
+// TestRunServeConfigStoreOpenFailure checks that a store-open failure is
+// wrapped with a clear "store:" prefix and, crucially, happens without ever
+// starting pools, jobs or the HTTP listener.
+func TestRunServeConfigStoreOpenFailure(t *testing.T) {
+	cfg := shutdownTestConfig(t)
+	boom := errors.New("boom: simulated store-open failure")
+	hooks := serveHooks{
+		newStore: func(context.Context, factory.Config, func() time.Time) (store.Store, error) {
+			return nil, boom
+		},
+	}
+	err := runServeConfig(context.Background(), cfg, hooks)
+	require.ErrorContains(t, err, "store:")
+	require.ErrorIs(t, err, boom)
+}
+
+// TestRunServeConfigStartJobsErrorWrapping exercises startJobs' own error
+// wrapping through the runServeConfig seam: a hand-mutated, otherwise-valid
+// config with an invalid reaper interval (bypassing config.Config.Validate,
+// which would normally catch this at load time) must surface as a "reaper:"
+// error from jobs.NewReaper, not a panic or a silent no-op.
+func TestRunServeConfigStartJobsErrorWrapping(t *testing.T) {
+	cfg := shutdownTestConfig(t)
+	cfg.Jobs.Reaper.Interval = 0 // jobs.ReaperConfig.Validate requires > 0
+
+	err := runServeConfig(context.Background(), cfg, serveHooks{})
+	require.ErrorContains(t, err, "reaper:")
 }

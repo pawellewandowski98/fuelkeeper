@@ -5,10 +5,19 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"regexp"
 	"time"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 )
+
+// poolNamePattern restricts a pool name to what can be safely routed in a URL
+// path segment (e.g. GET /v1/pools/{pool}/...): it must start with a letter
+// or digit and contain only letters, digits, '_', '.' and '-', up to 64
+// bytes total (matching store.ValidatePool's length limit). Because the
+// first character must be alphanumeric, this also rejects the reserved path
+// segments "." and ".." outright, which cannot be routed.
+var poolNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 
 // ServePolicy says which shard statuses an instance may serve from.
 type ServePolicy string
@@ -107,6 +116,9 @@ func DefaultPoolConfig(name string, denomination uint64) Config {
 func (c *Config) Validate() error {
 	if err := store.ValidatePool(c.Name); err != nil {
 		return err
+	}
+	if !poolNamePattern.MatchString(c.Name) {
+		return fmt.Errorf("pool %s: name must match %s (and not be \".\" or \"..\", which cannot be routed)", c.Name, poolNamePattern.String())
 	}
 	if c.Denomination == 0 {
 		return fmt.Errorf("pool %s: denomination must be > 0", c.Name)

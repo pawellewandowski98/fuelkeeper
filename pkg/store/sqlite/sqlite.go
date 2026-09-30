@@ -51,8 +51,8 @@ const (
 
 // Config configures Open.
 type Config struct {
-	Path string
-	Sync Sync // "" = SyncFull
+	Path string `yaml:"path"`
+	Sync Sync   `yaml:"sync"` // "" = SyncFull
 }
 
 // Option configures Open.

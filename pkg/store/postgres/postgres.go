@@ -81,8 +81,8 @@ const defaultMaxConns = maxConcurrentFlushes + 4
 
 // Config configures New.
 type Config struct {
-	DSN      string
-	MaxConns int32 // 0 = defaultMaxConns (maxConcurrentFlushes + 4)
+	DSN      string `yaml:"dsn"`
+	MaxConns int32  `yaml:"max_conns"` // 0 = defaultMaxConns (maxConcurrentFlushes + 4)
 }
 
 // Option configures New.
