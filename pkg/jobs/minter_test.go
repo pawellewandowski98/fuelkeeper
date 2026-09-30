@@ -129,6 +129,134 @@ func TestMinterLowWaterHysteresis(t *testing.T) {
 	assert.Equal(t, 0, tr.BuildAttempts())
 }
 
+// spendAvailable removes n available rows from pool by reserving and
+// terminally spending them, so a test can drop a pool's available count
+// without going through pkg/pool.
+func spendAvailable(t *testing.T, st store.Store, clk *storetest.Clock, poolName string, n int) {
+	t.Helper()
+	ctx := context.Background()
+	rows := mustListAvailable(t, st, poolName)
+	require.GreaterOrEqual(t, len(rows), n, "not enough available rows to spend down")
+	rows = rows[:n]
+	tok := store.NewToken()
+	storetest.MustReserve(t, st, poolName, rows, tok, clk.Now().Add(time.Minute))
+	spent, err := st.Spend(ctx, poolName, tok, storetest.Ops(rows), storetest.NewTxID(), true)
+	require.NoError(t, err)
+	require.Equal(t, n, spent)
+}
+
+// TestMinterRefillsFromLowWaterToTarget reproduces the hysteresis bug
+// observed on the bench cluster: with target_available 300, low_water 200
+// and split_size 10 (max_per_round 20), filling from 0 took exactly one
+// round to land available precisely on low_water (200), and every round
+// after that saw available >= low_water and skipped minting forever,
+// instead of continuing on to target_available. A pool must keep minting,
+// once triggered, until it actually reaches target_available -- regardless
+// of where available sits relative to low_water in the meantime -- and only
+// stop refilling there; it must not refill again until available truly
+// drops below low_water.
+func TestMinterRefillsFromLowWaterToTarget(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	tr := mock.New()
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.SplitSize = 10
+	pc.TargetAvailable = 300
+	pc.LowWater = 200
+	cfg := jobs.DefaultMinterConfig()
+	cfg.MaxPerRound = 20
+	cfg.MaxPendingShards = 100 // large enough that the pending cap never interferes here
+	m := newMinter(t, st, tr, []pool.Config{pc}, cfg, clk)
+
+	// Round 1: 0 < low_water (200) triggers refilling; max_per_round (20)
+	// caps this round at exactly low_water.
+	require.NoError(t, m.RunOnce(ctx))
+	stats, err := st.Stats(ctx, "main")
+	require.NoError(t, err)
+	assert.Equal(t, int64(200), stats.Available, "round 1 mints max_per_round (20) splits of 10")
+	assert.Equal(t, 20, tr.Built())
+
+	// Round 2: available (200) is no longer < low_water, but refilling was
+	// already triggered and must continue -- this is the bug: the old code
+	// re-checked "available < low_water" at the top of every round and
+	// skipped here forever.
+	require.NoError(t, m.RunOnce(ctx))
+	stats, err = st.Stats(ctx, "main")
+	require.NoError(t, err)
+	assert.Equal(t, int64(300), stats.Available, "refilling continues past low_water up to target_available")
+	assert.Equal(t, 30, tr.Built())
+
+	// Round 3: supply is at target_available; refilling has turned off.
+	require.NoError(t, m.RunOnce(ctx))
+	assert.Equal(t, 30, tr.Built(), "at target_available: nothing minted")
+
+	// Drop supply to 250: still >= low_water (200), so no refill starts.
+	spendAvailable(t, st, clk, "main", 50)
+	stats, err = st.Stats(ctx, "main")
+	require.NoError(t, err)
+	require.Equal(t, int64(250), stats.Available)
+	require.NoError(t, m.RunOnce(ctx))
+	assert.Equal(t, 30, tr.Built(), "250 >= low_water 200: no minting")
+
+	// Drop supply to 199: now < low_water (200), so minting resumes and
+	// fills back up past target_available (deficit 101 rounds up to 11
+	// splits of 10).
+	spendAvailable(t, st, clk, "main", 51)
+	stats, err = st.Stats(ctx, "main")
+	require.NoError(t, err)
+	require.Equal(t, int64(199), stats.Available)
+	require.NoError(t, m.RunOnce(ctx))
+	stats, err = st.Stats(ctx, "main")
+	require.NoError(t, err)
+	assert.Equal(t, 41, tr.Built(), "199 < low_water 200: minting resumes")
+	assert.Equal(t, int64(309), stats.Available, "mints past target_available by one split_size, same as any round")
+}
+
+// TestMinterRefillSurvivesRestart pins the chosen restart behavior: the
+// refilling flag lives only in process memory (see the Minter doc comment),
+// so a freshly created Minter that finds a pool sitting strictly between
+// low_water and target_available does NOT assume a refill was in progress.
+// It waits for a real dip below low_water instead of minting on every
+// restart -- the conservative choice, since the alternative (treating
+// "below target at startup" as refilling) would mint on essentially every
+// process restart whenever a pool is not already sitting exactly at target.
+func TestMinterRefillSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	tr := mock.New()
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.SplitSize = 10
+	pc.TargetAvailable = 300
+	pc.LowWater = 200
+
+	// Seed 250 available rows directly: between low_water and
+	// target_available, as if a previous process's refill had gotten partway
+	// before the process restarted (or had simply never been triggered).
+	_, rows := storetest.MintShard(t, st, "main", 250, store.ShardMined)
+	require.Len(t, rows, 250)
+
+	m := newMinter(t, st, tr, []pool.Config{pc}, jobs.DefaultMinterConfig(), clk)
+	require.NoError(t, m.RunOnce(ctx))
+	stats, err := st.Stats(ctx, "main")
+	require.NoError(t, err)
+	assert.Equal(t, int64(250), stats.Available, "restart between low_water and target_available: no surprise minting")
+	assert.Equal(t, 0, tr.Built())
+
+	require.NoError(t, m.RunOnce(ctx))
+	assert.Equal(t, 0, tr.Built(), "stays quiet across rounds until available truly dips below low_water")
+
+	// Confirm it is not simply broken: a real dip below low_water still
+	// triggers a refill on this same, already-running Minter.
+	spendAvailable(t, st, clk, "main", 51) // 250 - 51 = 199 < low_water (200)
+	require.NoError(t, m.RunOnce(ctx))
+	stats, err = st.Stats(ctx, "main")
+	require.NoError(t, err)
+	assert.Positive(t, tr.Built(), "a genuine dip below low_water still triggers a refill")
+	assert.GreaterOrEqual(t, stats.Available, pc.TargetAvailable)
+}
+
 func TestMinterOrderingAndFailures(t *testing.T) {
 	ctx := context.Background()
 	clk := storetest.NewClock(storetest.Start)

@@ -31,7 +31,10 @@ var (
 	}, []string{"pool", "status"})
 )
 
-// MinterConfig tunes replenishment.
+// MinterConfig tunes replenishment. Per-pool refill hysteresis
+// (pool.Config.LowWater / TargetAvailable) is tracked only in this
+// process's memory, not here or in the store; see the Minter doc comment
+// for the exact rule and what a restart does with it.
 type MinterConfig struct {
 	// Interval is how often the minter ticks; see Job.Interval.
 	Interval time.Duration `yaml:"interval"`
@@ -75,12 +78,24 @@ func (c MinterConfig) Validate() error {
 // fatal. MaxPendingShards bounds exposure to unmined ("pending") shards, and
 // MaxPerRound bounds work per pool per tick.
 //
-// Refilling is hysteresis, not a live setpoint: a pool is topped up only once
-// its available rows drop below pool.Config.LowWater (LowWater == 0 means
-// "always refill below target"), and once triggered it mints back up to
-// TargetAvailable rather than just past LowWater. While available sits
-// anywhere in [LowWater, TargetAvailable) the minter does nothing, so a pool
-// does not re-split for every single row consumed. See needsRefill.
+// Refilling is hysteresis, not a live setpoint: a pool starts refilling only
+// once its available rows (rows already sitting in unmined shards count too,
+// see the deficit comment in mintPool) drop below pool.Config.LowWater
+// (LowWater == 0 means "always refill below target"). Once started,
+// refilling is sticky across rounds: mintPool keeps minting -- bounded by
+// MaxPerRound and MaxPendingShards each round, same as always -- even after
+// available climbs back to or past LowWater, until a round's projected
+// supply reaches TargetAvailable; only then does refilling stop, and it does
+// not start again until available truly drops below LowWater. While
+// available sits anywhere in [LowWater, TargetAvailable) and no refill is in
+// progress, the minter does nothing, so a pool does not re-split for every
+// single row consumed. See refillTrigger and the refilling field.
+//
+// refilling lives only in this process's memory: it starts false (not
+// refilling) for every pool, so a process that (re)starts with a pool
+// sitting between LowWater and TargetAvailable does not assume a refill was
+// under way -- it waits for a genuine dip below LowWater rather than mint on
+// every restart. See TestMinterRefillSurvivesRestart.
 //
 // Treasuries with optional capabilities get two more steps at the start of a
 // round: a treasury.Reconciler is reconciled (see startRound), and a
@@ -107,6 +122,12 @@ type Minter struct {
 	reconcilePending bool
 	// snapshot is a taken but unfinished reconcile, or nil.
 	snapshot *reconcileSnapshot
+	// refilling tracks, per pool name, whether that pool is mid-refill (see
+	// the Minter doc comment). It is set once a round finds available below
+	// refillTrigger(pc), and cleared once a round's projected supply reaches
+	// TargetAvailable. Absent/false means "not refilling", so every pool
+	// starts not-refilling when a new Minter is created.
+	refilling map[string]bool
 }
 
 // reconcileSnapshot is the first listing of a two-phase reconcile.
@@ -127,7 +148,7 @@ func NewMinter(st store.Store, tr treasury.Treasury, pools []pool.Config, cfg Mi
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	return &Minter{st: st, tr: tr, pools: pools, cfg: cfg, clock: clock, log: log.With("job", "minter")}, nil
+	return &Minter{st: st, tr: tr, pools: pools, cfg: cfg, clock: clock, log: log.With("job", "minter"), refilling: make(map[string]bool)}, nil
 }
 
 // Name implements Job.
@@ -279,34 +300,40 @@ func publishStats(p string, st store.Stats) {
 	poolShards.WithLabelValues(p, "invalid").Set(float64(st.ShardsInvalid))
 }
 
-// needsRefill reports whether pc should be topped up given its currently
-// available rows: LowWater is a hysteresis threshold, not a second target.
-// Once available falls below LowWater the pool refills (mintPool then fills
-// all the way up to TargetAvailable, not just past LowWater); while available
-// sits anywhere in [LowWater, TargetAvailable) it is left alone. LowWater == 0
-// disables hysteresis: the pool refills whenever it is below TargetAvailable
-// at all, matching pool.Config.LowWater's zero value.
-func needsRefill(pc pool.Config, available int64) bool {
+// refillTrigger returns the available-rows threshold that starts a refill
+// for pc: LowWater when set, otherwise TargetAvailable. LowWater == 0
+// disables hysteresis (the pool starts refilling whenever it is below
+// TargetAvailable at all), matching pool.Config.LowWater's zero value.
+func refillTrigger(pc pool.Config) int64 {
 	if pc.LowWater > 0 {
-		return available < pc.LowWater
+		return pc.LowWater
 	}
-	return available < pc.TargetAvailable
+	return pc.TargetAvailable
 }
 
 // mintPool tops up one pool toward its target, subject to LowWater hysteresis
-// (see needsRefill), MaxPendingShards and MaxPerRound.
+// (see refillTrigger, the Minter.refilling field and the Minter doc
+// comment), MaxPendingShards and MaxPerRound.
 func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 	stats, err := m.st.Stats(ctx, pc.Name)
 	if err != nil {
 		return err
 	}
 	publishStats(pc.Name, stats)
-	if !needsRefill(pc, stats.Available) {
+
+	// Available dropping below the trigger starts refilling; once started it
+	// is sticky (see the Minter doc comment) until this round's projected
+	// supply reaches TargetAvailable, checked after the loop below.
+	if stats.Available < refillTrigger(pc) {
+		m.refilling[pc.Name] = true
+	}
+	if !m.refilling[pc.Name] {
 		return nil
 	}
 	// Rows in unmined shards are already counted in stats.Available (they are
 	// available rows that mined-only instances cannot serve yet), so the
-	// deficit is simply target - available.
+	// deficit is simply target - available, i.e. target - projected as the
+	// loop below mints.
 	deficit := pc.TargetAvailable - stats.Available
 	pending := int(stats.ShardsUnmined)
 	for built := 0; deficit > 0 && pending < m.cfg.MaxPendingShards && built < m.cfg.MaxPerRound; built++ {
@@ -379,6 +406,15 @@ func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 		}
 		minterSplits.WithLabelValues(pc.Name, "ok").Inc()
 		minterLastSuccess.WithLabelValues(pc.Name).Set(float64(m.clock.Now().Unix()))
+	}
+	// The loop above only exits normally (not via an early return on error)
+	// when the deficit and pending/per-round caps say so; only a deficit at
+	// or below zero means projected supply actually reached TargetAvailable,
+	// so only then does refilling stop. Stopping early for a cap instead
+	// leaves refilling set, which is exactly what carries it sticky into the
+	// next round.
+	if deficit <= 0 {
+		m.refilling[pc.Name] = false
 	}
 	return nil
 }

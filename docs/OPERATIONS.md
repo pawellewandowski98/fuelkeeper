@@ -47,7 +47,9 @@ pools:
     lock_mode: puzzle                # puzzle (default) | p2pkh; unlock mode
     split_size: 500                  # Outputs per split transaction (shard); default 500; must be 1..10000
     target_available: 100000         # Target number of available rows to maintain; default 100000
-    low_water: 60000                 # Minter refill trigger: mint when rows < this; 0 = always refill below target; default 60000
+    low_water: 60000                 # Minter refill trigger: rows < this starts a refill; 0 = always refill below target; default 60000
+                                     #   once started, refilling is sticky (in-memory, per process) and keeps minting past
+                                     #   low_water each round until rows reach target_available, not just past low_water
     serve_policy: mined_only         # mined_only (default) | any; return only mined splits or any splits
     default_ttl: 2m                  # Reservation TTL when client doesn't specify; default 2m
     min_ttl: 30s                     # Minimum allowed TTL; default 30s
