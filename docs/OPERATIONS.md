@@ -217,6 +217,18 @@ oracle, and `serve` logs a Warn for `spend_policy: verify` with one.
 - Every store operation is a compare-and-set; no pessimistic locking
 - With `treasury.kind: toolbox`, every instance must use the same treasury storage: one postgres database in `treasury.toolbox.storage` and the same root key. The minter runs wherever the lease is and funding is served by whichever instance a request reaches, so with per-instance sqlite files a payment can land in a wallet the minter never spends (see [TREASURY.md](TREASURY.md#several-instances))
 
+### Benchmark cluster
+
+`deploy/docker-compose.bench.yaml` runs three `fuelkeeper` instances (`fk1`-`fk3`, built from the repo `Dockerfile`) sharing one `postgres:16-alpine` store, all driven by `deploy/fuelkeeper-bench.yaml` (mock oracle and treasury, so throughput measures the store/pool path, not chain latency). It is a separate compose project (`name: fuelkeeper-bench`) from `deploy/docker-compose.yaml`'s dev Postgres: its own network, and host ports 8081-8083 only (the bench Postgres exposes no host port, unlike the dev one's 15432).
+
+```bash
+make bench-cluster-up                     # build + start fk1..fk3 + postgres, wait for healthy
+make bench-run                            # cmd/fuelbench against :8081-8083; WORKERS/COUNT/DURATION/LABEL/OUT override
+make bench-cluster-down                   # stop and remove volumes
+```
+
+`bench-run`'s `OUT` defaults to `/tmp/fuelbench-last.json` (`docs/benchmarks/` does not exist in this tree). Give the minter a few seconds after `bench-cluster-up` to fill `pools[0].available` toward `target_available` before a long run, or lower `target_available` in the bench config for a quick smoke test; a handful of `exhausted` errors right after start-up, before the mock treasury's first splits are mined, is expected and not a bug. Every service sets `SETTINGS_ENV_FILE=/dev/null` (see "Teratestnet" above) so the toolbox's settings package does not pick up a stray `.env`/`settings.conf`.
+
 ## Durability and Consistency
 
 **Correctness guarantee G1** (no fuel output is ever handed to two live reservations) depends on durability:
@@ -346,7 +358,7 @@ Monitor these Prometheus metrics to stay on top of pool health:
 | `fuelkeeper_allocator_available` | gauge | pool | track | Rows queued in memory |
 | `fuelkeeper_shards_owned` | gauge | pool | track | Shards leased by this instance |
 | `fuelkeeper_coalescer_batch_size` | histogram | pool | track | Ops grouped into one coalescer flush |
-| `fuelkeeper_coalescer_flush_latency_seconds` | histogram | pool | p99 high? | Store Reserve call duration per flush, including retries |
+| `fuelkeeper_coalescer_flush_latency_seconds` | histogram | pool | p99 high? | Time from the first attempt to the final outcome, including retry backoff |
 | `fuelkeeper_coalescer_inflight_ops` | gauge | pool | near MaxInflightOps? | Ops queued plus ops currently in a flush |
 | `fuelkeeper_cas_unknown_total` | counter | pool | > 0 sustained? | Ops whose Reserve outcome was unknown after retries were exhausted |
 | `fuelkeeper_compensating_release_total` | counter | pool | track | Compensating Release calls issued by the coalescer after an in-doubt flush |
@@ -364,6 +376,8 @@ Monitor these Prometheus metrics to stay on top of pool health:
 | `fuelkeeper_reaper_resolved_total` | counter | pool, result | track | Quarantined rows resolved by state |
 | `fuelkeeper_oracle_requests_total` | counter | kind, result | track | Oracle calls by type and outcome |
 | `fuelkeeper_job_lease_held` | gauge | job (reaper\|watcher\|minter) | max by (job) < 1 for > 1 min? | 1 if this instance holds the job lease, 0 otherwise |
+
+`fuelkeeper_clock_skew_seconds` (spec) is deferred, not implemented: local clock vs. store `now()` would matter for lease takeover timing (a large skew could make a lease look expired, or not, earlier or later than the store believes), but `pkg/pool` has no independent server-clock-vs-store-clock notion yet to measure it from.
 
 ## Runbook
 

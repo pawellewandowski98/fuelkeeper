@@ -45,7 +45,8 @@ var (
 		Buckets: batchSizeBuckets,
 	}, []string{"pool"})
 	coalescerFlushLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name: "fuelkeeper_coalescer_flush_latency_seconds", Help: "Store Reserve call duration per flush, including retries.",
+		Name:    "fuelkeeper_coalescer_flush_latency_seconds",
+		Help:    "Time from the first attempt to the final outcome, including retry backoff.",
 		Buckets: latencyBuckets,
 	}, []string{"pool"})
 	coalescerInflightOps = promauto.NewGaugeVec(prometheus.GaugeOpts{

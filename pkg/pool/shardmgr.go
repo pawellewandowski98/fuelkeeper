@@ -8,9 +8,15 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 )
+
+// shardDropReasons are the reasons this manager ever passes to drop() or
+// counts directly; used to pre-populate dropCounters in NewShardManager so
+// drop's hot path never calls WithLabelValues.
+var shardDropReasons = []string{"not_owner", "retired", "empty", "stale", "closed"}
 
 const (
 	listPage         = 1000
@@ -47,10 +53,26 @@ type ShardManager struct {
 	closed        bool
 	hungry        chan struct{}
 	adoptSem      chan struct{} // capacity 1; serializes adopt+load across FeedOnce and EnsureRows
+
+	// Metric children for this pool, fetched once here instead of calling
+	// WithLabelValues on the hot path. See metrics.go for what each measures.
+	adoptionsOK          prometheus.Counter
+	adoptionsNone        prometheus.Counter
+	adoptionsError       prometheus.Counter
+	dropCounters         map[string]prometheus.Counter // reason -> counter, populated for shardDropReasons
+	renewFailures        prometheus.Counter
+	acquireShardLatency  prometheus.Observer
+	renewShardLatency    prometheus.Observer
+	releaseShardLatency  prometheus.Observer
+	listAvailableLatency prometheus.Observer
 }
 
 // NewShardManager builds a manager with a fresh holder id.
 func NewShardManager(st store.Store, pc Config, cfg InstanceConfig, alloc *Allocator, clock Clock, log *slog.Logger) *ShardManager {
+	dropCounters := make(map[string]prometheus.Counter, len(shardDropReasons))
+	for _, reason := range shardDropReasons {
+		dropCounters[reason] = shardDrops.WithLabelValues(pc.Name, reason)
+	}
 	return &ShardManager{
 		st:            st,
 		pc:            pc,
@@ -64,6 +86,16 @@ func NewShardManager(st store.Store, pc Config, cfg InstanceConfig, alloc *Alloc
 		recentlyEmpty: map[chainhash.Hash]time.Time{},
 		hungry:        make(chan struct{}, 1),
 		adoptSem:      make(chan struct{}, 1),
+
+		adoptionsOK:          shardAdoptions.WithLabelValues(pc.Name, "ok"),
+		adoptionsNone:        shardAdoptions.WithLabelValues(pc.Name, "none"),
+		adoptionsError:       shardAdoptions.WithLabelValues(pc.Name, "error"),
+		dropCounters:         dropCounters,
+		renewFailures:        leaseRenewFailures.WithLabelValues(pc.Name),
+		acquireShardLatency:  storeOpLatency.WithLabelValues(pc.Name, "acquire_shard"),
+		renewShardLatency:    storeOpLatency.WithLabelValues(pc.Name, "renew_shard"),
+		releaseShardLatency:  storeOpLatency.WithLabelValues(pc.Name, "release_shard"),
+		listAvailableLatency: storeOpLatency.WithLabelValues(pc.Name, "list_available"),
 	}
 }
 
@@ -202,25 +234,29 @@ func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 	until := now.Add(m.cfg.LeaseTTL)
 	opStart := time.Now()
 	sh, err := m.st.AcquireShard(ctx, m.pc.Name, m.holder, now, until, m.serve, m.excludeList(now))
-	storeOpLatency.WithLabelValues(m.pc.Name, "acquire_shard").Observe(time.Since(opStart).Seconds())
+	m.acquireShardLatency.Observe(time.Since(opStart).Seconds())
 	if err != nil {
-		shardAdoptions.WithLabelValues(m.pc.Name, "error").Inc()
+		m.adoptionsError.Inc()
 		return false, err
 	}
 	if sh == nil {
-		shardAdoptions.WithLabelValues(m.pc.Name, "none").Inc()
+		m.adoptionsNone.Inc()
 		return false, nil
 	}
-	shardAdoptions.WithLabelValues(m.pc.Name, "ok").Inc()
 
 	m.mu.Lock()
 	switch {
 	case m.closed:
 		m.mu.Unlock()
-		shardDrops.WithLabelValues(m.pc.Name, "closed").Inc()
+		// Never tracked in owned, so this is not a "drop": nothing to count in
+		// shard_drops_total, and shard_adoptions_total counts only a real
+		// adoption (below, once the shard is confirmed kept), not this
+		// declined-because-closing path.
 		m.releaseLease(ctx, sh.TxID)
 		return false, nil
 	case m.owned[sh.TxID] != nil:
+		// Re-acquiring a shard we already track (our lease lapsed and then
+		// freed up again before anyone else took it): not a new adoption.
 		st := m.owned[sh.TxID]
 		st.leaseUntil = until
 		st.head = store.ShardHead{Status: sh.Status, Version: sh.Version}
@@ -235,12 +271,15 @@ func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 	m.alloc.AddShard(OwnedShard{TxID: sh.TxID, Status: sh.Status, Version: sh.Version, CreatedAt: sh.CreatedAt})
 	loaded, err := m.loadRows(ctx, sh.TxID)
 	if err != nil {
-		return true, err // keep the shard; rescan will retry
+		m.adoptionsOK.Inc() // kept the shard; rescan will retry loading
+		return true, err
 	}
 	if loaded == 0 {
+		// Adopted but immediately empty: not counted as a real adoption.
 		m.drop(ctx, sh.TxID, true, "empty")
 		return false, nil
 	}
+	m.adoptionsOK.Inc()
 	m.log.Debug("adopted shard", "txid", sh.TxID.String(), "rows", loaded)
 	return true, nil
 }
@@ -252,7 +291,7 @@ func (m *ShardManager) loadRows(ctx context.Context, txid chainhash.Hash) (int, 
 	for {
 		opStart := time.Now()
 		rows, err := m.st.ListAvailable(ctx, m.pc.Name, txid, from, listPage)
-		storeOpLatency.WithLabelValues(m.pc.Name, "list_available").Observe(time.Since(opStart).Seconds())
+		m.listAvailableLatency.Observe(time.Since(opStart).Seconds())
 		if err != nil {
 			return total, err
 		}
@@ -272,7 +311,7 @@ func (m *ShardManager) releaseLease(ctx context.Context, txid chainhash.Hash) {
 	defer cancel()
 	opStart := time.Now()
 	err := m.st.ReleaseShard(rctx, m.pc.Name, txid, m.holder)
-	storeOpLatency.WithLabelValues(m.pc.Name, "release_shard").Observe(time.Since(opStart).Seconds())
+	m.releaseShardLatency.Observe(time.Since(opStart).Seconds())
 	if err != nil && !errors.Is(err, store.ErrNotFound) && !errors.Is(err, store.ErrNotOwner) {
 		m.log.Warn("release shard", "txid", txid.String(), "err", err)
 	}
@@ -282,7 +321,11 @@ func (m *ShardManager) releaseLease(ctx context.Context, txid chainhash.Hash) {
 // and excludes it from re-adoption for emptyExclusion. reason feeds
 // shard_drops_total (e.g. "empty", "not_owner", "stale", "retired").
 func (m *ShardManager) drop(ctx context.Context, txid chainhash.Hash, release bool, reason string) {
-	shardDrops.WithLabelValues(m.pc.Name, reason).Inc()
+	if c, ok := m.dropCounters[reason]; ok {
+		c.Inc()
+	} else { // defensive: an unlisted reason still gets counted, just not cached
+		shardDrops.WithLabelValues(m.pc.Name, reason).Inc()
+	}
 	m.alloc.RemoveShard(txid)
 	m.mu.Lock()
 	delete(m.owned, txid)
@@ -314,14 +357,14 @@ func (m *ShardManager) RenewOnce(ctx context.Context) error {
 	for _, txid := range m.ownedIDs() {
 		opStart := time.Now()
 		head, err := m.st.RenewShard(ctx, m.pc.Name, txid, m.holder, until)
-		storeOpLatency.WithLabelValues(m.pc.Name, "renew_shard").Observe(time.Since(opStart).Seconds())
+		m.renewShardLatency.Observe(time.Since(opStart).Seconds())
 		switch {
 		case errors.Is(err, store.ErrNotOwner), errors.Is(err, store.ErrNotFound):
 			m.log.Info("lost shard lease", "txid", txid.String())
 			m.drop(ctx, txid, false, "not_owner")
 			continue
 		case err != nil:
-			leaseRenewFailures.WithLabelValues(m.pc.Name).Inc()
+			m.renewFailures.Inc()
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -419,14 +462,14 @@ func (m *ShardManager) rescanFlagged(ctx context.Context) error {
 	for _, txid := range flagged {
 		opStart := time.Now()
 		head, err := m.st.RenewShard(ctx, m.pc.Name, txid, m.holder, until)
-		storeOpLatency.WithLabelValues(m.pc.Name, "renew_shard").Observe(time.Since(opStart).Seconds())
+		m.renewShardLatency.Observe(time.Since(opStart).Seconds())
 		switch {
 		case errors.Is(err, store.ErrNotOwner), errors.Is(err, store.ErrNotFound):
 			m.log.Info("lost shard lease", "txid", txid.String())
 			m.drop(ctx, txid, false, "not_owner")
 			continue
 		case err != nil:
-			leaseRenewFailures.WithLabelValues(m.pc.Name).Inc()
+			m.renewFailures.Inc()
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -493,14 +536,14 @@ func (m *ShardManager) ReleaseAll(ctx context.Context) error {
 	m.mu.Unlock()
 	var firstErr error
 	for _, txid := range m.ownedIDs() {
-		shardDrops.WithLabelValues(m.pc.Name, "closed").Inc()
+		m.dropCounters["closed"].Inc() // these are genuinely owned, unlike AdoptOnce's declined-while-closing path
 		m.alloc.RemoveShard(txid)
 		m.mu.Lock()
 		delete(m.owned, txid)
 		m.mu.Unlock()
 		opStart := time.Now()
 		err := m.st.ReleaseShard(ctx, m.pc.Name, txid, m.holder)
-		storeOpLatency.WithLabelValues(m.pc.Name, "release_shard").Observe(time.Since(opStart).Seconds())
+		m.releaseShardLatency.Observe(time.Since(opStart).Seconds())
 		if err != nil && !errors.Is(err, store.ErrNotFound) && !errors.Is(err, store.ErrNotOwner) && firstErr == nil {
 			firstErr = err
 		}

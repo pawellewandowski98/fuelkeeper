@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 )
 
@@ -99,6 +101,18 @@ type Coalescer struct {
 	slots      chan struct{}
 	stopped    atomic.Bool
 	flushes    sync.WaitGroup // every dispatched flush goroutine; Run waits on this before returning
+
+	// Metric children for this pool, fetched once here instead of calling
+	// WithLabelValues (a locked map lookup on the Vec) on the hot path -- in
+	// particular under c.mu in withdraw. See metrics.go for what each
+	// measures.
+	inflightGauge              prometheus.Gauge
+	batchSizeObs               prometheus.Observer
+	flushLatencyObs            prometheus.Observer
+	reserveLatencyObs          prometheus.Observer
+	releaseLatencyObs          prometheus.Observer
+	casUnknownCounter          prometheus.Counter
+	compensatingReleaseCounter prometheus.Counter
 }
 
 // NewCoalescer creates a coalescer for one pool.
@@ -110,6 +124,14 @@ func NewCoalescer(st store.Store, pool string, cfg CoalescerConfig) *Coalescer {
 		cfg:   cfg,
 		kick:  make(chan struct{}, 1),
 		slots: make(chan struct{}, cfg.Slots),
+
+		inflightGauge:              coalescerInflightOps.WithLabelValues(pool),
+		batchSizeObs:               coalescerBatchSize.WithLabelValues(pool),
+		flushLatencyObs:            coalescerFlushLatency.WithLabelValues(pool),
+		reserveLatencyObs:          storeOpLatency.WithLabelValues(pool, "reserve"),
+		releaseLatencyObs:          storeOpLatency.WithLabelValues(pool, "release"),
+		casUnknownCounter:          casUnknown.WithLabelValues(pool),
+		compensatingReleaseCounter: compensatingRelease.WithLabelValues(pool),
 	}
 }
 
@@ -162,13 +184,18 @@ func (c *Coalescer) Submit(ctx context.Context, ops []store.ReserveOp) Result {
 	return Result{Err: ctx.Err()}
 }
 
-// addInflight adjusts the inflight counter and mirrors it onto the exported
-// gauge, so every enqueue/withdraw/drain/flush accounting site stays in sync
-// with fuelkeeper_coalescer_inflight_ops without each call site touching the
-// gauge itself.
+// addInflight adjusts the inflight counter and moves the exported gauge by
+// the same delta, via Add rather than Set: Add on a prometheus.Gauge is
+// itself safe under concurrent callers and commutative, so concurrent
+// increments/decrements always converge to the correct total regardless of
+// interleaving. A Set-after-Load pattern does not have that property --two
+// goroutines each computing c.inflight.Load() then calling Set() can have
+// the earlier snapshot's Set land after the later one's, permanently
+// sticking the gauge at a stale value even though the atomic counter is
+// correct.
 func (c *Coalescer) addInflight(n int64) int64 {
 	v := c.inflight.Add(n)
-	coalescerInflightOps.WithLabelValues(c.pool).Set(float64(v))
+	c.inflightGauge.Add(float64(n))
 	return v
 }
 
@@ -348,7 +375,7 @@ func (c *Coalescer) flush(base context.Context, batch []*request) {
 		total += len(r.ops)
 	}
 	defer c.addInflight(-int64(total))
-	coalescerBatchSize.WithLabelValues(c.pool).Observe(float64(total))
+	c.batchSizeObs.Observe(float64(total))
 
 	ops := make([]store.ReserveOp, 0, total)
 	owner := make(map[store.Outpoint]int, total)
@@ -379,7 +406,7 @@ func (c *Coalescer) flush(base context.Context, batch []*request) {
 		fctx, cancel := context.WithTimeout(base, c.cfg.FlushTimeout)
 		opStart := time.Now()
 		applied, err = c.st.Reserve(fctx, c.pool, ops)
-		storeOpLatency.WithLabelValues(c.pool, "reserve").Observe(time.Since(opStart).Seconds())
+		c.reserveLatencyObs.Observe(time.Since(opStart).Seconds())
 		cancel()
 		if err == nil {
 			break
@@ -388,13 +415,13 @@ func (c *Coalescer) flush(base context.Context, batch []*request) {
 			break // not retryable
 		}
 	}
-	coalescerFlushLatency.WithLabelValues(c.pool).Observe(time.Since(flushStart).Seconds())
+	c.flushLatencyObs.Observe(time.Since(flushStart).Seconds())
 	if err != nil {
 		// Outcome unknown: compensate once over the deduplicated ops actually sent,
 		// not once per request, so N requests sharing a flush don't each pay their
 		// own CompensateTime budget while still holding the slot. Release on a
 		// never-applied row is a no-op.
-		casUnknown.WithLabelValues(c.pool).Add(float64(len(ops)))
+		c.casUnknownCounter.Add(float64(len(ops)))
 		c.compensate(ops)
 		for _, r := range batch {
 			c.deliver(r, Result{Err: fmt.Errorf("%w: %w", ErrUnavailable, err)})
@@ -450,7 +477,7 @@ func (c *Coalescer) releaseApplied(ops []store.ReserveOp) {
 func (c *Coalescer) compensate(ops []store.ReserveOp) {
 	n := c.releaseByToken(ops)
 	if n > 0 {
-		compensatingRelease.WithLabelValues(c.pool).Add(float64(n))
+		c.compensatingReleaseCounter.Add(float64(n))
 	}
 }
 
@@ -469,7 +496,7 @@ func (c *Coalescer) releaseByToken(ops []store.ReserveOp) int {
 	for tok, outs := range byToken {
 		start := time.Now()
 		_, err := c.st.Release(ctx, c.pool, tok, outs) // errors leave rows to the expiry path
-		storeOpLatency.WithLabelValues(c.pool, "release").Observe(time.Since(start).Seconds())
+		c.releaseLatencyObs.Observe(time.Since(start).Seconds())
 		_ = err
 	}
 	return len(byToken)

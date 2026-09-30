@@ -68,7 +68,7 @@ func TestMetricsCoalescerFlushObservesBatchLatencyAndInflight(t *testing.T) {
 	_, rows := storetest.MintShard(t, st, poolName, 5, store.ShardMined)
 	c := startCoalescerNamed(t, st, poolName, pool.CoalescerConfig{Slots: 1, MaxBatch: 64})
 
-	batchBefore, _ := histObserved(t, pool.CoalescerBatchSize, poolName)
+	batchBefore, batchSumBefore := histObserved(t, pool.CoalescerBatchSize, poolName)
 	flushBefore, _ := histObserved(t, pool.CoalescerFlushLatency, poolName)
 	reserveBefore, _ := histObserved(t, pool.StoreOpLatency, poolName, "reserve")
 
@@ -77,9 +77,13 @@ func TestMetricsCoalescerFlushObservesBatchLatencyAndInflight(t *testing.T) {
 	require.NoError(t, res.Err)
 	assert.Len(t, res.Applied, 5)
 
+	// Compare against the running total captured just above, not a literal:
+	// under -count>1 this test function runs repeatedly in the same process,
+	// and poolName's histogram series (like any metric on the shared default
+	// registry) keeps accumulating across those runs.
 	batchCount, batchSum := histObserved(t, pool.CoalescerBatchSize, poolName)
 	assert.Equal(t, batchBefore+1, batchCount, "one flush carried the whole request")
-	assert.InDelta(t, 5, batchSum, 0, "the flush's batch size was 5 ops")
+	assert.InDelta(t, batchSumBefore+5, batchSum, 0, "the flush's batch size was 5 ops")
 
 	flushCount, _ := histObserved(t, pool.CoalescerFlushLatency, poolName)
 	assert.Equal(t, flushBefore+1, flushCount)
@@ -87,7 +91,14 @@ func TestMetricsCoalescerFlushObservesBatchLatencyAndInflight(t *testing.T) {
 	reserveCount, _ := histObserved(t, pool.StoreOpLatency, poolName, "reserve")
 	assert.Equal(t, reserveBefore+1, reserveCount, "one store.Reserve call for the one attempt")
 
-	assert.Zero(t, testutil.ToFloat64(pool.CoalescerInflightOps.WithLabelValues(poolName)),
+	// Submit returns as soon as deliver() closes req.done, which happens
+	// inside flush() before flush's own deferred inflight decrement runs (LIFO
+	// defers): there is a real, if narrow, window where Submit has returned
+	// but the gauge has not yet settled back to 0. Poll instead of asserting
+	// immediately.
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(pool.CoalescerInflightOps.WithLabelValues(poolName)) == 0
+	}, time.Second, time.Millisecond,
 		"inflight drops back to 0 once the flush that carried every op has settled")
 }
 
@@ -120,6 +131,54 @@ func TestMetricsCASUnknownAndCompensatingRelease(t *testing.T) {
 	for _, r := range rows {
 		assert.Equal(t, store.StateAvailable, got[r.Outpoint].State, "the compensating release undid the hidden commit")
 	}
+}
+
+// TestMetricsCompensatingReleaseNotCountedOnAbandonedSuccess covers a caller
+// that cancels after its request was already taken by a flush that goes on to
+// succeed: the coalescer releases the now-unwanted applied rows via
+// releaseApplied, a courtesy release for an abandoned caller, not a
+// compensating one (the store's outcome was never in doubt), so
+// compensating_release_total must not move.
+func TestMetricsCompensatingReleaseNotCountedOnAbandonedSuccess(t *testing.T) {
+	const poolName = "metrics-abandoned-success"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	_, rows := storetest.MintShard(t, st, poolName, 3, store.ShardMined)
+	f := storetest.NewFaulty(st)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	f.BeforeReserve = func([]store.ReserveOp) { entered <- struct{}{}; <-release }
+	c := startCoalescerNamed(t, f, poolName, pool.CoalescerConfig{Slots: 1, MaxBatch: 64})
+
+	compBefore := testutil.ToFloat64(pool.CompensatingRelease.WithLabelValues(poolName))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var res pool.Result
+	done := make(chan struct{})
+	tok := store.NewToken()
+	go func() {
+		defer close(done)
+		res = c.Submit(ctx, storetest.ReserveOps(rows, tok, clk.Now().Add(time.Minute)))
+	}()
+	<-entered // the flush has started; the request can no longer be withdrawn
+	cancel()
+	<-done
+	require.ErrorIs(t, res.Err, context.Canceled)
+	assert.False(t, res.Unflushed, "the request reached the store")
+	close(release) // let the flush finish; it succeeds (no fault armed)
+
+	require.Eventually(t, func() bool {
+		got := storetest.RowsByOutpoint(t, st, poolName, storetest.Ops(rows))
+		for _, r := range rows {
+			if got[r.Outpoint].State != store.StateAvailable {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 5*time.Millisecond, "rows applied for an abandoned request are released back")
+
+	assert.InDelta(t, compBefore, testutil.ToFloat64(pool.CompensatingRelease.WithLabelValues(poolName)), 0,
+		"a courtesy release after abandonment is not a compensating release")
 }
 
 // TestMetricsShardAdoptions covers shard_adoptions_total{result}: "none" when
@@ -270,4 +329,34 @@ func TestMetricsLeaseRenewFailures(t *testing.T) {
 	require.Error(t, m.RenewOnce(ctx))
 	assert.InDelta(t, before+1, testutil.ToFloat64(pool.LeaseRenewFailures.WithLabelValues(poolName)), 0)
 	assert.True(t, alloc.Has(sh.TxID), "a freshly-renewed lease is not yet stale, so the shard is kept")
+}
+
+// TestMetricsShardDropStale drives RenewOnce's stale-lease branch: a shard
+// whose renews keep failing transiently (never ErrNotOwner/ErrNotFound, which
+// would be lease loss, not failure) is dropped once its lease has been
+// expired for more than one full TTL, and that drop must land under
+// shard_drops_total{reason="stale"}, not some other reason.
+func TestMetricsShardDropStale(t *testing.T) {
+	const poolName = "metrics-drop-stale"
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	sh, _ := storetest.MintShard(t, base, poolName, 3, store.ShardMined)
+	wrapped := &renewErrStore{Store: base, err: errors.New("renew store down")}
+	m, alloc := newShardManager(wrapped, poolName, clk, nil)
+	require.NoError(t, m.FeedOnce(ctx))
+	require.True(t, alloc.Has(sh.TxID))
+
+	// leaseUntil = adoptNow + LeaseTTL; stale requires now - leaseUntil >
+	// LeaseTTL, i.e. now > adoptNow + 2*LeaseTTL. 3*LeaseTTL clears that with
+	// margin.
+	clk.Advance(3 * pool.DefaultInstanceConfig().LeaseTTL)
+
+	staleBefore := testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "stale"))
+	notOwnerBefore := testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "not_owner"))
+	require.Error(t, m.RenewOnce(ctx))
+	assert.InDelta(t, staleBefore+1, testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "stale")), 0)
+	assert.InDelta(t, notOwnerBefore, testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "not_owner")), 0,
+		"a transient renew failure is not lease loss; must not be mislabelled not_owner")
+	assert.False(t, alloc.Has(sh.TxID), "a lease stale under a permanently failing renew is dropped")
 }
