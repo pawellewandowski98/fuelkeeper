@@ -357,12 +357,10 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 }
 
 // countGroupBy runs a "SELECT <key>, count(*) FROM <table> WHERE pool = ?
-// GROUP BY <key>" style query and returns the counts keyed by the integer
-// column value. It is its own function, not inlined into Stats, so each
-// query gets its own deferred Close instead of Stats reusing one *sql.Rows
-// variable across two queries.
-func (s *Store) countGroupBy(ctx context.Context, q, pool string) (map[int]int64, error) {
-	rs, err := s.reader.QueryContext(ctx, q, pool)
+// GROUP BY <key>" style query on q (a *sql.Tx, so Stats' two counts share one
+// snapshot) and returns the counts keyed by the integer column value.
+func countGroupBy(ctx context.Context, q querier, query, pool string) (map[int]int64, error) {
+	rs, err := q.QueryContext(ctx, query, pool)
 	if err != nil {
 		return nil, wrap(err)
 	}
@@ -379,13 +377,21 @@ func (s *Store) countGroupBy(ctx context.Context, q, pool string) (map[int]int64
 	return out, wrap(rs.Err())
 }
 
-// Stats implements store.Store.
+// Stats implements store.Store. Both counts run inside one read-only
+// transaction on the reader, so they reflect a single consistent snapshot
+// instead of two independent reads that a concurrent write could straddle.
 func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return store.Stats{}, err
 	}
+	tx, err := s.reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return store.Stats{}, wrap(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var st store.Stats
-	rowCounts, err := s.countGroupBy(ctx, `SELECT state, count(*) FROM fuel_rows WHERE pool = ? GROUP BY state`, pool)
+	rowCounts, err := countGroupBy(ctx, tx, `SELECT state, count(*) FROM fuel_rows WHERE pool = ? GROUP BY state`, pool)
 	if err != nil {
 		return st, err
 	}
@@ -395,7 +401,7 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 	st.Spent = rowCounts[int(store.StateSpent)]
 	st.Invalid = rowCounts[int(store.StateInvalid)]
 
-	shardCounts, err := s.countGroupBy(ctx, `SELECT status, count(*) FROM fuel_shards WHERE pool = ? GROUP BY status`, pool)
+	shardCounts, err := countGroupBy(ctx, tx, `SELECT status, count(*) FROM fuel_shards WHERE pool = ? GROUP BY status`, pool)
 	if err != nil {
 		return st, err
 	}
@@ -403,5 +409,5 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 	st.ShardsMined = shardCounts[int(store.ShardMined)]
 	st.ShardsRetired = shardCounts[int(store.ShardRetired)]
 	st.ShardsInvalid = shardCounts[int(store.ShardInvalid)]
-	return st, nil
+	return st, wrap(tx.Commit())
 }

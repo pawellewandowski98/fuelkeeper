@@ -366,12 +366,17 @@ reference for implementation):
   versioned and applied under a transaction-scoped advisory lock. EXPLAIN
   tests pin generic plans of the shipped statements. `synchronous_commit=on`
   documented as required. All stored times have microsecond precision.
-- **SQLite** (modernc): DSN exactly
-  `file:<path>?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)`;
-  writer handle `SetMaxOpenConns(1)`, separate reader pool; boot-time pragma
-  read-back refuses to start on mismatch. `Reserve` is per-op UPDATEs inside
-  one `BEGIN IMMEDIATE`, single commit (K=1). `synchronous=NORMAL` is opt-in
-  because it can revert a committed reservation on power loss.
+- **SQLite** (modernc): writer DSN
+  `file:<path>?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=journal_size_limit(67108864)`,
+  reader DSN with `query_only(1)`; writer handle `SetMaxOpenConns(1)`,
+  separate reader pool; boot-time pragma read-back refuses to start on
+  mismatch. Every write is a `database/sql` transaction (`BeginTx`, so a
+  cancelled context rolls back rather than poisoning the writer connection)
+  of per-op statements in sorted `(txid, vout)` order, single commit (K=1).
+  `AcquireShard` probes each status separately (`UNION ALL` of ordered
+  `LIMIT 1` probes). `synchronous=NORMAL` is opt-in because it can revert a
+  committed reservation on power loss. Conformance pins all-or-nothing
+  behaviour under cancellation for every `AtomicBatch` backend.
 - **Pebble**: keys `r/<txid><vout>`, `s/<pool>\0<txid>`, index keys
   `is/<pool>\0<status><created><txid>`, `ie/<pool>\0<expires><txid><vout>`,
   `iq/…`; every mutation one batch with `Commit(Sync)`; one store-wide write

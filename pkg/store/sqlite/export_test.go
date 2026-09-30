@@ -17,3 +17,12 @@ const (
 	ResolveSpentRowSQL      = resolveSpentRowSQL
 	RetireShardRowSQL       = retireShardRowSQL
 )
+
+// AcquireShardProbeSQL re-exports acquireShardProbeSQL, the per-status
+// candidate probe AcquireShard unions once per requested status.
+var AcquireShardProbeSQL = acquireShardProbeSQL
+
+// AcquireShardSQL re-exports acquireShardSQL, the full conditional UPDATE ...
+// RETURNING statement AcquireShard sends for nStatuses probes and nExclude
+// excluded txids.
+var AcquireShardSQL = acquireShardSQL

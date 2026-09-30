@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
@@ -57,9 +58,18 @@ func TestQueryPlansUsePartialIndexes(t *testing.T) {
 
 	// --- Ordered range scans: partial index, no separate sort. ---
 
+	// fuel_rows_avail, the primary key range and fuel_rows_pool_state are all
+	// acceptable here: unlike fuel_rows_avail/fuel_rows_expiry/fuel_rows_quar,
+	// fuel_rows_pool_state is not a partial index conditioned on state, so it
+	// carries none of the stale-ANALYZE plan-cliff risk this pin otherwise
+	// guards against (see requirePKOnly below) -- and on a WITHOUT ROWID table
+	// a non-covering index's entries carry the table's primary key (txid, vout)
+	// trailing the declared columns, so a (pool, state) seek here still lands
+	// in (txid, vout) order with no extra sort, which is the property that
+	// actually matters and is checked next.
 	p := plan(sqlite.ListAvailableSQL, "main", target.TxID[:], 0, 100)
-	require.True(t, strings.Contains(p, "fuel_rows_avail") || strings.Contains(p, "PRIMARY KEY"),
-		"expected fuel_rows_avail or the primary key range, got:\n%s", p)
+	require.True(t, strings.Contains(p, "fuel_rows_avail") || strings.Contains(p, "PRIMARY KEY") || strings.Contains(p, "fuel_rows_pool_state"),
+		"expected fuel_rows_avail, the primary key range, or fuel_rows_pool_state, got:\n%s", p)
 	require.NotContains(t, p, "TEMP B-TREE", p)
 
 	p = plan(sqlite.QuarantineCandidateSQL, "main", now, 1000)
@@ -96,6 +106,58 @@ func TestQueryPlansUsePartialIndexes(t *testing.T) {
 	p = plan(sqlite.RetireShardRowSQL, now, "main", someTxID[:], someVout)
 	requirePKOnly(t, p)
 	require.NotContains(t, p, "fuel_rows_shard_live", p)
+}
+
+// TestAcquireShardProbesUseAdoptIndex pins that AcquireShard's per-status
+// UNION ALL probes (see acquireShardProbeSQL) each seek fuel_shards_adopt
+// directly, for both one and two requested statuses, without a separate sort
+// inside any individual probe.
+func TestAcquireShardProbesUseAdoptIndex(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	s, err := sqlite.Open(ctx, sqlite.Config{Path: filepath.Join(t.TempDir(), "adopt.sqlite")}, sqlite.WithClock(clk.Now))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	for i := 0; i < 5; i++ {
+		storetest.MintShard(t, s, "main", 1, store.ShardMined)
+	}
+	require.NoError(t, s.Analyze(ctx))
+
+	now := clk.Now().UnixMicro()
+
+	// One status, no exclusions.
+	lines, err := s.ExplainQueryPlan(ctx, sqlite.AcquireShardSQL(1, 0),
+		"holder", now, now,
+		"main", int(store.ShardMined), now)
+	require.NoError(t, err)
+	plan := strings.Join(lines, "\n")
+	assert.Equal(t, 1, strings.Count(plan, "fuel_shards_adopt"),
+		"one status: exactly one probe should use fuel_shards_adopt, got:\n%s", plan)
+	assertNoTempBTreeInProbes(t, lines)
+
+	// Two statuses, no exclusions.
+	lines, err = s.ExplainQueryPlan(ctx, sqlite.AcquireShardSQL(2, 0),
+		"holder", now, now,
+		"main", int(store.ShardUnmined), now,
+		"main", int(store.ShardMined), now)
+	require.NoError(t, err)
+	plan = strings.Join(lines, "\n")
+	assert.Equal(t, 2, strings.Count(plan, "fuel_shards_adopt"),
+		"two statuses: each probe should use fuel_shards_adopt, got:\n%s", plan)
+	assertNoTempBTreeInProbes(t, lines)
+}
+
+// assertNoTempBTreeInProbes asserts no plan line that searches fuel_shards_adopt
+// also needs a separate sort: each probe's own "ORDER BY created_at, txid
+// LIMIT 1" must be satisfied directly by the index's order.
+func assertNoTempBTreeInProbes(t *testing.T, lines []string) {
+	t.Helper()
+	for _, l := range lines {
+		if strings.Contains(l, "fuel_shards_adopt") {
+			assert.NotContains(t, l, "TEMP B-TREE", "a probe using fuel_shards_adopt must not also need a separate sort:\n%s", strings.Join(lines, "\n"))
+		}
+	}
 }
 
 // requirePKOnly asserts a per-row CAS plan uses fuel_rows' primary key and

@@ -1,19 +1,16 @@
 // Package sqlite implements store.Store on SQLite via modernc.org/sqlite (no CGO).
 //
-// One process, one writer: every mutation runs on a dedicated single-connection
-// *sql.DB (MaxOpenConns(1)) inside BEGIN IMMEDIATE, so writes serialise through
-// Go's own connection-pool checkout instead of racing SQLite's own locking.
-// Every batch mutation (Reserve, Release, Spend, Resolve, and RetireShard's row
-// cascade) still issues one single-row, primary-key statement per op, in
-// ascending (txid internal bytes, vout) order (see lessOutpoint in rows.go):
-// harmless under this single-writer model (there is only ever one write
-// transaction in flight, so no two transactions can deadlock against each
-// other), but it keeps the on-disk access pattern identical to the Postgres
-// backend and costs nothing to keep, including for a future backend that might
-// share this code under real row-level locking.
+// One process, one writer: every mutation runs in a transaction on a
+// dedicated single-connection *sql.DB (MaxOpenConns(1), _txlock=immediate),
+// serialising writes through Go's own connection-pool checkout. Reads use a
+// separate, read-only WAL handle that proceeds concurrently with the single
+// open write transaction.
 //
-// Reads use a separate handle (up to 8 connections): WAL lets them proceed
-// concurrently with the single open write transaction.
+// Callers read the clock (s.now()) before queueing a write, not once inside
+// it: under contention a write can wait for the sole writer connection to
+// free up, so its stamped timestamp is slightly earlier than when it actually
+// commits. That is the safe direction -- a lease or reservation computed from
+// it runs out slightly sooner than requested, never later.
 package sqlite
 
 import (
@@ -34,6 +31,11 @@ import (
 )
 
 const maxBatch = 1000
+
+// journalSizeLimit bounds how large the WAL file is allowed to grow before
+// SQLite truncates it back down after a checkpoint (PRAGMA
+// journal_size_limit): 64 MiB.
+const journalSizeLimit = 64 * 1024 * 1024
 
 // Sync is the synchronous pragma level.
 type Sync string
@@ -58,22 +60,45 @@ type Option func(*Store)
 // WithClock injects the clock used for timestamps and lease expiry.
 func WithClock(now func() time.Time) Option { return func(s *Store) { s.now = now } }
 
-// DSN builds the modernc DSN. Only the _pragma=name(value) form is honoured by
-// modernc; mattn-style keys (_journal_mode=WAL) are silently ignored, which is
-// why Open reads the pragmas back. _txlock=immediate makes every
-// database/sql BeginTx on this connection issue BEGIN IMMEDIATE, so a
-// conflicting writer sees SQLITE_BUSY up front instead of partway through the
-// transaction (see write below).
-func DSN(path string, sync Sync) string {
+// dsnPathEscaper percent-encodes the characters that are otherwise meaningful
+// in a SQLite URI filename (the query-string separators and the escape
+// character itself), so a path containing them still names the intended file
+// instead of being parsed apart as DSN parameters.
+var dsnPathEscaper = strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23")
+
+func normalizeSync(sync Sync) Sync {
 	if sync == "" {
-		sync = SyncFull
+		return SyncFull
 	}
-	return "file:" + path +
-		"?_txlock=immediate" +
-		"&_pragma=busy_timeout(5000)" +
+	return sync
+}
+
+func validateSync(sync Sync) error {
+	if sync != "" && sync != SyncFull && sync != SyncNormal {
+		return fmt.Errorf("%w: sqlite sync %q must be \"\", %q or %q", store.ErrInvalidArgument, sync, SyncFull, SyncNormal)
+	}
+	return nil
+}
+
+func commonPragmas(sync Sync) string {
+	return "_pragma=busy_timeout(5000)" +
 		"&_pragma=journal_mode(WAL)" +
-		"&_pragma=synchronous(" + string(sync) + ")" +
-		"&_pragma=foreign_keys(ON)"
+		"&_pragma=synchronous(" + string(normalizeSync(sync)) + ")" +
+		fmt.Sprintf("&_pragma=journal_size_limit(%d)", journalSizeLimit)
+}
+
+// DSN builds the writer DSN. _txlock=immediate makes every BeginTx on this
+// connection issue BEGIN IMMEDIATE, so a conflicting writer sees SQLITE_BUSY
+// up front instead of partway through the transaction.
+func DSN(path string, sync Sync) string {
+	return "file:" + dsnPathEscaper.Replace(path) + "?_txlock=immediate&" + commonPragmas(sync)
+}
+
+// ReaderDSN builds the read-only handle's DSN: the same pragmas as DSN plus
+// query_only(1) (a bug can never route a write through the reader), and no
+// _txlock, since reads never open a write transaction.
+func ReaderDSN(path string, sync Sync) string {
+	return "file:" + dsnPathEscaper.Replace(path) + "?" + commonPragmas(sync) + "&_pragma=query_only(1)"
 }
 
 // Store is a SQLite store.Store.
@@ -87,11 +112,15 @@ type Store struct {
 
 var _ store.Store = (*Store)(nil)
 
-// Pragmas is what Open verified.
+// Pragmas is what Open verified: journal_mode/busy_timeout/synchronous/
+// journal_size_limit read back on a writer connection, and query_only read
+// back on a reader connection (only the reader DSN sets it).
 type Pragmas struct {
-	JournalMode string
-	BusyTimeout int
-	Synchronous int // 1 NORMAL, 2 FULL
+	JournalMode      string
+	BusyTimeout      int
+	Synchronous      int // 1 NORMAL, 2 FULL
+	JournalSizeLimit int64
+	ReaderQueryOnly  bool
 }
 
 // Open opens the database, applies the schema and verifies the pragmas.
@@ -99,14 +128,16 @@ func Open(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 	if cfg.Path == "" {
 		return nil, fmt.Errorf("%w: sqlite path is required", store.ErrInvalidArgument)
 	}
-	dsn := DSN(cfg.Path, cfg.Sync)
-	writer, err := sql.Open("sqlite", dsn)
+	if err := validateSync(cfg.Sync); err != nil {
+		return nil, err
+	}
+	writer, err := sql.Open("sqlite", DSN(cfg.Path, cfg.Sync))
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open writer: %w", err)
 	}
 	writer.SetMaxOpenConns(1)
 	writer.SetConnMaxLifetime(0)
-	reader, err := sql.Open("sqlite", dsn)
+	reader, err := sql.Open("sqlite", ReaderDSN(cfg.Path, cfg.Sync))
 	if err != nil {
 		_ = writer.Close()
 		return nil, fmt.Errorf("sqlite: open reader: %w", err)
@@ -129,9 +160,10 @@ func Open(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 	if cfg.Sync == SyncNormal {
 		wantSync = 1
 	}
-	if p.JournalMode != "wal" || p.BusyTimeout != 5000 || p.Synchronous != wantSync {
+	if p.JournalMode != "wal" || p.BusyTimeout != 5000 || p.Synchronous != wantSync ||
+		p.JournalSizeLimit != journalSizeLimit || !p.ReaderQueryOnly {
 		_ = s.Close()
-		return nil, fmt.Errorf("sqlite: pragmas not applied (journal_mode=%q busy_timeout=%d synchronous=%d)", p.JournalMode, p.BusyTimeout, p.Synchronous)
+		return nil, fmt.Errorf("sqlite: pragmas not applied (%+v)", p)
 	}
 	return s, nil
 }
@@ -164,24 +196,39 @@ func (s *Store) migrate(ctx context.Context) error {
 	})
 }
 
-// Pragmas reads the effective pragmas on the writer connection.
+// Pragmas reads the effective pragmas back from a writer connection and a
+// reader connection.
 func (s *Store) Pragmas(ctx context.Context) (Pragmas, error) {
 	var p Pragmas
-	conn, err := s.writer.Conn(ctx)
+	wconn, err := s.writer.Conn(ctx)
 	if err != nil {
 		return p, wrap(err)
 	}
-	defer func() { _ = conn.Close() }()
-	if err := conn.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&p.JournalMode); err != nil {
+	defer func() { _ = wconn.Close() }()
+	if err := wconn.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&p.JournalMode); err != nil {
 		return p, wrap(err)
 	}
-	if err := conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&p.BusyTimeout); err != nil {
+	if err := wconn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&p.BusyTimeout); err != nil {
 		return p, wrap(err)
 	}
-	if err := conn.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&p.Synchronous); err != nil {
+	if err := wconn.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&p.Synchronous); err != nil {
+		return p, wrap(err)
+	}
+	if err := wconn.QueryRowContext(ctx, `PRAGMA journal_size_limit`).Scan(&p.JournalSizeLimit); err != nil {
 		return p, wrap(err)
 	}
 	p.JournalMode = strings.ToLower(p.JournalMode)
+
+	rconn, err := s.reader.Conn(ctx)
+	if err != nil {
+		return p, wrap(err)
+	}
+	defer func() { _ = rconn.Close() }()
+	var queryOnly int
+	if err := rconn.QueryRowContext(ctx, `PRAGMA query_only`).Scan(&queryOnly); err != nil {
+		return p, wrap(err)
+	}
+	p.ReaderQueryOnly = queryOnly != 0
 	return p, nil
 }
 
@@ -196,6 +243,16 @@ func (s *Store) Capabilities() store.Caps {
 // Analyze refreshes planner statistics (tests and operators).
 func (s *Store) Analyze(ctx context.Context) error {
 	_, err := s.writer.ExecContext(ctx, `ANALYZE`)
+	return wrap(err)
+}
+
+// Checkpoint runs a PASSIVE WAL checkpoint: it folds as many WAL frames into
+// the main database file as it can without blocking a concurrent reader or
+// writer, simply doing less if it can't get the locks to do more. Safe to
+// call at any time; a maintenance job may call it periodically to bound WAL
+// growth between the automatic checkpoints SQLite already runs on its own.
+func (s *Store) Checkpoint(ctx context.Context) error {
+	_, err := s.writer.ExecContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`)
 	return wrap(err)
 }
 
@@ -218,12 +275,14 @@ func (s *Store) ExplainQueryPlan(ctx context.Context, q string, args ...any) ([]
 	return out, wrap(rs.Err())
 }
 
-// Close closes both handles. Idempotent (guarded by sync.Once): the handles
-// are never nilled out, so a store method called after Close hits
-// database/sql's own "sql: database is closed" on a closed *sql.DB, never a
-// nil-pointer panic.
+// Close closes both handles, first folding the WAL back into the main
+// database file (best effort: closing must proceed even if the checkpoint
+// can't complete). Idempotent (guarded by sync.Once); the handles are never
+// nilled out, so a store method called after Close hits database/sql's own
+// "sql: database is closed" on a closed *sql.DB, never a nil-pointer panic.
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
+		_, _ = s.writer.ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`)
 		var errs []error
 		if err := s.writer.Close(); err != nil {
 			errs = append(errs, err)
@@ -301,13 +360,14 @@ func wrap(err error) error {
 	return err
 }
 
-// write runs fn inside one transaction on the single writer *sql.DB. Because
-// writer has exactly one connection, at most one write transaction is ever in
-// flight: a second concurrent call blocks in BeginTx until the first's
-// connection is released, never at the SQL engine level, so fn never races
-// another write's statements -- including the read-then-write sequences in
-// shards.go (RenewShard, ReleaseShard, RetireShard): nothing else can run
-// between a SELECT and its following UPDATE within the same fn.
+// write runs fn inside one transaction on the single writer *sql.DB
+// (_txlock=immediate, so BeginTx issues BEGIN IMMEDIATE). Because writer has
+// exactly one connection, at most one write transaction is ever in flight: a
+// second concurrent call blocks in BeginTx until the first's connection is
+// released, never at the SQL engine level, so fn never races another write's
+// statements -- including the read-then-write sequences in shards.go
+// (RenewShard, ReleaseShard, RetireShard): nothing else can run between a
+// SELECT and its following UPDATE within the same fn.
 //
 // Using *sql.Tx here, rather than a raw *sql.Conn plus hand-written "BEGIN"/
 // "COMMIT"/"ROLLBACK" statements, is what makes this safe under a cancelled
@@ -321,8 +381,7 @@ func wrap(err error) error {
 // inside an open transaction when it's returned to the pool, so every later
 // write then fails with SQLite's non-transient "cannot start a transaction
 // within a transaction" -- and because that error isn't transient, callers
-// never retry their way out of it either. (BEGIN IMMEDIATE semantics for
-// BeginTx itself follow from the DSN's _txlock=immediate, see DSN below.)
+// never retry their way out of it either.
 func (s *Store) write(ctx context.Context, fn func(querier) error) error {
 	tx, err := s.writer.BeginTx(ctx, nil)
 	if err != nil {

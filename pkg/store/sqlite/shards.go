@@ -169,10 +169,9 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 			}
 		}
 		// Invalidate this shard's non-terminal rows one at a time, in ascending
-		// vout order (a single txid, so this already matches the global (txid,
-		// vout) order Reserve/Release/Spend/Resolve sort their own batches into;
-		// see lessOutpoint in rows.go), re-checking state IN (0,1,2) on each row
-		// so a row a concurrent Reserve just touched is still caught correctly.
+		// vout order (a single txid, so this already matches store.LessOutpoint's
+		// global order), re-checking state IN (0,1,2) on each row so a row a
+		// concurrent Reserve just touched is still caught correctly.
 		vrows, err := c.QueryContext(ctx, `SELECT vout FROM fuel_rows WHERE pool=? AND txid=? AND state IN (0,1,2) ORDER BY vout`, pool, txid[:])
 		if err != nil {
 			return err
@@ -219,22 +218,45 @@ const retireShardRowSQL = `
 	UPDATE fuel_rows SET state=4, updated_at=?
 	 WHERE pool=? AND txid=? AND vout=? AND state IN (0,1,2)`
 
-// acquireShardSQL is AcquireShard's statement: holder = ?, until = ?, store
-// clock now = ? (updated_at; see AcquireShard's doc comment on why this is
-// the store's own clock and not the passed now), pool = ?, statuses = (?,
-// ...), lease-free now = ? [, exclude = (?, ...)]. The lease-free predicate
-// uses "<=" (a lease is free at exactly LeaseUntil == now, per store.go's
+// acquireShardProbeSQL is one status's candidate probe: pool = ?, status = ?,
+// lease-free now = ? [, exclude = (?, ...)]. Equality on status (not an IN
+// (...) list) is what lets this probe seek fuel_shards_adopt (pool, status,
+// created_at, txid) directly in (created_at, txid) order, instead of a
+// multi-value IN forcing a scan across every requested status's range (or a
+// separate sort): pinned by explain_test.go. The lease-free predicate uses
+// "<=" (a lease is free at exactly LeaseUntil == now, per store.go's
 // "Owner == \"\" or LeaseUntil <= now" rule).
-func acquireShardSQL(nStatuses, nExclude int) string {
-	q := `UPDATE fuel_shards SET owner=?, lease_until=?, updated_at=? WHERE rowid = (
-	        SELECT rowid FROM fuel_shards
-	         WHERE pool=? AND status IN (` + placeholders(nStatuses) + `)
-	           AND (owner='' OR lease_until IS NULL OR lease_until <= ?)`
+func acquireShardProbeSQL(nExclude int) string {
+	q := `SELECT rowid, created_at, txid FROM fuel_shards
+	       WHERE pool=? AND status=? AND (owner='' OR lease_until IS NULL OR lease_until <= ?)`
 	if nExclude > 0 {
 		q += ` AND txid NOT IN (` + placeholders(nExclude) + `)`
 	}
-	q += ` ORDER BY created_at, txid LIMIT 1) RETURNING ` + shardCols
-	return q
+	return q + ` ORDER BY created_at, txid LIMIT 1`
+}
+
+// acquireShardSQL is AcquireShard's statement: holder = ?, until = ?, store
+// clock now = ? (updated_at; see AcquireShard's doc comment on why this is
+// the store's own clock and not the passed now), then one
+// acquireShardProbeSQL group (pool = ?, status = ?, lease-free now = ? [,
+// exclude = (?, ...)]) per requested status, unioned and re-limited to pick
+// the overall oldest candidate across every probe.
+func acquireShardSQL(nStatuses, nExclude int) string {
+	// Each arm is "SELECT rowid, created_at, txid FROM (<probe>)", not the
+	// probe's own "SELECT ... ORDER BY ... LIMIT ..." directly: SQLite's
+	// compound-select grammar has no form of "(SELECT ... ORDER BY ... LIMIT
+	// ...) UNION ALL (...)" (confirmed against sqlite3 3.51: "near UNION:
+	// syntax error"), so each arm's ORDER BY/LIMIT must live inside its own
+	// FROM-subquery instead, which SQLite fully supports.
+	arm := "SELECT rowid, created_at, txid FROM (" + acquireShardProbeSQL(nExclude) + ")"
+	arms := make([]string, nStatuses)
+	for i := range arms {
+		arms[i] = arm
+	}
+	return `UPDATE fuel_shards SET owner=?, lease_until=?, updated_at=? WHERE rowid = (
+	          SELECT rowid FROM (` + strings.Join(arms, " UNION ALL ") + `)
+	           ORDER BY created_at, txid LIMIT 1
+	        ) RETURNING ` + shardCols
 }
 
 // AcquireShard implements store.Store.
@@ -251,13 +273,12 @@ func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, unti
 	if err := store.ValidateAcquireUntil(until, now); err != nil {
 		return nil, err
 	}
-	args := []any{holder, until.UnixMicro(), s.now().UnixMicro(), pool} // updated_at from the store clock
+	args := []any{holder, until.UnixMicro(), s.now().UnixMicro()} // updated_at from the store clock
 	for _, st := range statuses {
-		args = append(args, int(st))
-	}
-	args = append(args, now.UnixMicro())
-	for i := range exclude {
-		args = append(args, exclude[i][:])
+		args = append(args, pool, int(st), now.UnixMicro())
+		for i := range exclude {
+			args = append(args, exclude[i][:])
+		}
 	}
 	q := acquireShardSQL(len(statuses), len(exclude))
 	var out *store.Shard

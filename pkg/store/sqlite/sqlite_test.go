@@ -23,8 +23,15 @@ func TestConformance(t *testing.T) {
 
 func TestDSNAndPragmas(t *testing.T) {
 	dsn := sqlite.DSN("/tmp/x.sqlite", sqlite.SyncFull)
-	require.Equal(t, "file:/tmp/x.sqlite?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)", dsn)
+	require.Equal(t, "file:/tmp/x.sqlite?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=journal_size_limit(67108864)", dsn)
 	require.Contains(t, sqlite.DSN("/tmp/x.sqlite", sqlite.SyncNormal), "synchronous(NORMAL)")
+
+	readerDSN := sqlite.ReaderDSN("/tmp/x.sqlite", sqlite.SyncFull)
+	require.Equal(t, "file:/tmp/x.sqlite?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=journal_size_limit(67108864)&_pragma=query_only(1)", readerDSN)
+	require.NotContains(t, readerDSN, "_txlock", "the reader never opens a write transaction")
+
+	escaped := sqlite.DSN("/tmp/weird%?#name.sqlite", sqlite.SyncFull)
+	require.Contains(t, escaped, "/tmp/weird%25%3F%23name.sqlite?", "%, ? and # in the path must be percent-escaped")
 
 	s, err := sqlite.Open(context.Background(), sqlite.Config{Path: filepath.Join(t.TempDir(), "p.sqlite")})
 	require.NoError(t, err)
@@ -34,4 +41,29 @@ func TestDSNAndPragmas(t *testing.T) {
 	require.Equal(t, "wal", p.JournalMode)
 	require.Equal(t, 5000, p.BusyTimeout)
 	require.Equal(t, 2, p.Synchronous, "FULL")
+	require.Equal(t, int64(67108864), p.JournalSizeLimit)
+	require.True(t, p.ReaderQueryOnly)
+}
+
+func TestOpen_InvalidSync(t *testing.T) {
+	_, err := sqlite.Open(context.Background(), sqlite.Config{Path: filepath.Join(t.TempDir(), "bad.sqlite"), Sync: "full"})
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "Sync is case-sensitive: lowercase must be rejected")
+
+	_, err = sqlite.Open(context.Background(), sqlite.Config{Path: filepath.Join(t.TempDir(), "bad2.sqlite"), Sync: "OFF"})
+	require.ErrorIs(t, err, store.ErrInvalidArgument)
+}
+
+func TestCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	s, err := sqlite.Open(ctx, sqlite.Config{Path: filepath.Join(t.TempDir(), "checkpoint.sqlite")})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, rows := storetest.MintShard(t, s, "main", 50, store.ShardMined)
+	_, err = s.Reserve(ctx, "main", storetest.ReserveOps(rows, store.NewToken(), time.Now().Add(time.Hour)))
+	require.NoError(t, err)
+
+	require.NoError(t, s.Checkpoint(ctx))
+	// A maintenance job may call it repeatedly; it must stay safe to call again.
+	require.NoError(t, s.Checkpoint(ctx))
 }
