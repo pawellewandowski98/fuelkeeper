@@ -471,6 +471,13 @@ func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 // or quarantined rows may still return to available) or when the shard is
 // not mined (serve_policy=any may adopt unmined shards, whose status the
 // watcher still owns).
+//
+// Residual: a shard that reads empty only because rows are still reserved or
+// quarantined (by this or another instance) is not retired, so if more than
+// maxRecentlyEmpty such shards precede every live one, adoption can still
+// cycle over them until those rows are spent or come back. The check's cost
+// on an empty adoption is usually a single GetRows page: it stops at the
+// first non-terminal row.
 func (m *ShardManager) retireIfSpentOut(ctx context.Context, sh *store.Shard) bool {
 	if sh.Status != store.ShardMined || sh.Size <= 0 {
 		return false

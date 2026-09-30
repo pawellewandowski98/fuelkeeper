@@ -692,8 +692,12 @@ func TestHungryAtMaxShardsTriggersBackgroundRotation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- m.Run(ctx) }()
-	require.Eventually(t, func() bool { return alloc.Has(shards[0].TxID) && alloc.Has(shards[1].TxID) },
-		2*time.Second, 5*time.Millisecond, "Run fills both slots on start")
+	require.Eventually(t, func() bool {
+		// Rows loaded too, not just both shards registered: AdoptOnce registers
+		// a shard before loading it, and draining in between would leave the
+		// second shard's rows to land afterwards, so it would never rotate.
+		return alloc.Has(shards[0].TxID) && alloc.Has(shards[1].TxID) && alloc.Available() == 20
+	}, 2*time.Second, 5*time.Millisecond, "Run fills both slots on start")
 
 	drainAll(t, st, clk, poolName, alloc)
 	m.Hungry() // what Reserve does when the allocator is below LowWaterRows
@@ -1139,4 +1143,188 @@ func TestRescanDoesNotReAddRowsHandedOutDuringListing(t *testing.T) {
 	require.Equal(t, 2, n)
 	require.NoError(t, m.RescanOnce(ctx))
 	assert.Equal(t, 5, alloc.Available())
+}
+
+// hideListStore lists no available rows for the shards in hide, as if the
+// listing had raced a release made through another instance.
+type hideListStore struct {
+	store.Store
+	hide map[chainhash.Hash]bool
+}
+
+func (w *hideListStore) ListAvailable(ctx context.Context, pool string, txid chainhash.Hash, fromVout uint32, limit int) ([]store.Row, error) {
+	if w.hide[txid] {
+		return nil, nil
+	}
+	return w.Store.ListAvailable(ctx, pool, txid, fromVout, limit)
+}
+
+func dropsRetired(poolName string) float64 {
+	return testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "retired"))
+}
+
+// assertDroppedAsEmpty checks the pre-retirement handling of an adoption that
+// found sh empty: dropped as "empty", lease released, excluded from
+// re-adoption, and still mined in the store.
+func assertDroppedAsEmpty(t *testing.T, st store.Store, m *pool.ShardManager, poolName string, sh store.Shard, emptyBefore, retiredBefore float64) {
+	t.Helper()
+	got, err := st.GetShard(context.Background(), poolName, sh.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, store.ShardMined, got.Status, "not retired")
+	assert.Empty(t, got.Owner, "lease released")
+	assert.True(t, m.RecentlyEmpty(sh.TxID), "excluded from re-adoption as before")
+	assert.InDelta(t, emptyBefore+1, dropsEmpty(poolName), 0)
+	assert.InDelta(t, retiredBefore, dropsRetired(poolName), 0)
+}
+
+// TestAdoptOnceDoesNotRetireShardWithAvailableRow pins that retirement needs
+// every row terminal: a shard whose adoption listing came back empty while one
+// row is in fact available (e.g. released through another instance meanwhile)
+// is handled as empty, never retired, so that row is not stranded.
+func TestAdoptOnceDoesNotRetireShardWithAvailableRow(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "retire-avail"
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	sh, rows := storetest.MintShard(t, base, poolName, 3, store.ShardMined)
+	spendOut(t, base, clk, poolName, [][]store.Row{rows[1:]}) // rows[0] stays available
+	wrapped := &hideListStore{Store: base, hide: map[chainhash.Hash]bool{sh.TxID: true}}
+	m, alloc := newMgr(t, wrapped, clk, testInstanceConfig(), pc)
+	emptyBefore, retiredBefore := dropsEmpty(poolName), dropsRetired(poolName)
+
+	adopted, err := m.AdoptOnce(ctx)
+	require.NoError(t, err)
+	assert.False(t, adopted)
+	assert.False(t, alloc.Has(sh.TxID))
+	assertDroppedAsEmpty(t, base, m, poolName, sh, emptyBefore, retiredBefore)
+}
+
+// TestAdoptOnceDoesNotRetireShardWithUnexpectedVouts pins the found == Size
+// check: rows are only looked up at vouts 0..Size-1, so a shard laid out
+// differently (here vouts 1..Size) cannot be proven spent out and is handled
+// as empty, never retired, even though every row it has is terminal.
+func TestAdoptOnceDoesNotRetireShardWithUnexpectedVouts(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "retire-gap"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	sh, rows := storetest.BuildShard(poolName, 3, store.ShardMined)
+	for i := range rows {
+		rows[i].Vout = uint32(i + 1) //nolint:gosec // tiny test count
+	}
+	require.NoError(t, st.PutShard(ctx, sh, rows))
+	spendOut(t, st, clk, poolName, [][]store.Row{rows})
+	m, _ := newMgr(t, st, clk, testInstanceConfig(), pc)
+	emptyBefore, retiredBefore := dropsEmpty(poolName), dropsRetired(poolName)
+
+	adopted, err := m.AdoptOnce(ctx)
+	require.NoError(t, err)
+	assert.False(t, adopted)
+	assertDroppedAsEmpty(t, st, m, poolName, sh, emptyBefore, retiredBefore)
+}
+
+// TestAdoptOnceRetiredShardNotOnRecentlyEmptyList pins that a retired shard
+// takes no slot on the bounded recently-empty list (AcquireShard never
+// returns it again, so an entry would only evict a useful one), while its
+// lease is still released and the drop is counted as "retired".
+func TestAdoptOnceRetiredShardNotOnRecentlyEmptyList(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "retire-noexclude"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	sh, rows := storetest.MintShard(t, st, poolName, 3, store.ShardMined)
+	spendOut(t, st, clk, poolName, [][]store.Row{rows})
+	m, _ := newMgr(t, st, clk, testInstanceConfig(), pc)
+	emptyBefore, retiredBefore := dropsEmpty(poolName), dropsRetired(poolName)
+
+	adopted, err := m.AdoptOnce(ctx)
+	require.NoError(t, err)
+	assert.False(t, adopted)
+	got, err := st.GetShard(ctx, poolName, sh.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, store.ShardRetired, got.Status)
+	assert.Empty(t, got.Owner, "lease released")
+	assert.False(t, m.RecentlyEmpty(sh.TxID), "retired shard not on the recently-empty list")
+	assert.InDelta(t, retiredBefore+1, dropsRetired(poolName), 0)
+	assert.InDelta(t, emptyBefore, dropsEmpty(poolName), 0)
+}
+
+// getRowsHookStore runs hook after the wrapped GetRows has read its rows and
+// before they are returned: the window in noteReleased between reading the
+// released rows and adding them back.
+type getRowsHookStore struct {
+	store.Store
+	mu   sync.Mutex
+	hook func() // runs once, then cleared
+}
+
+func (w *getRowsHookStore) setHook(h func()) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.hook = h
+}
+
+func (w *getRowsHookStore) GetRows(ctx context.Context, pool string, ops []store.Outpoint) ([]store.Row, error) {
+	rows, err := w.Store.GetRows(ctx, pool, ops)
+	w.mu.Lock()
+	h := w.hook
+	w.hook = nil
+	w.mu.Unlock()
+	if err == nil && h != nil {
+		h()
+	}
+	return rows, err
+}
+
+// TestReleaseDoesNotReAddRowsHandedOutDuringItsRead is the release-path twin
+// of TestRescanDoesNotReAddRowsHandedOutDuringListing: Release (trust) reads
+// the released rows back with GetRows and re-adds the available ones. If one
+// of them is meanwhile picked up (here by a rescan), handed out, reserved and
+// forgotten, the stale copy from that read must not be queued again.
+func TestReleaseDoesNotReAddRowsHandedOutDuringItsRead(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "stale-release"
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	wrapped := &getRowsHookStore{Store: base}
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	pc.MinTTL = time.Second
+	pc.ReleasePolicy = pool.ReleaseTrust
+	require.NoError(t, pc.Validate())
+	p := pool.NewPool(wrapped, pc, testInstanceConfig(), pool.ClockFunc(clk.Now), slog.Default())
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); _ = p.Run(runCtx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	sh, _ := storetest.MintShard(t, base, poolName, 2, store.ShardMined)
+
+	res, err := p.Reserve(ctx, pool.ReserveRequest{Count: 2})
+	require.NoError(t, err)
+	alloc := p.Allocator()
+	require.Zero(t, alloc.Available())
+	ops := outpointsOf(res.Outputs)
+
+	var handedOut []store.Row
+	wrapped.setHook(func() {
+		// A rescan picks the first released row up, and a concurrent Reserve
+		// hands it out, reserves it and forgets it.
+		rows := storetest.RowsByOutpoint(t, base, poolName, ops[:1])
+		alloc.Add(sh.TxID, []store.Row{rows[ops[0]]})
+		handedOut = alloc.Pop(1)
+		storetest.MustReserve(t, base, poolName, handedOut, store.NewToken(), clk.Now().Add(time.Hour))
+		alloc.Forget(storetest.Ops(handedOut))
+	})
+	n, err := p.Release(ctx, res.Token, ops)
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+	require.Len(t, handedOut, 1)
+	require.Equal(t, ops[0], handedOut[0].Outpoint)
+
+	assert.Equal(t, 1, alloc.Available(), "only the row still available in the store is queued")
+	queued := alloc.Pop(10)
+	require.Len(t, queued, 1)
+	assert.Equal(t, ops[1], queued[0].Outpoint)
 }

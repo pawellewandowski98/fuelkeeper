@@ -31,3 +31,14 @@ func (m *ShardManager) ReleasePending(txid chainhash.Hash) bool {
 	_, pending := m.releasing[txid]
 	return pending
 }
+
+// RecentlyEmpty reports whether txid is on the recently-drained exclusion list.
+func (m *ShardManager) RecentlyEmpty(txid chainhash.Hash) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.recentlyEmpty[txid]
+	return ok
+}
+
+// Allocator exposes the pool's allocator.
+func (p *Pool) Allocator() *Allocator { return p.alloc }
