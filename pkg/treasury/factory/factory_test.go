@@ -80,9 +80,9 @@ func TestOpenRejectsBadConfig(t *testing.T) {
 		return nil, nil
 	}
 	c := toolboxConfig()
-	c.Toolbox.ArcadeURL = ""
+	c.Toolbox.RootKeyHex = "zz"
 	_, err := Open(context.Background(), c, pools(), nil)
-	require.ErrorContains(t, err, "arcade_url")
+	require.ErrorContains(t, err, "root_key_hex")
 }
 
 type fakeToolbox struct {
@@ -113,6 +113,11 @@ func TestOpenToolbox(t *testing.T) {
 	o, err := Open(context.Background(), c, pools(), nil, WithMockOnSend(func(chainhash.Hash) {}))
 	require.NoError(t, err)
 	assert.Equal(t, c.Toolbox, gotCfg)
+
+	c.Toolbox.ChaintracksURL = ""
+	_, err = Open(context.Background(), c, pools(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, "https://arcade-v2-ttn-us-1.bsvblockchain.tech/chaintracks", gotCfg.ChaintracksURL, "Open applies the network defaults")
 	assert.Same(t, fake, o.Treasury)
 	assert.Same(t, fake, o.Funder)
 	require.NoError(t, o.Closer.Close())
@@ -124,4 +129,34 @@ func TestOpenToolbox(t *testing.T) {
 	}
 	_, err = Open(context.Background(), c, pools(), nil)
 	require.ErrorIs(t, err, boom)
+}
+
+func TestApplyDefaultsFillsPublicEndpoints(t *testing.T) {
+	c := toolboxConfig()
+	c.Toolbox.ArcadeURL, c.Toolbox.ChaintracksURL = "", ""
+	require.NoError(t, c.Validate(pools()))
+	assert.Equal(t, "https://arcade-v2-ttn-us-1.bsvblockchain.tech", c.Toolbox.ArcadeURL)
+	assert.Equal(t, "https://arcade-v2-ttn-us-1.bsvblockchain.tech/chaintracks", c.Toolbox.ChaintracksURL)
+
+	c = toolboxConfig()
+	c.Toolbox.Network = "main"
+	c.Toolbox.ArcadeURL, c.Toolbox.ChaintracksURL = "", ""
+	require.NoError(t, c.Validate(pools()))
+	assert.Equal(t, "https://arcade-v2-us-1.bsvblockchain.tech", c.Toolbox.ArcadeURL)
+	assert.Equal(t, "https://arcade-v2-us-1.bsvblockchain.tech/chaintracks", c.Toolbox.ChaintracksURL)
+
+	c = toolboxConfig()
+	c.Toolbox.ArcadeURL = "https://mine.invalid"
+	require.NoError(t, c.Validate(pools()))
+	assert.Equal(t, "https://mine.invalid", c.Toolbox.ArcadeURL, "an explicit URL is kept")
+
+	c = toolboxConfig()
+	c.Toolbox.Network = "test"
+	c.Toolbox.ArcadeURL = ""
+	require.ErrorContains(t, c.Validate(pools()), "arcade_url", "test has no public arcade default")
+
+	c = Default()
+	c.Toolbox.ArcadeURL = ""
+	require.NoError(t, c.Validate(pools()))
+	assert.Empty(t, c.Toolbox.ArcadeURL, "kind mock is left alone")
 }

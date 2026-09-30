@@ -8,10 +8,6 @@
 #                             fuel keys) comes from it: back it up, never commit it.
 #   FUELKEEPER_API_KEY        required: the /v1 API key.
 #   FUELKEEPER_ADMIN_KEY      required: the admin key (funding, quarantine).
-#   FUELKEEPER_ARCADE_URL     optional: defaults to the toolbox's public ttn arcade
-#                             (go-wallet-toolbox defs.ArcadeTTNURL).
-#   FUELKEEPER_CHAINTRACKS_URL optional: defaults to that host's /chaintracks, the
-#                             toolbox's ttn default.
 #   FUELKEEPER_TERANODE_URL   optional: a teranode asset API base
 #                             (e.g. http://teranode:8090/api/v1); without it the
 #                             oracle is arcade-only and outpoint checks stay Unknown.
@@ -20,6 +16,12 @@
 # environment variable NAME and must be set; ":-default" inside the braces
 # supplies a default instead. Two dollar signs are one literal dollar sign.
 # Expansion also applies inside comments, so do not write a reference here.
+#
+# arcade_url and chaintracks_url are left out: on ttn (and main) the treasury
+# uses the toolbox's public endpoints (go-wallet-toolbox defs.ArcadeTTNURL and
+# its /chaintracks), and the oracle uses the treasury's arcade. Add
+# treasury.toolbox.arcade_url / chaintracks_url (and oracle.arcade_url) to use
+# your own.
 
 instance:
   instance_id: ${FUELKEEPER_INSTANCE_ID:-ttn-1}
@@ -50,7 +52,6 @@ jobs:
 
 oracle:
   kind: composite
-  arcade_url: ${FUELKEEPER_ARCADE_URL:-https://arcade-v2-ttn-us-1.bsvblockchain.tech}
   teranode_url: ${FUELKEEPER_TERANODE_URL:-}
 
 treasury:
@@ -61,8 +62,6 @@ treasury:
     originator: fuelkeeper
     # 0 = read arcade's /policy at start (floor 1 sat/kB).
     fee_sat_per_kb: 0
-    arcade_url: ${FUELKEEPER_ARCADE_URL:-https://arcade-v2-ttn-us-1.bsvblockchain.tech}
-    chaintracks_url: ${FUELKEEPER_CHAINTRACKS_URL:-https://arcade-v2-ttn-us-1.bsvblockchain.tech/chaintracks}
     storage:
       engine: sqlite
       sqlite_path: ${FUELKEEPER_TREASURY_DB:-treasury.sqlite}

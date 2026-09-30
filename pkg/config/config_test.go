@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/config"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/jobs"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
@@ -431,15 +432,23 @@ func toolboxConfig(t *testing.T) *config.Config {
 func TestValidateOracleAndTreasuryFactories(t *testing.T) {
 	c := toolboxConfig(t)
 	c.Oracle.ArcadeURL = ""
-	require.ErrorContains(t, c.Validate(), "oracle.arcade_url is required")
+	c.Treasury.Toolbox.ArcadeURL = "https://arcade.example"
+	require.NoError(t, c.Validate())
+	assert.Equal(t, "https://arcade.example", c.Oracle.ArcadeURL, "the oracle falls back to the treasury's arcade")
+
+	c = toolboxConfig(t)
+	c.Oracle.ArcadeURL = ""
+	c.Treasury.Kind = "mock"
+	require.ErrorContains(t, c.Validate(), "oracle.arcade_url is required", "no toolbox treasury to fall back to")
 
 	c = toolboxConfig(t)
 	c.Oracle.Kind = "teranode"
 	require.ErrorContains(t, c.Validate(), "oracle.teranode_url is required")
 
 	c = toolboxConfig(t)
+	c.Treasury.Toolbox.Network = "test"
 	c.Treasury.Toolbox.ChaintracksURL = ""
-	require.ErrorContains(t, c.Validate(), "treasury.toolbox.chaintracks_url")
+	require.ErrorContains(t, c.Validate(), "treasury.toolbox.chaintracks_url", "test has no public default")
 
 	c = toolboxConfig(t)
 	big := c.Pools[0]
@@ -466,6 +475,17 @@ func TestValidateReconcileGraceExceedsBuildTimeout(t *testing.T) {
 
 	c.Jobs.Minter.BuildTimeout = 0
 	require.ErrorContains(t, c.Validate(), "build_timeout")
+
+	c = toolboxConfig(t)
+	c.Jobs.LeaseTTL = c.Jobs.Minter.BuildTimeout + 2*jobs.ReconcileBudget
+	err = c.Validate()
+	require.ErrorContains(t, err, "jobs.lease_ttl")
+	require.ErrorContains(t, err, "reconcile budget")
+	c.Jobs.LeaseTTL += time.Second
+	require.NoError(t, c.Validate())
+	c.Jobs.LeaseTTL = time.Second
+	c.Jobs.Enabled = false
+	require.NoError(t, c.Validate(), "no jobs, no minter round")
 
 	// The mock treasury does not reconcile: no constraint.
 	c = toolboxConfig(t)

@@ -387,6 +387,7 @@ func TestRunServeConfigToolboxTreasury(t *testing.T) {
 	tb.ChaintracksURL = stub.URL + "/chaintracks"
 	tb.FeeSatPerKB = 1
 	tb.Storage.SQLite = filepath.Join(t.TempDir(), "treasury.sqlite")
+	cfg.Jobs.LeaseTTL = 90 * time.Second // must outlast a toolbox minter round
 	require.NoError(t, cfg.Validate())
 
 	var (
@@ -403,6 +404,7 @@ func TestRunServeConfigToolboxTreasury(t *testing.T) {
 			}
 			return closeRecorder{Store: st, onClose: func() { record("store closed") }}, nil
 		},
+		onTreasuryClosed: func() { record("treasury closed") },
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	addr := make(chan string, 1)
@@ -435,7 +437,8 @@ func TestRunServeConfigToolboxTreasury(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	assert.Equal(t, []string{"store opened", "store closed"}, events)
+	assert.Equal(t, []string{"store opened", "treasury closed", "store closed"}, events,
+		"the treasury closes after the jobs and before the store")
 	_, err = os.Stat(tb.Storage.SQLite)
 	require.NoError(t, err, "the treasury wallet storage was created")
 }

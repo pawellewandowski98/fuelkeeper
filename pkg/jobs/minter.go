@@ -83,9 +83,11 @@ func (c MinterConfig) Validate() error {
 // does not re-split for every single row consumed. See needsRefill.
 //
 // Treasuries with optional capabilities get two more steps at the start of a
-// round: a treasury.Reconciler is reconciled on the first round of every
-// lease (see startRound), and a treasury.ChunkEnsurer tops up its funding
-// chunks every round. Build plus PutShard of one split is bounded by
+// round: a treasury.Reconciler is reconciled (see startRound), and a
+// treasury.ChunkEnsurer tops up its funding chunks. Reconciliation never
+// blocks a round for its grace: one round takes the snapshot, and the first
+// round at least ReconcileGrace later finishes it, each phase bounded by
+// ReconcileBudget. Build plus PutShard of one split is bounded by
 // MinterConfig.BuildTimeout, the window a Reconciler's grace must exceed.
 type Minter struct {
 	st    store.Store
@@ -97,10 +99,27 @@ type Minter struct {
 
 	// lastRound is when the previous RunOnce ended (zero before the first).
 	lastRound time.Time
-	// reconcilePending is set on the first round of a lease and cleared once
-	// a Reconcile completes (a failed one is retried next round).
+	// reconcilePending asks the next round to take a reconcile snapshot. It
+	// is set on the first round of a lease, after a split may have been left
+	// built but unrecorded (a failed PutShard, a timed-out Build), and after
+	// a finish that deferred or failed to settle a split; it is cleared once
+	// a snapshot is taken.
 	reconcilePending bool
+	// snapshot is a taken but unfinished reconcile, or nil.
+	snapshot *reconcileSnapshot
 }
+
+// reconcileSnapshot is the first listing of a two-phase reconcile.
+type reconcileSnapshot struct {
+	txids []chainhash.Hash
+	due   time.Time // ReconcileFinish may run from here on
+}
+
+// ReconcileBudget bounds each reconcile phase (a wallet listing, store
+// lookups and sends). A round runs at most one finish and one start, so it
+// adds at most twice this to a round; config.Validate requires the job
+// lease to outlast build_timeout plus that.
+const ReconcileBudget = 10 * time.Second
 
 // NewMinter creates a minter for the configured pools, or an error if cfg is
 // invalid.
@@ -140,21 +159,26 @@ func (m *Minter) RunOnce(ctx context.Context) error {
 // previous round ended, so a gap of more than 1.5 intervals means at least
 // one tick found the lease held elsewhere and this instance has just
 // (re)acquired it. The first round of the process is a new lease too. A
-// false positive (a slow lease renewal) only costs an extra Reconcile, which
-// is a single wallet listing when there is nothing to settle.
+// false positive (a slow lease renewal) only costs one extra wallet listing.
 func (m *Minter) newLease(now time.Time) bool {
 	return m.lastRound.IsZero() || now.Sub(m.lastRound) > m.cfg.Interval+m.cfg.Interval/2
 }
 
-// startRound runs the treasury's optional per-round steps: Reconcile on the
-// first round of a lease (retried each round until it completes), then
-// EnsureChunks. Neither failure stops the round.
+// startRound runs the treasury's optional per-round steps: finish a due
+// reconcile snapshot, take a new one when one is pending, then
+// EnsureChunks. No step waits for the grace, and no failure stops the round.
 func (m *Minter) startRound(ctx context.Context) {
-	if m.newLease(m.clock.Now()) {
+	now := m.clock.Now()
+	if m.newLease(now) {
 		m.reconcilePending = true
 	}
-	if rec, ok := m.tr.(treasury.Reconciler); ok && m.reconcilePending {
-		m.reconcilePending = !m.reconcile(ctx, rec)
+	if rec, ok := m.tr.(treasury.Reconciler); ok {
+		if m.snapshot != nil && !now.Before(m.snapshot.due) {
+			m.finishReconcile(ctx, rec)
+		}
+		if m.reconcilePending && m.snapshot == nil {
+			m.startReconcile(ctx, rec, now)
+		}
 	}
 	if ce, ok := m.tr.(treasury.ChunkEnsurer); ok {
 		if err := ce.EnsureChunks(ctx); err != nil && ctx.Err() == nil {
@@ -163,15 +187,44 @@ func (m *Minter) startRound(ctx context.Context) {
 	}
 }
 
-// reconcile settles splits the treasury built but never recorded or sent,
-// and reports whether it completed.
-func (m *Minter) reconcile(ctx context.Context, rec treasury.Reconciler) bool {
-	rep, err := rec.Reconcile(ctx, m.knownSplit)
+// startReconcile takes the first listing and sends the splits the store
+// already records; the rest wait for finishReconcile.
+func (m *Minter) startReconcile(ctx context.Context, rec treasury.Reconciler, now time.Time) {
+	rctx, cancel := context.WithTimeout(ctx, ReconcileBudget)
+	defer cancel()
+	txids, rep, err := rec.ReconcileStart(rctx, m.knownSplit)
+	if err != nil {
+		if ctx.Err() == nil {
+			m.log.Error("treasury reconcile snapshot failed; retrying next round", "err", err)
+		}
+		return
+	}
+	m.reconcilePending = false
+	if len(txids) > 0 {
+		m.snapshot = &reconcileSnapshot{txids: txids, due: now.Add(rec.ReconcileGrace())}
+	}
+	m.log.Info("treasury reconcile snapshot", "unsent", len(txids), "resent", len(rep.Resent), "errors", len(rep.Errors))
+	m.log.Debug("treasury reconcile snapshot txids", "unsent", hashStrings(txids), "resent", hashStrings(rep.Resent))
+	for txid, err := range rep.Errors {
+		m.log.Warn("treasury reconcile could not settle a split", "txid", txid.String(), "err", err)
+	}
+}
+
+// finishReconcile lists again and settles the snapshot. A failure keeps the
+// snapshot for the next round; deferred or failed splits ask for a new one.
+func (m *Minter) finishReconcile(ctx context.Context, rec treasury.Reconciler) {
+	rctx, cancel := context.WithTimeout(ctx, ReconcileBudget)
+	defer cancel()
+	rep, err := rec.ReconcileFinish(rctx, m.snapshot.txids, m.knownSplit)
 	if err != nil {
 		if ctx.Err() == nil {
 			m.log.Error("treasury reconcile failed; retrying next round", "err", err)
 		}
-		return false
+		return
+	}
+	m.snapshot = nil
+	if len(rep.Deferred) > 0 || len(rep.Errors) > 0 {
+		m.reconcilePending = true
 	}
 	lvl := slog.LevelInfo
 	if len(rep.Aborted) > 0 || len(rep.Errors) > 0 {
@@ -184,7 +237,6 @@ func (m *Minter) reconcile(ctx context.Context, rec treasury.Reconciler) bool {
 	for txid, err := range rep.Errors {
 		m.log.Warn("treasury reconcile could not settle a split", "txid", txid.String(), "err", err)
 	}
-	return true
 }
 
 // knownSplit reports whether any configured pool records a shard for txid.
@@ -268,6 +320,11 @@ func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 				m.log.Warn("treasury cannot fund a split", "pool", pc.Name, "deficit", deficit)
 				return nil
 			}
+			// A Build cut off by its deadline may have left a split in the
+			// treasury's wallet that nothing records: reconcile it.
+			if errors.Is(err, context.DeadlineExceeded) {
+				m.reconcilePending = true
+			}
 			// An unexpected build failure is not a known, transient condition
 			// like ErrInsufficientFunds: propagate it so the runner logs a job
 			// failure instead of silently doing nothing this tick.
@@ -279,8 +336,10 @@ func (m *Minter) mintPool(ctx context.Context, pc pool.Config) error {
 		if err != nil {
 			minterSplits.WithLabelValues(pc.Name, "record_failed").Inc()
 			// A signed split now exists in the treasury that was never
-			// recorded; log at Error with the txid. A treasury.Reconciler
-			// aborts it on the next lease's first round.
+			// recorded; log at Error with the txid. The next round takes a
+			// reconcile snapshot, so a treasury.Reconciler aborts it a grace
+			// later even if this instance keeps the lease.
+			m.reconcilePending = true
 			m.log.Error("record split; a signed split may now be unrecorded", "pool", pc.Name, "txid", b.Shard.TxID.String(), "err", err)
 			return err // never send what we could not record
 		}

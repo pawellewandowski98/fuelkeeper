@@ -60,7 +60,8 @@ pools:
 # Background jobs (enabled by default)
 jobs:
   enabled: true                      # Run jobs or not; default true
-  lease_ttl: 90s                     # Job lease TTL; must exceed 2× longest job interval; only matters when enabled
+  lease_ttl: 90s                     # Job lease TTL; must exceed 2× longest job interval (and, with the toolbox
+                                     #   treasury, minter.build_timeout + 20s); only matters when enabled
   
   reaper:
     interval: 1s                     # How often to scan for expired/quarantined rows; default 1s
@@ -91,7 +92,8 @@ oracle:
   kind: none                         # none (default) | mock | arcade | teranode | composite
   mock:
     assume_unspent: true             # When true, assume unknown outpoints are unspent (nullnet only)
-  arcade_url: ""                     # Arcade base URL; required for arcade and composite
+  arcade_url: ""                     # Arcade base URL; required for arcade and composite (default: the
+                                     #   toolbox treasury's arcade_url when treasury.kind is toolbox)
   teranode_url: ""                   # Teranode asset API base (e.g. http://teranode:8090/api/v1);
                                      #   required for teranode, optional for composite
   teranode_batch_threshold: 0        # Outpoints above which teranode batches lookups; 0 = 8, < 0 disables
@@ -106,9 +108,11 @@ treasury:
     root_key_hex: ${FUELKEEPER_TREASURY_KEY}  # 64 hex chars; required for kind toolbox; never commit it
     originator: fuelkeeper           # BRC-100 originator; default fuelkeeper
     fee_sat_per_kb: 0                # 0 = read arcade /policy at start (floor 1)
-    arcade_url: ""                   # Arcade base URL (broadcast, status); required
+    arcade_url: ""                   # Arcade base URL (broadcast, status); default on main/ttn: the toolbox's
+                                     #   public arcade; required on test/tstn
     arcade_events_url: ""            # Arcade SSE events base; default arcade_url
-    chaintracks_url: ""              # Chaintracks (headers, SPV); required
+    chaintracks_url: ""              # Chaintracks (headers, SPV); default on main/ttn: <arcade host>/chaintracks;
+                                     #   required on test/tstn
     storage:
       engine: sqlite                 # sqlite (default) | postgres
       sqlite_path: treasury.sqlite   # Wallet database for engine sqlite
@@ -151,9 +155,16 @@ On startup, FuelKeeper validates the configuration:
 - `jobs.watcher.limit` must exceed `jobs.minter.max_pending_shards`
 - Mint capacity must be ≥ 1.2× `expected_tps` for each pool (when expected_tps > 0)
 - Pools with `spend_policy: verify` or `release_policy: verify` require an oracle (`oracle.kind` != "none")
-- `oracle.kind: arcade` and `composite` need `oracle.arcade_url`; `teranode` needs `oracle.teranode_url`
-- `treasury.kind: toolbox` needs a valid `root_key_hex`, `arcade_url` and `chaintracks_url`, and every pool must share one leaf cost class (same `split_size` × `denomination`, same leaf size): one treasury keeps one chunk denomination (see [TREASURY.md](TREASURY.md))
+- `oracle.kind: arcade` and `composite` need `oracle.arcade_url` (or a toolbox treasury, whose arcade they then use); `teranode` needs `oracle.teranode_url`
+- `treasury.kind: toolbox` needs a valid `root_key_hex` (plus `arcade_url` and `chaintracks_url` on `test`/`tstn`; `main` and `ttn` default to the toolbox's public endpoints), and every pool must share one leaf cost class (same `split_size` × `denomination`, same leaf size): one treasury keeps one chunk denomination (see [TREASURY.md](TREASURY.md))
 - `treasury.toolbox.reconcile_grace` must exceed `jobs.minter.build_timeout`, or Reconcile could abort a split whose Build and PutShard were merely slow
+- With the toolbox treasury and jobs enabled, `jobs.lease_ttl` must exceed `jobs.minter.build_timeout` + 20 s (two 10 s reconcile phases), the longest minter round the lease has to outlast
+
+**Config keys changed with the toolbox treasury.** The oracle URLs moved from
+nested blocks to flat keys: `oracle.arcade.url` is now `oracle.arcade_url`
+and `oracle.teranode.url` is now `oracle.teranode_url`. The old keys are
+rejected as unknown fields. `oracle.mock.assume_unspent` and
+`treasury.mock.confirm_after` are unchanged.
 
 ## Deployment Topologies
 
@@ -169,6 +180,7 @@ On startup, FuelKeeper validates the configuration:
 - Each instance acquires a lease on whole shards and job responsibilities
 - Shards from a crashed instance are re-adopted after `instance.lease_ttl`
 - Every store operation is a compare-and-set; no pessimistic locking
+- With `treasury.kind: toolbox`, every instance must use the same treasury storage: one postgres database in `treasury.toolbox.storage` and the same root key. The minter runs wherever the lease is and funding is served by whichever instance a request reaches, so with per-instance sqlite files a payment can land in a wallet the minter never spends (see [TREASURY.md](TREASURY.md#several-instances))
 
 ## Durability and Consistency
 
@@ -204,7 +216,7 @@ Runs every `watcher.interval`. Responsibilities:
 
 Runs every `minter.interval`. Responsibilities:
 
-- On the first round of each lease (and each process start), run the treasury's Reconcile: splits built but never recorded are aborted, recorded but unsent ones are sent (toolbox treasury; see [TREASURY.md](TREASURY.md#reconciliation))
+- Reconcile the toolbox treasury without blocking: take a snapshot of built-but-unsent splits on the first round of each lease (and after a failed PutShard or a timed-out Build), and finish it in the first round at least `reconcile_grace` later; unrecorded splits seen in both listings are aborted, recorded ones are sent (see [TREASURY.md](TREASURY.md#reconciliation))
 - At the start of every round, top up the treasury's leaf-sized funding chunks (toolbox treasury)
 - Build, sign and send new split transactions ("shards") to keep each pool's available rows near target; one split's Build + PutShard is bounded by `build_timeout`
 - Stop minting when unmined shards exceed `max_pending_shards`
@@ -259,11 +271,27 @@ then the minter logs "treasury cannot fund a split" each round. Key
 material, chunk sizing, backups and reconciliation are in
 [TREASURY.md](TREASURY.md).
 
-At start-up a binary that links the toolbox prints two lines on stderr,
-`WARN: No config file 'settings.conf'` and `WARN: No local config file
-'settings_local.conf'`. They come from a settings package the toolbox's
-chaintracks client pulls in and are harmless; FuelKeeper does not read
-those files.
+**Side effects of the toolbox's dependencies at start-up.** The toolbox's
+chaintracks client pulls in a settings package (`github.com/ordishs/gocore`)
+that runs while the binary initialises, before FuelKeeper reads its config:
+
+- It loads a `.env` file from the **working directory** into the process
+  environment (existing variables are not overridden), or the file named by
+  `SETTINGS_ENV_FILE`. A stray `.env` can therefore supply values for the
+  `${VAR}` references in FuelKeeper's config, API keys included.
+- It searches for `settings.conf`, `settings_test.conf` and
+  `settings_local.conf` next to the binary and in its parent directories,
+  then in the working directory and its parents, and prints
+  `WARN: No config file 'settings.conf'` and
+  `WARN: No local config file 'settings_local.conf'` when none is found.
+  FuelKeeper never reads those settings; an unreadable `settings.conf` on
+  that path makes the process exit at start-up.
+
+In deployments, set `SETTINGS_ENV_FILE=/dev/null` (or any path that does not
+exist) in the service environment, e.g. `Environment=SETTINGS_ENV_FILE=/dev/null`
+in a systemd unit or `SETTINGS_ENV_FILE: /dev/null` under a compose
+service's `environment:`, and run from a working directory that holds no
+`.env` or `settings*.conf`. The two WARN lines are then harmless.
 
 ## What to Watch
 

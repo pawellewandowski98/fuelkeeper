@@ -108,6 +108,14 @@ func TestNoncesRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, ok)
 
+	raw, err := base64.StdEncoding.DecodeString(s)
+	require.NoError(t, err)
+	require.Len(t, raw, 48)
+	long := base64.StdEncoding.EncodeToString(append(raw, 1, 2, 3))
+	ok, err = n.Verify(ctx, long)
+	require.NoError(t, err)
+	assert.False(t, ok, "a valid nonce with bytes appended does not verify")
+
 	other := nonces{w: protoWallet(t)}
 	ok, err = other.Verify(ctx, s)
 	require.NoError(t, err)

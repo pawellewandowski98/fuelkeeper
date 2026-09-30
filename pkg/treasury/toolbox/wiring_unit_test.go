@@ -131,7 +131,7 @@ func TestUTXOManagementAndKeeperAgree(t *testing.T) {
 	assert.Equal(t, uint64(100), th.HighWaterPercent)
 	assert.False(t, th.TopUp.Enabled)
 
-	k := keeperConfig(c, um, chunk)
+	k := keeperConfig(c, um, chunk, 100)
 	assert.Equal(t, chunk, k.Denomination)
 	assert.Equal(t, uint64(70), k.TargetPoolSize)
 	assert.Equal(t, uint64(40), k.LowWaterPercent)
@@ -142,7 +142,13 @@ func TestUTXOManagementAndKeeperAgree(t *testing.T) {
 	assert.Equal(t, "reserve", k.ReserveBasket)
 	assert.Equal(t, 7*time.Second, k.Interval)
 	assert.Equal(t, "fk-test", k.Originator)
-	assert.GreaterOrEqual(t, k.ChunkFeeHeadroom, uint64(1000))
+	assert.Equal(t, max(uint64(1000), 8*chunk), k.ChunkFeeHeadroom, "FromThroughput's headroom at a low rate")
+
+	// At a high rate, twice the fan-out fee wins: 25 P2PKH outputs are
+	// 10 + 148 + 25 × 34 + 34 = 1042 bytes.
+	assert.Equal(t, 1042, fanoutSizeBytes(25))
+	k = keeperConfig(c, um, chunk, 1_000_000)
+	assert.Equal(t, 2*uint64(1_042_000), k.ChunkFeeHeadroom)
 }
 
 func TestUTXOManagementRejectsDenominationBelowInputFee(t *testing.T) {

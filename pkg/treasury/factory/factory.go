@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-wallet-toolbox/pkg/defs"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/treasury"
@@ -50,8 +51,37 @@ func Default() Config {
 	}
 }
 
-// Validate checks the config against the pools the treasury funds.
+// ApplyDefaults fills an empty treasury.toolbox.arcade_url and
+// chaintracks_url from the toolbox's network defaults
+// (defs.DefaultServicesConfig, defs/services.go:126), for the networks that
+// have public endpoints: main uses defs.ArcadeURL (defs/arcade.go:12), ttn
+// defs.ArcadeTTNURL (defs/arcade.go:16), and chaintracks is the arcade host's
+// /chaintracks (defs/network_endpoints.go:48-69, defs/networkconfig.go:65).
+// test and tstn have no such default and still need both URLs. Validate
+// calls it.
+func (c *Config) ApplyDefaults() {
+	if c.Kind != KindToolbox {
+		return
+	}
+	tb := &c.Toolbox
+	switch tb.Network {
+	case string(defs.NetworkMainnet), string(defs.NetworkTTN):
+	default:
+		return
+	}
+	d := defs.DefaultServicesConfig(defs.BSVNetwork(tb.Network))
+	if tb.ArcadeURL == "" {
+		tb.ArcadeURL = d.Arcade.URL
+	}
+	if tb.ChaintracksURL == "" {
+		tb.ChaintracksURL = d.ChaintracksClient.RemoteURL
+	}
+}
+
+// Validate applies the network defaults and checks the config against the
+// pools the treasury funds.
 func (c *Config) Validate(pools []pool.Config) error {
+	c.ApplyDefaults()
 	switch c.Kind {
 	case KindMock:
 		if c.Mock.ConfirmAfter <= 0 {

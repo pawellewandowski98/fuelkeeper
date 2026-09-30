@@ -21,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/go-wallet-toolbox/pkg/wdk"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/arcadeclient"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/fuel"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/treasury"
 )
@@ -104,7 +105,7 @@ func Open(ctx context.Context, cfg Config, pools []pool.Config, log *slog.Logger
 	if err != nil {
 		return nil, err
 	}
-	kcfg := keeperConfig(cfg, um, chunkValue)
+	kcfg := keeperConfig(cfg, um, chunkValue, feeKB)
 
 	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	t := &Treasury{feeKB: feeKB, chunk: chunkValue, cancel: cancel}
@@ -207,10 +208,23 @@ func (t *Treasury) Close() error {
 	return t.closeErr
 }
 
-// Reconcile is Core.Reconcile with the report in the treasury package's
-// type, so the minter can run it without importing this package.
+// Reconcile is Core.Reconcile (blocking for the grace) with the report in
+// the treasury package's type. The minter uses the non-blocking
+// ReconcileStart/ReconcileFinish instead.
 func (t *Treasury) Reconcile(ctx context.Context, known func(context.Context, chainhash.Hash) (bool, error)) (treasury.ReconcileReport, error) {
 	rep, err := t.Core.Reconcile(ctx, known)
+	return treasury.ReconcileReport(rep), err
+}
+
+// ReconcileStart is Core.ReconcileStart in the treasury package's types.
+func (t *Treasury) ReconcileStart(ctx context.Context, known func(context.Context, chainhash.Hash) (bool, error)) ([]chainhash.Hash, treasury.ReconcileReport, error) {
+	snap, rep, err := t.Core.ReconcileStart(ctx, known)
+	return snap, treasury.ReconcileReport(rep), err
+}
+
+// ReconcileFinish is Core.ReconcileFinish in the treasury package's types.
+func (t *Treasury) ReconcileFinish(ctx context.Context, snapshot []chainhash.Hash, known func(context.Context, chainhash.Hash) (bool, error)) (treasury.ReconcileReport, error) {
+	rep, err := t.Core.ReconcileFinish(ctx, snapshot, known)
 	return treasury.ReconcileReport(rep), err
 }
 
@@ -326,14 +340,24 @@ func utxoManagement(cfg Config, chunkValue uint64, fee defs.FeeModel) (defs.UTXO
 // guarantees the keeper and the storage agree on the denomination, target,
 // water marks, fan-out shape and baskets (a mismatch disables minting). Only
 // three fields are then overridden: the interval and originator come from
-// the treasury config, and ChunkFeeHeadroom stays FromThroughput's
-// max(1000, 8 × denomination). That headroom is the per-reserve-chunk fee
-// allowance for one leaf fan-out (M chunk outputs), not
-// Chunking.HeadroomSats, which is the per-chunk allowance for one fuel
-// split; any excess returns to the wallet as change.
-func keeperConfig(cfg Config, um defs.UTXOManagement, chunkValue uint64) fuelkeeper.Config {
+// the treasury config, and ChunkFeeHeadroom, the per-reserve-chunk fee
+// allowance for one leaf fan-out (M chunk outputs; not Chunking.HeadroomSats,
+// which is the per-chunk allowance for one fuel split), is the larger of
+// FromThroughput's max(1000, 8 × denomination) and twice the fan-out's fee
+// at the resolved rate, so a high fee rate cannot starve the fan-out. Any
+// excess returns to the wallet as change.
+func keeperConfig(cfg Config, um defs.UTXOManagement, chunkValue, feeKB uint64) fuelkeeper.Config {
 	k := fuelkeeper.FromThroughput(um.Throughput, chunkValue)
 	k.Interval = cfg.Chunking.Interval
 	k.Originator = cfg.Originator
+	k.ChunkFeeHeadroom = max(k.ChunkFeeHeadroom, 2*fuel.FeeSats(fanoutSizeBytes(k.FanoutOutputsPerTx), feeKB))
 	return k
+}
+
+// fanoutSizeBytes estimates a leaf fan-out: one P2PKH input (a reserve
+// chunk), m P2PKH chunk outputs and one change output, plus the fixed
+// fields and CompactSize counts.
+func fanoutSizeBytes(m uint64) int {
+	return txFixedSize + varIntSize(1) + varIntSize(m+1) + fuel.P2PKHInputSize +
+		int(m)*p2pkhOutputSize + changeOutputSize //nolint:gosec // m is a small config value
 }

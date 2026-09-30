@@ -206,6 +206,9 @@ type serveHooks struct {
 	// call, or fails outright) without needing a config-level knob for
 	// something that is purely a test seam.
 	newStore func(ctx context.Context, cfg factory.Config, now func() time.Time) (store.Store, error)
+	// onTreasuryClosed, if non-nil, is called once the treasury has been
+	// closed; tests use it to check the teardown order.
+	onTreasuryClosed func()
 }
 
 // runServe loads cfgPath and runs the service until ctx is cancelled or the
@@ -270,6 +273,9 @@ func runServeConfig(ctx context.Context, cfg *config.Config, hooks serveHooks) e
 	// return before that teardown is registered (a store-open failure).
 	closeTreasury := sync.OnceFunc(func() {
 		ot.confirmer.Stop()
+		if hooks.onTreasuryClosed != nil {
+			defer hooks.onTreasuryClosed()
+		}
 		if cerr := ot.Closer.Close(); cerr != nil {
 			log.Error("treasury close failed", "err", cerr)
 			return

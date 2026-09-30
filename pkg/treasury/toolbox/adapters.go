@@ -74,9 +74,11 @@ func serviceErrors(res wdk.PostFromBeefResult) string {
 	return " (" + strings.Join(parts, "; ") + ")"
 }
 
-// nonceMinBytes is go-sdk's minimum decoded nonce length: 16 bytes of data
-// plus a non-empty HMAC (auth/utils/verify_nonce.go:28).
-const nonceMinBytes = 17
+// nonceBytes is the decoded length of a go-sdk nonce: 16 random bytes and a
+// 32-byte HMAC (auth/utils/create_nonce.go:15-45). go-sdk's VerifyNonce
+// copies the tail into a 32-byte array, so a longer string with extra bytes
+// appended would still verify; only the exact length is accepted.
+const nonceBytes = 16 + 32
 
 // nonces issues and checks BRC-29 derivation prefixes with go-sdk's HMAC
 // nonces (auth/utils/create_nonce.go:15, verify_nonce.go:14), keyed to the
@@ -112,10 +114,11 @@ func (n nonces) Verify(ctx context.Context, nonce string) (bool, error) {
 	return ok, nil
 }
 
-// wellFormedNonce reports whether nonce decodes to at least nonceMinBytes.
+// wellFormedNonce reports whether nonce is standard base64 of exactly
+// nonceBytes bytes.
 func wellFormedNonce(nonce string) bool {
 	raw, err := base64.StdEncoding.DecodeString(nonce)
-	return err == nil && len(raw) >= nonceMinBytes
+	return err == nil && len(raw) == nonceBytes
 }
 
 // runOncer is the toolbox chunk keeper (pkg/wallet/fuelkeeper/keeper.go:287

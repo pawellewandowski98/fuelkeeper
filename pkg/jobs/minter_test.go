@@ -3,7 +3,10 @@ package jobs_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -337,31 +340,65 @@ func TestMinterPutShardFailureIsolatedPerPool(t *testing.T) {
 // ChunkEnsurer capabilities.
 type reconcilingTreasury struct {
 	*mock.Treasury
-	reconciles   int
-	reconcileErr error
-	report       treasury.ReconcileReport
+	mu           sync.Mutex
+	grace        time.Duration
+	snapshot     []chainhash.Hash // what ReconcileStart returns
+	starts       int
+	startErr     error
+	finishes     [][]chainhash.Hash // the snapshots ReconcileFinish got
+	finishErr    error
+	finishReport treasury.ReconcileReport
 	known        func(context.Context, chainhash.Hash) (bool, error)
 	ensures      int
 	ensureErr    error
+	buildErr     error
 	buildDL      time.Duration // remaining time on Build's ctx deadline
 }
 
-func (r *reconcilingTreasury) Reconcile(_ context.Context, known func(context.Context, chainhash.Hash) (bool, error)) (treasury.ReconcileReport, error) {
-	r.reconciles++
+func (r *reconcilingTreasury) ReconcileGrace() time.Duration { return r.grace }
+
+func (r *reconcilingTreasury) ReconcileStart(_ context.Context, known func(context.Context, chainhash.Hash) (bool, error)) ([]chainhash.Hash, treasury.ReconcileReport, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.starts++
 	r.known = known
-	return r.report, r.reconcileErr
+	if r.startErr != nil {
+		return nil, treasury.ReconcileReport{}, r.startErr
+	}
+	return r.snapshot, treasury.ReconcileReport{}, nil
+}
+
+func (r *reconcilingTreasury) ReconcileFinish(_ context.Context, snap []chainhash.Hash, _ func(context.Context, chainhash.Hash) (bool, error)) (treasury.ReconcileReport, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.finishes = append(r.finishes, snap)
+	return r.finishReport, r.finishErr
 }
 
 func (r *reconcilingTreasury) EnsureChunks(context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.ensures++
 	return r.ensureErr
 }
 
 func (r *reconcilingTreasury) Build(ctx context.Context, req treasury.MintRequest) (*treasury.BuiltShard, error) {
+	r.mu.Lock()
 	if dl, ok := ctx.Deadline(); ok {
 		r.buildDL = time.Until(dl)
 	}
+	err := r.buildErr
+	r.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	return r.Treasury.Build(ctx, req)
+}
+
+func (r *reconcilingTreasury) counts() (starts, finishes, ensures int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.starts, len(r.finishes), r.ensures
 }
 
 var (
@@ -369,61 +406,146 @@ var (
 	_ treasury.ChunkEnsurer = (*reconcilingTreasury)(nil)
 )
 
-func reconcileSetup(t *testing.T) (*jobs.Minter, *reconcilingTreasury, *storetest.Clock, jobs.MinterConfig) {
-	t.Helper()
-	clk := storetest.NewClock(storetest.Start)
-	st := memory.New(memory.WithClock(clk.Now))
-	tr := &reconcilingTreasury{Treasury: mock.New()}
-	pc := pool.DefaultPoolConfig("main", 50)
-	pc.SplitSize = 10
-	pc.TargetAvailable = 10
-	pc.LowWater = 0
-	cfg := jobs.DefaultMinterConfig()
-	return newMinter(t, st, tr, []pool.Config{pc}, cfg, clk), tr, clk, cfg
+// putFailStore fails PutShard while fail is set.
+type putFailStore struct {
+	store.Store
+	fail bool
 }
 
-func TestMinterReconcilesOnFirstRoundOfEachLease(t *testing.T) {
+func (s *putFailStore) PutShard(ctx context.Context, sh store.Shard, rows []store.Row) error {
+	if s.fail {
+		return errors.New("disk full")
+	}
+	return s.Store.PutShard(ctx, sh, rows)
+}
+
+// reconcileSetup returns a minter over a pool with a large deficit (one
+// split per round) and a reconciling treasury with a one-minute grace.
+func reconcileSetup(t *testing.T) (*jobs.Minter, *reconcilingTreasury, *putFailStore, *storetest.Clock, jobs.MinterConfig) {
+	t.Helper()
+	clk := storetest.NewClock(storetest.Start)
+	st := &putFailStore{Store: memory.New(memory.WithClock(clk.Now))}
+	tr := &reconcilingTreasury{Treasury: mock.New(), grace: time.Minute}
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.SplitSize = 10
+	pc.TargetAvailable = 1000
+	pc.LowWater = 0
+	cfg := jobs.DefaultMinterConfig()
+	cfg.MaxPerRound = 1
+	return newMinter(t, st, tr, []pool.Config{pc}, cfg, clk), tr, st, clk, cfg
+}
+
+func TestMinterReconcileIsTwoPhaseAndNeverWaits(t *testing.T) {
 	ctx := context.Background()
-	m, tr, clk, cfg := reconcileSetup(t)
+	m, tr, _, clk, cfg := reconcileSetup(t)
+	tr.snapshot = []chainhash.Hash{{7}}
 
 	require.NoError(t, m.RunOnce(ctx))
-	assert.Equal(t, 1, tr.reconciles, "first round of the process reconciles")
-	assert.Equal(t, 1, tr.ensures)
+	starts, finishes, ensures := tr.counts()
+	assert.Equal(t, []int{1, 0, 1}, []int{starts, finishes, ensures}, "first round of the process takes a snapshot")
 	assert.Equal(t, 1, tr.Built(), "the round still mints")
+
+	clk.Advance(cfg.Interval) // 30s after the snapshot: not due
+	require.NoError(t, m.RunOnce(ctx))
+	starts, finishes, ensures = tr.counts()
+	assert.Equal(t, []int{1, 0, 2}, []int{starts, finishes, ensures}, "nothing waits for the grace")
+
+	clk.Advance(cfg.Interval) // 60s: due
+	require.NoError(t, m.RunOnce(ctx))
+	starts, finishes, _ = tr.counts()
+	assert.Equal(t, []int{1, 1}, []int{starts, finishes})
+	assert.Equal(t, [][]chainhash.Hash{{{7}}}, tr.finishes, "the finish gets the snapshot")
 
 	clk.Advance(cfg.Interval)
 	require.NoError(t, m.RunOnce(ctx))
-	assert.Equal(t, 1, tr.reconciles, "consecutive rounds of one lease do not reconcile again")
-	assert.Equal(t, 2, tr.ensures, "EnsureChunks runs every round")
+	starts, finishes, _ = tr.counts()
+	assert.Equal(t, []int{1, 1}, []int{starts, finishes}, "a finished reconcile is not repeated within the lease")
 
 	clk.Advance(3 * cfg.Interval) // ticks missed: the lease was held elsewhere
 	require.NoError(t, m.RunOnce(ctx))
-	assert.Equal(t, 2, tr.reconciles, "a re-acquired lease reconciles again")
-	assert.Equal(t, 3, tr.ensures)
+	starts, _, _ = tr.counts()
+	assert.Equal(t, 2, starts, "a re-acquired lease takes a new snapshot")
 }
 
-func TestMinterRetriesFailedReconcileAndKeepsMinting(t *testing.T) {
+func TestMinterReconcileEmptySnapshotNeedsNoFinish(t *testing.T) {
 	ctx := context.Background()
-	m, tr, clk, cfg := reconcileSetup(t)
-	tr.reconcileErr = errors.New("wallet down")
+	m, tr, _, clk, cfg := reconcileSetup(t)
+	for range 4 {
+		require.NoError(t, m.RunOnce(ctx))
+		clk.Advance(cfg.Interval)
+	}
+	starts, finishes, _ := tr.counts()
+	assert.Equal(t, []int{1, 0}, []int{starts, finishes})
+}
+
+func TestMinterReconcileRetriesAndKeepsMinting(t *testing.T) {
+	ctx := context.Background()
+	m, tr, _, clk, cfg := reconcileSetup(t)
+	tr.startErr = errors.New("wallet down")
 	tr.ensureErr = errors.New("no reserve")
+	tr.snapshot = []chainhash.Hash{{1}}
 
 	require.NoError(t, m.RunOnce(ctx))
-	assert.Equal(t, 1, tr.reconciles)
 	assert.Equal(t, 1, tr.Built(), "neither failure stops minting")
 
 	clk.Advance(cfg.Interval)
-	tr.reconcileErr = nil
-	tr.report = treasury.ReconcileReport{
-		Aborted: []chainhash.Hash{{1}},
-		Errors:  map[chainhash.Hash]error{{2}: errors.New("x")},
-	}
+	tr.startErr = nil
 	require.NoError(t, m.RunOnce(ctx))
-	assert.Equal(t, 2, tr.reconciles, "a failed reconcile is retried next round")
+	starts, _, _ := tr.counts()
+	assert.Equal(t, 2, starts, "a failed snapshot is retried next round")
 
+	clk.Advance(2 * cfg.Interval) // due
+	tr.finishErr = errors.New("wallet down")
+	require.NoError(t, m.RunOnce(ctx))
+	clk.Advance(cfg.Interval)
+	tr.finishErr = nil
+	tr.finishReport = treasury.ReconcileReport{Deferred: []chainhash.Hash{{2}}}
+	require.NoError(t, m.RunOnce(ctx))
+	starts, _, _ = tr.counts()
+	assert.Equal(t, [][]chainhash.Hash{{{1}}, {{1}}}, tr.finishes, "a failed finish keeps its snapshot")
+	assert.Equal(t, 3, starts, "a finish that deferred a split takes a new snapshot in the same round")
+}
+
+func TestMinterReconcilesAfterRecordFailure(t *testing.T) {
+	ctx := context.Background()
+	m, tr, st, clk, cfg := reconcileSetup(t)
+	require.NoError(t, m.RunOnce(ctx))
 	clk.Advance(cfg.Interval)
 	require.NoError(t, m.RunOnce(ctx))
-	assert.Equal(t, 2, tr.reconciles, "a completed reconcile (even with per-split errors) is not repeated")
+	starts, _, _ := tr.counts()
+	require.Equal(t, 1, starts)
+
+	st.fail = true
+	clk.Advance(cfg.Interval)
+	require.Error(t, m.RunOnce(ctx), "PutShard failed after a successful Build")
+	st.fail = false
+	clk.Advance(cfg.Interval)
+	require.NoError(t, m.RunOnce(ctx))
+	starts, _, _ = tr.counts()
+	assert.Equal(t, 2, starts, "a split left unrecorded is reconciled without waiting for a new lease")
+}
+
+func TestMinterReconcilesAfterBuildDeadline(t *testing.T) {
+	ctx := context.Background()
+	m, tr, _, clk, cfg := reconcileSetup(t)
+	require.NoError(t, m.RunOnce(ctx))
+
+	tr.buildErr = errors.New("treasury: create split: boom") // not a deadline
+	clk.Advance(cfg.Interval)
+	require.Error(t, m.RunOnce(ctx))
+	clk.Advance(cfg.Interval)
+	require.Error(t, m.RunOnce(ctx))
+	starts, _, _ := tr.counts()
+	assert.Equal(t, 1, starts, "an ordinary build failure leaves nothing unrecorded")
+
+	tr.buildErr = fmt.Errorf("treasury: create split: %w", context.DeadlineExceeded)
+	clk.Advance(cfg.Interval)
+	require.Error(t, m.RunOnce(ctx))
+	tr.buildErr = nil
+	clk.Advance(cfg.Interval)
+	require.NoError(t, m.RunOnce(ctx))
+	starts, _, _ = tr.counts()
+	assert.Equal(t, 2, starts, "a timed-out Build may have left a split behind: reconcile")
 }
 
 // getShardFailStore fails GetShard for one pool.
@@ -449,7 +571,7 @@ func TestMinterReconcileKnownConsultsEveryPool(t *testing.T) {
 	a.SplitSize, a.TargetAvailable, a.LowWater = 10, 10, 0
 	b := pool.DefaultPoolConfig("b", 50)
 	b.SplitSize, b.TargetAvailable, b.LowWater = 10, 10, 0
-	tr := &reconcilingTreasury{Treasury: mock.New()}
+	tr := &reconcilingTreasury{Treasury: mock.New(), grace: time.Minute}
 	m := newMinter(t, mem, tr, []pool.Config{a, b}, jobs.DefaultMinterConfig(), clk)
 	require.NoError(t, m.RunOnce(ctx))
 	require.NotNil(t, tr.known)
@@ -465,7 +587,7 @@ func TestMinterReconcileKnownConsultsEveryPool(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, ok, "ErrNotFound in every pool is unknown, not an error")
 
-	tr2 := &reconcilingTreasury{Treasury: mock.New()}
+	tr2 := &reconcilingTreasury{Treasury: mock.New(), grace: time.Minute}
 	m2 := newMinter(t, getShardFailStore{Store: mem, failPool: "b"}, tr2, []pool.Config{a, b}, jobs.DefaultMinterConfig(), clk)
 	require.NoError(t, m2.RunOnce(ctx))
 	ok, err = tr2.known(ctx, chainhash.Hash{9})
@@ -490,7 +612,7 @@ func TestMinterBoundsBuildAndPutShardByBuildTimeout(t *testing.T) {
 	ctx := context.Background()
 	clk := storetest.NewClock(storetest.Start)
 	st := &deadlineStore{Store: memory.New(memory.WithClock(clk.Now))}
-	tr := &reconcilingTreasury{Treasury: mock.New()}
+	tr := &reconcilingTreasury{Treasury: mock.New(), grace: time.Minute}
 	pc := pool.DefaultPoolConfig("main", 50)
 	pc.SplitSize, pc.TargetAvailable, pc.LowWater = 10, 10, 0
 	cfg := jobs.DefaultMinterConfig()
@@ -506,4 +628,73 @@ func TestMinterBoundsBuildAndPutShardByBuildTimeout(t *testing.T) {
 	bad.BuildTimeout = 0
 	require.ErrorContains(t, bad.Validate(), "build_timeout")
 	assert.Equal(t, time.Minute, jobs.DefaultMinterConfig().BuildTimeout)
+}
+
+// roundCounter wraps a job and tracks how many rounds, across every
+// instance sharing it, run at the same moment.
+type roundCounter struct {
+	jobs.Job
+	active, maxActive *atomic.Int32
+	rounds            *atomic.Int32
+}
+
+func (r roundCounter) RunOnce(ctx context.Context) error {
+	n := r.active.Add(1)
+	defer r.active.Add(-1)
+	for {
+		m := r.maxActive.Load()
+		if n <= m || r.maxActive.CompareAndSwap(m, n) {
+			break
+		}
+	}
+	r.rounds.Add(1)
+	return r.Job.RunOnce(ctx)
+}
+
+// TestTwoRunnersNeverOverlapDuringReconcile runs two instances' runners on
+// one lease store. The reconcile grace (400ms) exceeds the lease TTL
+// (300ms): a minter that waited out the grace inside a round would lose the
+// lease mid-round and let the other instance mint concurrently. With the
+// two-phase reconcile no round ever overlaps another, and the snapshot is
+// still finished after its grace.
+func TestTwoRunnersNeverOverlapDuringReconcile(t *testing.T) {
+	st := memory.New()
+	var active, maxActive, rounds atomic.Int32
+	cfg := jobs.DefaultMinterConfig()
+	cfg.Interval = 50 * time.Millisecond
+	pc := pool.DefaultPoolConfig("main", 50)
+	pc.SplitSize, pc.TargetAvailable, pc.LowWater = 10, 100, 0
+
+	type instance struct {
+		tr     *reconcilingTreasury
+		cancel context.CancelFunc
+		done   chan struct{}
+	}
+	start := func(holder string) instance {
+		tr := &reconcilingTreasury{Treasury: mock.New(), grace: 400 * time.Millisecond, snapshot: []chainhash.Hash{{1}}}
+		m, err := jobs.NewMinter(st, tr, []pool.Config{pc}, cfg, pool.RealClock{}, slog.New(slog.DiscardHandler))
+		require.NoError(t, err)
+		r := jobs.NewRunner(st, holder, 300*time.Millisecond, slog.New(slog.DiscardHandler))
+		require.NoError(t, r.Add(roundCounter{Job: m, active: &active, maxActive: &maxActive, rounds: &rounds}))
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { defer close(done); _ = r.Run(ctx) }()
+		return instance{tr: tr, cancel: cancel, done: done}
+	}
+	a := start("a")
+	time.Sleep(100 * time.Millisecond) // a takes the lease first
+	b := start("b")
+	time.Sleep(1100 * time.Millisecond)
+	a.cancel() // hand the lease over: b's first round takes a snapshot
+	<-a.done
+	time.Sleep(1200 * time.Millisecond)
+	b.cancel()
+	<-b.done
+
+	assert.Equal(t, int32(1), maxActive.Load(), "no two minter rounds ever ran at once")
+	assert.Greater(t, rounds.Load(), int32(10))
+	aStarts, aFinishes, _ := a.tr.counts()
+	bStarts, bFinishes, _ := b.tr.counts()
+	assert.Equal(t, []int{1, 1}, []int{aStarts, bStarts}, "one snapshot per lease: a's, then b's after the hand-over")
+	assert.Equal(t, []int{1, 1}, []int{aFinishes, bFinishes}, "each finished its snapshot a grace later, without blocking a round")
 }

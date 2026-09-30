@@ -12,7 +12,11 @@ the configuration reference is in [OPERATIONS.md](OPERATIONS.md).
 
 1. **Services** (`defs.DefaultServicesConfig(network)`) with the configured
    arcade URL (broadcast, status, SSE events) and chaintracks URL (block
-   headers for SPV), both enabled. The arcade health probe and the
+   headers for SPV), both enabled. On `main` and `ttn`, an empty
+   `arcade_url` or `chaintracks_url` takes the toolbox's public default
+   (`defs.ArcadeURL` / `defs.ArcadeTTNURL` and that host's `/chaintracks`);
+   `test` and `tstn` need both set. An `arcade` or `composite` oracle with
+   no `oracle.arcade_url` uses the treasury's. The arcade health probe and the
    chaintracks subscriptions start in the background.
 2. **Storage**: a GORM provider on sqlite or postgres, migrated under the
    name `fuelkeeper-treasury`, with the throughput UTXO strategy (below), the
@@ -24,8 +28,8 @@ the configuration reference is in [OPERATIONS.md](OPERATIONS.md).
    it fails unsigned/unprocessed actions, never a no-send split) and
    `un_fail` (10 min), plus the arcade SSE status stream and chaintracks
    reorg/tip events. The daemon holds per-task leases in the wallet
-   database, so two FuelKeeper processes sharing one postgres treasury run
-   each task once.
+   database, so FuelKeeper processes sharing one postgres treasury (see
+   "Several Instances") run each task once.
 5. **Chunk keeper** (`pkg/wallet/fuelkeeper.Keeper`), run once per minter
    round.
 
@@ -54,9 +58,11 @@ default basket (funding, change)
   surplus of a split stays below dust, so it is absorbed as fee instead of
   creating a change output.
 - `M` is `chunking.fanout_outputs_per_tx` (default 100). A reserve chunk
-  holds `M × ChunkValue` plus the keeper's leaf fan-out fee allowance,
-  `max(1000, 8 × ChunkValue)` (the toolbox's `FromThroughput` default); what
-  the fan-out fee does not use returns to the default basket as change.
+  holds `M × ChunkValue` plus the keeper's leaf fan-out fee allowance: the
+  larger of `max(1000, 8 × ChunkValue)` (the toolbox's `FromThroughput`
+  default) and twice the fee of a leaf fan-out (one input, `M` + 1 P2PKH
+  outputs) at the resolved rate. What the fan-out fee does not use returns
+  to the default basket as change.
 - The keeper refills the chunk basket to `chunking.target_chunks` (default
   50) once it drops below `low_water_percent` (default 60) of it, making up
   to 100 leaf fan-outs per round.
@@ -130,38 +136,77 @@ for one FuelKeeper process and moderate rates.
 ## Reconciliation
 
 Build creates a split as a no-send action, the minter records the shard,
-then Send asks the wallet to broadcast it. A crash in between leaves a
-no-send split in the wallet. On the first round of each minter lease (and
-at every process start), the minter runs `Reconcile`:
+then Send asks the wallet to broadcast it. A crash in between, a PutShard
+that fails or times out, or a Build cut off by its deadline, can leave a
+no-send split in the wallet that no shard records. The minter settles such
+splits in two phases, never waiting inside a round:
 
-1. List the wallet's `fuel-split` actions in status no-send.
-2. Wait `reconcile_grace` (default 2 min), then list again.
-3. For each split in the second listing, ask FuelKeeper's store whether any
-   configured pool records it:
+1. **Snapshot** (`ReconcileStart`): list the wallet's `fuel-split` actions in
+   status no-send. Each one FuelKeeper's store records (in any configured
+   pool) is sent at once; the whole listing is kept as the snapshot, with a
+   due time `reconcile_grace` (default 2 min) later.
+2. **Finish** (`ReconcileFinish`), in the first minter round that starts at
+   or after the due time: list again and look each split up afresh:
    - **resent**: recorded; handed to Send (the wallet claims and posts it).
    - **aborted**: unrecorded and present in both listings. Its puzzle seed
-     lived only in the crashed process, so it must never reach the chain;
-     the abort returns its inputs to the wallet and parks it as invalid.
-   - **deferred**: unrecorded but seen only in the second listing: possibly
-     a Build whose PutShard is still running (in this or another instance
-     during a lease hand-over). Left alone until the next reconcile.
+     lived only in the process that built it, so it must never reach the
+     chain; the abort returns its inputs to the wallet and parks it as
+     invalid.
+   - **deferred**: unrecorded but only in the second listing: possibly a
+     Build whose PutShard is still running (in this or another instance
+     during a lease hand-over). The next round takes a new snapshot.
    - **errors**: the store lookup or the send/abort failed; nothing is
-     aborted on an error.
+     aborted on an error, and the next round takes a new snapshot.
+
+A snapshot is taken on the first round of each minter lease (and at process
+start), after a `record_failed` split (PutShard failed after a successful
+Build), and after a Build that failed with a deadline, so an instance that
+keeps the lease for days still settles its own leftovers a grace later.
+When the first listing is empty there is nothing to finish.
 
 The grace only protects a split whose Build and PutShard finish within it,
 so the minter bounds that window with `jobs.minter.build_timeout` (default
-60 s), and the config requires `reconcile_grace > build_timeout`. When there
-are no no-send splits, Reconcile is one listing and returns at once; with
-some, the minter round waits the grace. A grace longer than
-`jobs.lease_ttl` can let the lease pass to another instance meanwhile, which
-is harmless (every write is a CAS and the grace covers overlapping
-minters). A failed Reconcile is logged and retried next round; minting
-continues. The minter logs the counts at Info (Warn when anything was
-aborted or failed) and the txids at Debug.
+60 s), and the config requires `reconcile_grace > build_timeout`. Each phase
+is bounded by a 10 s budget (`jobs.ReconcileBudget`), and a round runs at
+most one finish and one snapshot, so with the toolbox treasury the config
+requires `jobs.lease_ttl > build_timeout + 20 s` (90 s > 80 s by default).
+The job lease is renewed only between rounds; because no phase waits for
+the grace, a round never outlives the lease on account of reconciliation,
+and two instances never mint concurrently because of it. (A round that
+builds several splits can still take up to `max_per_round` ×
+`build_timeout` in the worst case; every store write is a CAS, so an
+overlap in that case is harmless, as it is during any lease hand-over.)
+
+A failed phase is logged and retried next round, keeping its snapshot;
+minting continues. The minter logs the counts at Info (Warn when anything
+was aborted or failed) and the txids at Debug.
 
 The minter detects a new lease by a gap of more than 1.5 × `minter.interval`
 since its previous round (the runner calls it only while it holds the
-lease); a false positive only costs one listing.
+lease). A false positive costs one extra wallet listing, and a second
+listing a grace later only if the first found no-send splits; it never
+delays a round.
+
+## Several Instances
+
+Every FuelKeeper instance that may hold the minter lease must use **the
+same treasury storage**: one postgres database in `treasury.toolbox.storage`
+(and the same root key). The minter runs on whichever instance holds the
+lease, and funding (`POST /v1/funding`) is served by whichever instance a
+request reaches; with per-instance sqlite files, a payment received by one
+instance lands in a wallet the minter on another instance never spends. The
+monitor's task leases live in that shared database, so each monitor task
+still runs once.
+
+## Using the Packages as a Library
+
+`pkg/treasury/toolbox`, `pkg/treasury/factory` and `pkg/config` link
+go-wallet-toolbox's services, which pull in go-libp2p. A module importing
+them must copy the three `replace` lines at the end of FuelKeeper's
+`go.mod` (go-libp2p, quic-go/webtransport-go and quic-go, as
+go-wallet-toolbox v0.184.16's own `go.mod` asks of its consumers); Go
+ignores `replace` directives of dependencies, and without them the build
+fails in go-libp2p's webtransport transport.
 
 ## Teratestnet Smoke
 

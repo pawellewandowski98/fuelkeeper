@@ -328,10 +328,16 @@ func (c *Config) Validate() error {
 		}
 		seen[p.Name] = true
 	}
-	if err := c.Oracle.Validate(); err != nil {
+	if err := c.Treasury.Validate(c.Pools); err != nil { // fills the toolbox's network default URLs
 		return fmt.Errorf("config: %w", err)
 	}
-	if err := c.Treasury.Validate(c.Pools); err != nil {
+	// An arcade-backed oracle with no URL of its own uses the toolbox
+	// treasury's arcade (after its network default).
+	if (c.Oracle.Kind == ofactory.KindArcade || c.Oracle.Kind == ofactory.KindComposite) &&
+		c.Oracle.ArcadeURL == "" && c.Treasury.Kind == tfactory.KindToolbox {
+		c.Oracle.ArcadeURL = c.Treasury.Toolbox.ArcadeURL
+	}
+	if err := c.Oracle.Validate(); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
 	if c.Treasury.Kind == tfactory.KindToolbox && c.Treasury.Toolbox.ReconcileGrace <= c.Jobs.Minter.BuildTimeout {
@@ -340,6 +346,15 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: treasury.toolbox.reconcile_grace (%s) must exceed jobs.minter.build_timeout (%s), "+
 			"or a slow Build+PutShard could be aborted by Reconcile as unrecorded",
 			c.Treasury.Toolbox.ReconcileGrace, c.Jobs.Minter.BuildTimeout)
+	}
+	if c.Treasury.Kind == tfactory.KindToolbox && c.Jobs.Enabled {
+		// A minter round runs one Build+PutShard per split and at most one
+		// finish and one start of a reconcile; the lease is renewed only
+		// between rounds, so it must outlast that.
+		if round := c.Jobs.Minter.BuildTimeout + 2*jobs.ReconcileBudget; c.Jobs.LeaseTTL <= round {
+			return fmt.Errorf("config: jobs.lease_ttl (%s) must exceed jobs.minter.build_timeout + 2 × %s reconcile budget (%s) with the toolbox treasury",
+				c.Jobs.LeaseTTL, jobs.ReconcileBudget, round)
+		}
 	}
 	if c.Jobs.Enabled {
 		if err := c.Jobs.Reaper.Validate(); err != nil {

@@ -10,7 +10,8 @@ Status: Plan 3 complete: HTTP API, Go client and `serve` command. Pool core
 (group-commit) reservations, and background jobs (reaper, proof watcher,
 minter) behind leased runners. This branch (`feat/treasury`) adds the
 go-wallet-toolbox treasury and BRC-29 funding: see `docs/TREASURY.md` and
-`docs/FUNDING.md`. Design:
+`docs/FUNDING.md` (a module importing `pkg/config` or `pkg/treasury/...`
+must copy the three `replace` lines from this `go.mod`). Design:
 `docs/superpowers/specs/2026-09-29-fuelkeeper-design.md`.
 
 ## Develop
