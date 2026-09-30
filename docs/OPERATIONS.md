@@ -329,7 +329,7 @@ Which backends that's safe for is a property of the backend, captured by
 ### Single-Process (memory, SQLite or Pebble)
 
 - One process per database/directory
-- SQLite uses a write lock; a second writer waits for `busy_timeout` (5s)
+- SQLite serializes writes through one in-process writer (group-committed, see [Durability and Consistency](#durability-and-consistency)); `busy_timeout` (5s) only matters against another process holding the file's lock
 - Pebble locks its directory for exclusive access; a second process opening
   the same `pebble.path` fails at store-open time rather than corrupting data
 - Memory backend: all state lost on restart; for development and testing only
@@ -448,8 +448,8 @@ make bench-cluster-down                   # stop and remove volumes
 **Correctness guarantee G1** (no fuel output is ever handed to two live reservations) depends on durability:
 
 - **Postgres**: Enable `synchronous_commit` (not `off`). On, local, remote_write, or remote_apply all provide durable commits.
-- **SQLite**: Default `synchronous=FULL` fsyncs every commit. Opt-in `sync: NORMAL` trades durability for speed (on power loss, may forget the last reservation).
-- **Pebble**: `no_sync: false` (the default) fsyncs every write batch, which G1 depends on; only set `no_sync: true` for throwaway stores such as tests, never in production.
+- **SQLite**: Default `synchronous=FULL` fsyncs every commit. Opt-in `sync: NORMAL` trades durability for speed (on power loss, may forget the last reservation). Writes are group-committed: the single writer runs every write queued while its previous commit was in flight in one transaction (each in its own savepoint, so each is still all-or-nothing on its own) and commits once, so concurrent writers share one WAL fsync; no write is acknowledged before that commit returns, so `FULL` keeps exactly its per-write durability. Throughput is therefore set by fsync latency times group size rather than by fsync latency alone (a 15 ms fsync used to cap every durable write, and so every `/spend` or `/release`, at ≈65/s).
+- **Pebble**: `no_sync: false` (the default) fsyncs every write batch, which G1 depends on; only set `no_sync: true` for throwaway stores such as tests, never in production. A batch is applied under the store's lock and its WAL fsync is awaited outside it, so concurrent calls' fsyncs coalesce in Pebble's WAL writer; a call returns only once its own batch and every batch applied before it are durable, and a read waits the same way for any batch it may have observed, so no result is ever based on a write a crash could revert.
 - **MongoDB**: Every write uses write concern `{w: "majority", j: true}` (journaled, not operator-configurable), so an acknowledged write is durable and every subsequent read (primary read preference) observes it.
 - **Aerospike**: Production requires a strong-consistency namespace (see [Deployment Topologies](#deployment-topologies)); within that, `commit-to-device true` covers a simultaneous crash of every replica of a partition, and `replication-factor >= 2` covers a single node's loss. `allow_availability_mode` trades this guarantee away and is for CE dev/test servers only.
 

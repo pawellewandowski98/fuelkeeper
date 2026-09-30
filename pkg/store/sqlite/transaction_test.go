@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -32,7 +33,7 @@ func TestWrite_FnCancelsContextThenSubsequentWriteSucceeds(t *testing.T) {
 	defer func() { _ = s.Close() }()
 
 	cctx, cancel := context.WithCancel(ctx)
-	writeErr := s.write(cctx, func(c querier) error {
+	writeErr := s.write(cctx, func(_ context.Context, c querier) error {
 		if _, execErr := c.ExecContext(cctx, `INSERT INTO fuel_leases (name, holder, expires_at) VALUES ('poison-probe', 'h', 1)`); execErr != nil {
 			return execErr
 		}
@@ -44,7 +45,7 @@ func TestWrite_FnCancelsContextThenSubsequentWriteSucceeds(t *testing.T) {
 	// The critical assertion: an entirely unrelated, freshly-contexted write
 	// must still succeed. Under the old bug this failed with SQLite's
 	// non-transient "cannot start a transaction within a transaction".
-	err = s.write(context.Background(), func(c querier) error {
+	err = s.write(context.Background(), func(_ context.Context, c querier) error {
 		_, execErr := c.ExecContext(context.Background(), `INSERT INTO fuel_leases (name, holder, expires_at) VALUES ('after', 'h', 1)`)
 		return execErr
 	})
@@ -129,4 +130,110 @@ func TestReserve_TightDeadlinesNeverApplyPartially(t *testing.T) {
 	applied, err := s.Reserve(context.Background(), "main", storetest.ReserveOps(freshRows, store.NewToken(), time.Now().Add(time.Hour)))
 	require.NoError(t, err)
 	require.Len(t, applied, 10)
+}
+
+// blockWriter queues a write whose fn holds writeLoop until the returned
+// release func is called, so the test can queue more writes behind it; the
+// returned channel yields the blocker's own result.
+func blockWriter(t *testing.T, s *Store) (release func(), result <-chan error) {
+	t.Helper()
+	entered, hold := make(chan struct{}), make(chan struct{})
+	res := make(chan error, 1)
+	go func() {
+		res <- s.write(context.Background(), func(ctx context.Context, c querier) error {
+			close(entered)
+			<-hold
+			_, err := c.ExecContext(ctx, `INSERT INTO fuel_leases (name, holder, expires_at) VALUES ('blocker', 'h', 1)`)
+			return err
+		})
+	}()
+	<-entered
+	return func() { close(hold) }, res
+}
+
+func countLeases(t *testing.T, s *Store, like string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, s.reader.QueryRowContext(context.Background(), `SELECT count(*) FROM fuel_leases WHERE name LIKE ?`, like).Scan(&n))
+	return n
+}
+
+// TestWrite_GroupCommitIsolatesFailures pins the group commit: writes queued
+// while another is in flight share one transaction (one COMMIT, so one WAL
+// fsync), yet each stays atomic on its own -- a failing fn's SAVEPOINT is
+// rolled back without disturbing the writes grouped with it.
+func TestWrite_GroupCommitIsolatesFailures(t *testing.T) {
+	s, err := Open(context.Background(), Config{Path: filepath.Join(t.TempDir(), "group.sqlite")})
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	release, blockerRes := blockWriter(t, s)
+	const n = 20
+	errBoom := errors.New("boom")
+	type result struct {
+		i   int
+		err error
+	}
+	results := make(chan result, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			err := s.write(context.Background(), func(ctx context.Context, c querier) error {
+				if _, err := c.ExecContext(ctx, `INSERT INTO fuel_leases (name, holder, expires_at) VALUES (?, 'h', 1)`, fmt.Sprintf("g-%02d", i)); err != nil {
+					return err
+				}
+				if i%2 == 1 {
+					return errBoom // after its insert: the insert must be undone
+				}
+				return nil
+			})
+			results <- result{i, err}
+		}()
+	}
+	// Let every writer reach the queue behind the blocker before releasing it
+	// (if one is late it simply lands in a later group; the outcome
+	// assertions below hold either way, only the group count would differ).
+	time.Sleep(100 * time.Millisecond)
+	before := s.commits.Load()
+	release()
+	require.NoError(t, <-blockerRes)
+	for k := 0; k < n; k++ {
+		r := <-results
+		if r.i%2 == 1 {
+			require.ErrorIs(t, r.err, errBoom, "write %d", r.i)
+		} else {
+			require.NoError(t, r.err, "write %d", r.i)
+		}
+	}
+	assert.Equal(t, 1, countLeases(t, s, "blocker"))
+	assert.Equal(t, n/2, countLeases(t, s, "g-%"), "only the even (succeeding) writes may be committed")
+	for i := 1; i < n; i += 2 {
+		assert.Zero(t, countLeases(t, s, fmt.Sprintf("g-%02d", i)), "failed write %d must be rolled back", i)
+	}
+	assert.LessOrEqual(t, s.commits.Load()-before, uint64(2),
+		"%d writes queued behind one in flight must share a group commit (blocker's own + at most one more), not commit one by one", n)
+}
+
+// TestWrite_CancelledWhileQueuedIsNotApplied pins the cancellation rule: a
+// write whose context ends before writeLoop claims it returns the context
+// error and is never run.
+func TestWrite_CancelledWhileQueuedIsNotApplied(t *testing.T) {
+	s, err := Open(context.Background(), Config{Path: filepath.Join(t.TempDir(), "cancel-queued.sqlite")})
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	release, blockerRes := blockWriter(t, s)
+	cctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	werr := s.write(cctx, func(ctx context.Context, c querier) error {
+		_, err := c.ExecContext(ctx, `INSERT INTO fuel_leases (name, holder, expires_at) VALUES ('queued', 'h', 1)`)
+		return err
+	})
+	require.ErrorIs(t, werr, context.DeadlineExceeded)
+	release()
+	require.NoError(t, <-blockerRes)
+	assert.Zero(t, countLeases(t, s, "queued"), "a write cancelled while queued must never run")
+
+	// After Close, a write fails instead of blocking forever.
+	require.NoError(t, s.Close())
+	require.ErrorIs(t, s.write(context.Background(), func(context.Context, querier) error { return nil }), errClosed)
 }

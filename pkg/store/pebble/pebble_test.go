@@ -22,6 +22,18 @@ func TestConformance(t *testing.T) {
 	})
 }
 
+// TestConformanceDurable runs the suite with durable (fsync'd) writes, the
+// production default: commit then applies each batch with ApplyNoSyncWait
+// under s.mu and waits for its WAL sync with s.mu released, a path the
+// NoSync suite above never takes.
+func TestConformanceDurable(t *testing.T) {
+	storetest.RunSuite(t, func(t *testing.T, now func() time.Time) store.Store {
+		s, err := pebblestore.Open(context.Background(), pebblestore.Config{Path: t.TempDir()}, pebblestore.WithClock(now))
+		require.NoError(t, err)
+		return s
+	})
+}
+
 func TestReopenKeepsState(t *testing.T) {
 	dir := t.TempDir()
 	clk := storetest.NewClock(storetest.Start)

@@ -18,8 +18,8 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 	if err := store.ValidatePutShard(shard, rows); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return errClosed
 	}
@@ -78,7 +78,7 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 	if err := s.applyCounters(b, deltas); err != nil {
 		return err
 	}
-	return s.commit(b)
+	return g.commit(b)
 }
 
 // GetShard implements store.Store.
@@ -89,8 +89,8 @@ func (s *Store) GetShard(ctx context.Context, pool string, txid chainhash.Hash) 
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -115,8 +115,8 @@ func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Has
 	if err := store.ValidateUpdateStatus(status); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return errClosed
 	}
@@ -148,7 +148,7 @@ func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Has
 	if err := s.applyCounters(b, deltas); err != nil {
 		return err
 	}
-	return s.commit(b)
+	return g.commit(b)
 }
 
 // RetireShard implements store.Store.
@@ -159,8 +159,8 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 	if err := store.ValidatePool(pool); err != nil {
 		return 0, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return 0, errClosed
 	}
@@ -224,7 +224,7 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 	if err := s.applyCounters(b, deltas); err != nil {
 		return 0, err
 	}
-	if err := s.commit(b); err != nil {
+	if err := g.commit(b); err != nil {
 		return 0, err
 	}
 	return n, nil
@@ -254,8 +254,8 @@ func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, unti
 		skip[h] = true
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -297,7 +297,7 @@ func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, unti
 	next.Owner = holder
 	next.LeaseUntil = until
 	next.UpdatedAt = s.now().Truncate(time.Microsecond)
-	if err := s.writeShardOnly(&next); err != nil {
+	if err := s.writeShardOnly(g, &next); err != nil {
 		return nil, err
 	}
 	return &next, nil
@@ -317,8 +317,8 @@ func (s *Store) RenewShard(ctx context.Context, pool string, txid chainhash.Hash
 	if err := store.ValidateRenewUntil(until); err != nil {
 		return store.ShardHead{}, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return store.ShardHead{}, errClosed
 	}
@@ -334,7 +334,7 @@ func (s *Store) RenewShard(ctx context.Context, pool string, txid chainhash.Hash
 	}
 	next := *sh
 	next.LeaseUntil = until.Truncate(time.Microsecond)
-	if err := s.writeShardOnly(&next); err != nil {
+	if err := s.writeShardOnly(g, &next); err != nil {
 		return store.ShardHead{}, err
 	}
 	return store.ShardHead{Status: next.Status, Version: next.Version}, nil
@@ -351,8 +351,8 @@ func (s *Store) ReleaseShard(ctx context.Context, pool string, txid chainhash.Ha
 	if err := store.ValidateHolder(holder); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return errClosed
 	}
@@ -369,7 +369,7 @@ func (s *Store) ReleaseShard(ctx context.Context, pool string, txid chainhash.Ha
 	next := *sh
 	next.Owner, next.LeaseUntil = "", time.Time{}
 	next.UpdatedAt = s.now().Truncate(time.Microsecond)
-	return s.writeShardOnly(&next)
+	return s.writeShardOnly(g, &next)
 }
 
 // ListShards implements store.Store.
@@ -383,8 +383,8 @@ func (s *Store) ListShards(ctx context.Context, pool string, f store.ShardFilter
 	if err := store.ValidateListShardsFilter(f); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return nil, errClosed
 	}

@@ -31,8 +31,8 @@ func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl 
 	if err := store.ValidateLease(name, holder, ttl); err != nil {
 		return time.Time{}, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return time.Time{}, errClosed
 	}
@@ -46,8 +46,13 @@ func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl 
 	}
 	exp := now.Add(ttl).Truncate(time.Microsecond)
 	next := leaseDoc{Holder: []byte(holder), Expires: us(exp)}
-	if err := s.db.Set(leaseKey(name), encodeLease(&next), s.wo); err != nil {
+	b := s.db.NewBatch()
+	defer func() { _ = b.Close() }()
+	if err := b.Set(leaseKey(name), encodeLease(&next), nil); err != nil {
 		return time.Time{}, wrapErr(err)
+	}
+	if err := g.commit(b); err != nil {
+		return time.Time{}, err
 	}
 	return exp, nil
 }
@@ -63,8 +68,8 @@ func (s *Store) ReleaseLease(ctx context.Context, name, holder string) error {
 	if err := store.ValidateHolder(holder); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return errClosed
 	}
@@ -75,8 +80,10 @@ func (s *Store) ReleaseLease(ctx context.Context, name, holder string) error {
 	if cur == nil || string(cur.Holder) != holder {
 		return nil
 	}
-	if err := s.db.Delete(leaseKey(name), s.wo); err != nil {
+	b := s.db.NewBatch()
+	defer func() { _ = b.Close() }()
+	if err := b.Delete(leaseKey(name), nil); err != nil {
 		return wrapErr(err)
 	}
-	return nil
+	return g.commit(b)
 }

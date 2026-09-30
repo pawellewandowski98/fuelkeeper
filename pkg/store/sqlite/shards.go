@@ -63,7 +63,7 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 		return err
 	}
 	now := s.now().UnixMicro()
-	return s.write(ctx, func(c querier) error {
+	return s.write(ctx, func(ctx context.Context, c querier) error {
 		var pool string
 		var size, mode int
 		var denom int64
@@ -123,7 +123,7 @@ func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Has
 		return err
 	}
 	now := s.now().UnixMicro()
-	return s.write(ctx, func(c querier) error {
+	return s.write(ctx, func(ctx context.Context, c querier) error {
 		var cur int
 		err := c.QueryRowContext(ctx, `SELECT status FROM fuel_shards WHERE pool=? AND txid=?`, pool, txid[:]).Scan(&cur)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -151,7 +151,7 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 	}
 	now := s.now().UnixMicro()
 	n := 0
-	err := s.write(ctx, func(c querier) error {
+	err := s.write(ctx, func(ctx context.Context, c querier) error {
 		// status <> 3 keeps a second retire from bumping the version; the row
 		// cascade below still runs (and, being idempotent, changes nothing further)
 		// so the call as a whole stays idempotent.
@@ -285,7 +285,7 @@ func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, unti
 	}
 	q := acquireShardSQL(len(statuses), len(exclude))
 	var out *store.Shard
-	err := s.write(ctx, func(c querier) error {
+	err := s.write(ctx, func(ctx context.Context, c querier) error {
 		sh, err := scanShard(c.QueryRowContext(ctx, q, args...), true)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil // nothing adoptable
@@ -314,7 +314,7 @@ func (s *Store) RenewShard(ctx context.Context, pool string, txid chainhash.Hash
 		return store.ShardHead{}, err
 	}
 	var head store.ShardHead
-	err := s.write(ctx, func(c querier) error {
+	err := s.write(ctx, func(ctx context.Context, c querier) error {
 		var stat int
 		var version int64
 		err := c.QueryRowContext(ctx, `
@@ -355,7 +355,7 @@ func (s *Store) ReleaseShard(ctx context.Context, pool string, txid chainhash.Ha
 		return err
 	}
 	now := s.now().UnixMicro()
-	return s.write(ctx, func(c querier) error {
+	return s.write(ctx, func(ctx context.Context, c querier) error {
 		// Only ever write when holder is already the owner: the WHERE clause
 		// re-asserts owner=? itself, so a non-owner call matches zero rows and this
 		// is naturally a no-op without a separate existence check on that path.

@@ -1,16 +1,18 @@
 // Package sqlite implements store.Store on SQLite via modernc.org/sqlite (no CGO).
 //
-// One process, one writer: every mutation runs in a transaction on a
-// dedicated single-connection *sql.DB (MaxOpenConns(1), _txlock=immediate),
-// serialising writes through Go's own connection-pool checkout. Reads use a
-// separate, read-only WAL handle that proceeds concurrently with the single
-// open write transaction.
+// One process, one writer: every mutation is queued to a single writer
+// goroutine that owns a dedicated single-connection *sql.DB (MaxOpenConns(1),
+// _txlock=immediate). The writer group-commits: it takes every write queued
+// while the previous commit was in flight, runs each in its own SAVEPOINT
+// inside one transaction, and commits once, so N concurrent writes pay for
+// one WAL fsync instead of N (see write). Reads use a separate, read-only WAL
+// handle that proceeds concurrently with the writer.
 //
 // Callers read the clock (s.now()) before queueing a write, not once inside
-// it: under contention a write can wait for the sole writer connection to
-// free up, so its stamped timestamp is slightly earlier than when it actually
-// commits. That is the safe direction -- a lease or reservation computed from
-// it runs out slightly sooner than requested, never later.
+// it: under contention a write can wait for the writer to reach it, so its
+// stamped timestamp is slightly earlier than when it actually commits. That
+// is the safe direction -- a lease or reservation computed from it runs out
+// slightly sooner than requested, never later.
 package sqlite
 
 import (
@@ -22,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sqlite3 "modernc.org/sqlite/lib"
@@ -32,6 +35,14 @@ import (
 )
 
 const maxBatch = 1000
+
+// maxGroup bounds how many queued writes one group commit carries, so a burst
+// of writers cannot grow a single transaction (and the latency of the first
+// write in it) without limit.
+const maxGroup = 256
+
+// errClosed is returned by a write issued after Close.
+var errClosed = errors.New("sqlite: store is closed")
 
 // journalSizeLimit bounds how large the WAL file is allowed to grow before
 // SQLite truncates it back down after a checkpoint (PRAGMA
@@ -112,9 +123,13 @@ func ReaderDSN(path string, sync Sync) string {
 
 // Store is a SQLite store.Store.
 type Store struct {
-	writer    *sql.DB // MaxOpenConns(1): the single writer
+	writer    *sql.DB // MaxOpenConns(1): the single writer, used only by writeLoop (and the maintenance helpers)
 	reader    *sql.DB
 	now       func() time.Time
+	writes    chan *writeReq // unbuffered: a request is claimed exactly when writeLoop receives it
+	stop      chan struct{}  // closed by Close: writeLoop exits, queued-but-unclaimed writes fail with errClosed
+	loopDone  chan struct{}  // closed when writeLoop has exited
+	commits   atomic.Uint64  // group commits that reached COMMIT successfully (tests)
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -153,10 +168,14 @@ func Open(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 	}
 	reader.SetMaxOpenConns(8)
 	reader.SetMaxIdleConns(8) // match MaxOpenConns: don't churn connections under concurrent reads
-	s := &Store{writer: writer, reader: reader, now: time.Now}
+	s := &Store{
+		writer: writer, reader: reader, now: time.Now,
+		writes: make(chan *writeReq), stop: make(chan struct{}), loopDone: make(chan struct{}),
+	}
 	for _, o := range opts {
 		o(s)
 	}
+	go s.writeLoop()
 	if err := s.migrate(ctx); err != nil {
 		_ = s.Close()
 		return nil, err
@@ -184,7 +203,7 @@ func Open(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 // versa, since both are ordinary writes inside the same transaction (see
 // schema.go).
 func (s *Store) migrate(ctx context.Context) error {
-	return s.write(ctx, func(c querier) error {
+	return s.write(ctx, func(ctx context.Context, c querier) error {
 		var version int
 		if err := c.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 			return fmt.Errorf("sqlite: read schema version: %w", err)
@@ -285,13 +304,17 @@ func (s *Store) ExplainQueryPlan(ctx context.Context, q string, args ...any) ([]
 	return out, wrapCtx(ctx, rs.Err())
 }
 
-// Close closes both handles, first folding the WAL back into the main
-// database file (best effort: closing must proceed even if the checkpoint
-// can't complete). Idempotent (guarded by sync.Once); the handles are never
-// nilled out, so a store method called after Close hits database/sql's own
-// "sql: database is closed" on a closed *sql.DB, never a nil-pointer panic.
+// Close stops the writer goroutine (after it finishes the group commit it is
+// running, if any), then closes both handles, first folding the WAL back into
+// the main database file (best effort: closing must proceed even if the
+// checkpoint can't complete). Idempotent (guarded by sync.Once); the handles
+// are never nilled out, so a write issued after Close fails with errClosed and
+// a read hits database/sql's own "sql: database is closed", never a
+// nil-pointer panic.
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
+		close(s.stop)
+		<-s.loopDone
 		_, _ = s.writer.ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`)
 		var errs []error
 		if err := s.writer.Close(); err != nil {
@@ -390,41 +413,157 @@ func wrapCtx(ctx context.Context, err error) error {
 	return wrap(err)
 }
 
-// write runs fn inside one transaction on the single writer *sql.DB
-// (_txlock=immediate, so BeginTx issues BEGIN IMMEDIATE). Because writer has
-// exactly one connection, at most one write transaction is ever in flight: a
-// second concurrent call blocks in BeginTx until the first's connection is
-// released, never at the SQL engine level, so fn never races another write's
-// statements -- including the read-then-write sequences in shards.go
-// (RenewShard, ReleaseShard, RetireShard): nothing else can run between a
-// SELECT and its following UPDATE within the same fn.
+// writeReq is one queued write: fn runs inside the writer's transaction and
+// done receives its outcome exactly once.
+type writeReq struct {
+	ctx  context.Context
+	fn   func(context.Context, querier) error
+	done chan error // buffered(1): writeLoop never blocks replying
+}
+
+// write runs fn as one atomic unit on the single writer and returns once its
+// outcome is durable (committed with the configured synchronous level) or
+// known to be discarded.
 //
-// Using *sql.Tx here, rather than a raw *sql.Conn plus hand-written "BEGIN"/
-// "COMMIT"/"ROLLBACK" statements, is what makes this safe under a cancelled
-// context: database/sql guarantees that once BeginTx succeeds, either Commit
-// or Rollback actually runs against the connection -- via its own background
-// watcher issuing a real rollback the moment ctx is done, even when our own
-// later Commit/Rollback call short-circuits on the already-cancelled context
-// -- before the connection goes back to the pool. A hand-written "COMMIT"
-// sent through ExecContext(ctx, ...) has no such guarantee: once ctx is
-// cancelled it never reaches the server at all, leaving the connection wedged
-// inside an open transaction when it's returned to the pool, so every later
-// write then fails with SQLite's non-transient "cannot start a transaction
-// within a transaction" -- and because that error isn't transient, callers
-// never retry their way out of it either.
-func (s *Store) write(ctx context.Context, fn func(querier) error) error {
-	tx, err := s.writer.BeginTx(ctx, nil)
-	if err != nil {
+// Group commit. Every commit under synchronous=FULL fsyncs the WAL, and with
+// one writer those fsyncs serialize: throughput is capped at 1/fsync-latency
+// writes per second (≈65/s on a SATA SSD under btrfs, where a WAL fsync costs
+// ≈15ms), however small each write is. So write does not open its own
+// transaction; it hands fn to writeLoop, which collects every write queued
+// while its previous commit was in flight (up to maxGroup), runs them in
+// arrival order inside one BEGIN IMMEDIATE transaction, each fn wrapped in its
+// own SAVEPOINT, and commits once. Each fn is still atomic and isolated (its
+// SAVEPOINT is rolled back on error without disturbing the others, and fns
+// run strictly one after another, so a read-then-write inside one fn -- e.g.
+// RenewShard, ReleaseShard, RetireShard in shards.go -- never races another
+// write), and nobody is acknowledged before the shared COMMIT returns, so
+// durability is exactly what it was with one transaction per write. If the
+// COMMIT (or a SAVEPOINT statement) fails, every write in the group gets that
+// error and none of them is applied.
+//
+// Cancellation. A write whose ctx is done before writeLoop claims it (the
+// unbuffered send below) is never run: it returns the ctx error with nothing
+// applied. Once claimed, fn runs under context.WithoutCancel(ctx) and write
+// waits for the group's real outcome, which takes at most one group commit:
+// a caller's cancellation must not interrupt a statement in the shared
+// transaction, since SQLite rolls back the whole transaction -- every other
+// caller's write with it -- when a DML statement inside it is interrupted.
+// fn must therefore use the ctx it is given, not one captured from its caller.
+//
+// fn must not call write itself (writeLoop runs one fn at a time).
+func (s *Store) write(ctx context.Context, fn func(context.Context, querier) error) error {
+	if err := ctx.Err(); err != nil {
 		return wrapCtx(ctx, err)
 	}
-	if err := fn(tx); err != nil {
-		_ = tx.Rollback()
-		return wrapCtx(ctx, err)
+	req := &writeReq{ctx: ctx, fn: fn, done: make(chan error, 1)}
+	select {
+	case s.writes <- req:
+	case <-ctx.Done():
+		return wrapCtx(ctx, ctx.Err())
+	case <-s.stop:
+		return errClosed
+	}
+	return <-req.done
+}
+
+// writeLoop is the single writer: it blocks for one queued write, then drains
+// whatever else is already queued (up to maxGroup) and group-commits them.
+// Every request it receives is replied to before it looks at the queue again.
+func (s *Store) writeLoop() {
+	defer close(s.loopDone)
+	group := make([]*writeReq, 0, maxGroup)
+	errs := make([]error, maxGroup)
+	for {
+		select {
+		case <-s.stop:
+			return
+		case r := <-s.writes:
+			group = append(group[:0], r)
+		}
+	drain:
+		for len(group) < maxGroup {
+			select {
+			case r := <-s.writes:
+				group = append(group, r)
+			default:
+				break drain
+			}
+		}
+		s.commitGroup(group, errs[:len(group)])
+		clear(group) // drop references to finished requests
+	}
+}
+
+// commitGroup runs group in one transaction and replies to every member.
+func (s *Store) commitGroup(group []*writeReq, errs []error) {
+	live := 0
+	for i, r := range group {
+		errs[i] = nil
+		if err := r.ctx.Err(); err != nil {
+			errs[i] = wrapCtx(r.ctx, err) // expired while queued: never run
+			continue
+		}
+		live++
+	}
+	var gerr error
+	if live > 0 {
+		gerr = s.runGroup(group, errs, live > 1)
+	}
+	for i, r := range group {
+		if errs[i] == nil && gerr != nil {
+			errs[i] = wrapCtx(r.ctx, gerr)
+		}
+		r.done <- errs[i]
+	}
+}
+
+// runGroup runs every member of group whose errs entry is nil inside one
+// transaction, recording each fn's own error in errs, and returns an error
+// that applies to every member that did not fail on its own (the transaction
+// was rolled back, or the COMMIT itself failed). With savepoints false (a
+// single live member) fn's error simply rolls the whole transaction back.
+func (s *Store) runGroup(group []*writeReq, errs []error, savepoints bool) error {
+	bg := context.Background()
+	tx, err := s.writer.BeginTx(bg, nil)
+	if err != nil {
+		return err
+	}
+	for i, r := range group {
+		if errs[i] != nil {
+			continue
+		}
+		ctx := context.WithoutCancel(r.ctx)
+		if !savepoints {
+			if ferr := r.fn(ctx, tx); ferr != nil {
+				_ = tx.Rollback()
+				errs[i] = wrapCtx(r.ctx, ferr)
+				return nil
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(bg, `SAVEPOINT w`); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if ferr := r.fn(ctx, tx); ferr != nil {
+			errs[i] = wrapCtx(r.ctx, ferr)
+			// If fn's failure already aborted the whole transaction (e.g. an
+			// I/O error), the savepoint is gone and this fails: the group fails.
+			if _, err := tx.ExecContext(bg, `ROLLBACK TO w`); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(bg, `RELEASE w`); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		_ = tx.Rollback()
-		return wrapCtx(ctx, err)
+		return err
 	}
+	s.commits.Add(1)
 	return nil
 }
 

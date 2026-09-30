@@ -203,7 +203,7 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 	now := s.now().UnixMicro()
 	sorted := store.SortReserveOps(ops)
 	applied := make([]store.ReserveOp, 0, len(ops))
-	err := s.write(ctx, func(c querier) error {
+	err := s.write(ctx, func(ctx context.Context, c querier) error {
 		stmt, err := c.PrepareContext(ctx, reserveRowSQL)
 		if err != nil {
 			return err
@@ -243,7 +243,7 @@ func (s *Store) updateReserved(ctx context.Context, pool string, token store.Tok
 	}
 	sorted := store.SortOutpoints(ops)
 	n := 0
-	err := s.write(ctx, func(c querier) error {
+	err := s.write(ctx, func(ctx context.Context, c querier) error {
 		n = 0
 		stmt, err := c.PrepareContext(ctx, sqlText)
 		if err != nil {
@@ -301,7 +301,7 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 	}
 	now := s.now().UnixMicro()
 	n := 0
-	err := s.write(ctx, func(c querier) error {
+	err := s.write(ctx, func(ctx context.Context, c querier) error {
 		res, err := c.ExecContext(ctx, quarantineSQL, now, now, pool, before.UnixMicro(), limit)
 		if err != nil {
 			return err
@@ -351,7 +351,7 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 		extra = []any{spentBy[:], now}
 	}
 	n := 0
-	err := s.write(ctx, func(c querier) error {
+	err := s.write(ctx, func(ctx context.Context, c querier) error {
 		n = 0
 		stmt, err := c.PrepareContext(ctx, sqlText)
 		if err != nil {

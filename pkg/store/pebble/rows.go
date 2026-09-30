@@ -38,8 +38,8 @@ func (s *Store) ListAvailable(ctx context.Context, pool string, txid chainhash.H
 	if err := store.ValidateLimit(limit); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -74,8 +74,8 @@ func (s *Store) GetRows(ctx context.Context, pool string, ops []store.Outpoint) 
 	if err := store.ValidateOutpoints(ops, maxBatch); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -103,8 +103,8 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 	if err := store.ValidateReserveOps(ops, maxBatch); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -172,7 +172,7 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 	if err := s.applyCounters(b, deltas); err != nil {
 		return nil, err
 	}
-	if err := s.commit(b); err != nil {
+	if err := g.commit(b); err != nil {
 		return nil, err
 	}
 	return applied, nil
@@ -187,8 +187,8 @@ func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpo
 	if token.IsZero() {
 		return 0, store.ErrInvalidArgument
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return 0, errClosed
 	}
@@ -217,7 +217,7 @@ func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpo
 	if err := s.applyCounters(b, deltas); err != nil {
 		return 0, err
 	}
-	if err := s.commit(b); err != nil {
+	if err := g.commit(b); err != nil {
 		return 0, err
 	}
 	return n, nil
@@ -288,8 +288,8 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 		return 0, nil
 	}
 	before = before.Truncate(time.Microsecond)
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return 0, errClosed
 	}
@@ -334,7 +334,7 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 	if err := s.applyCounters(b, deltas); err != nil {
 		return 0, err
 	}
-	if err := s.commit(b); err != nil {
+	if err := g.commit(b); err != nil {
 		return 0, err
 	}
 	return n, nil
@@ -363,8 +363,8 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 		return nil, nil
 	}
 	before = before.Truncate(time.Microsecond)
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -411,8 +411,8 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 	if err := store.ValidateResolve(to, spentBy); err != nil {
 		return 0, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return 0, errClosed
 	}
@@ -448,7 +448,7 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 	if err := s.applyCounters(b, deltas); err != nil {
 		return 0, err
 	}
-	if err := s.commit(b); err != nil {
+	if err := g.commit(b); err != nil {
 		return 0, err
 	}
 	return n, nil
@@ -462,8 +462,8 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return store.Stats{}, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return store.Stats{}, errClosed
 	}

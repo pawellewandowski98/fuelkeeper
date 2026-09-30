@@ -2,9 +2,13 @@
 // LSM tree.
 //
 // The whole store lives in one process behind one write mutex: every public
-// method takes s.mu for its entire body (not just its mutating tail), so
-// reads and writes alike observe and produce a fully consistent view without
-// relying on Pebble's own MVCC snapshots. Every mutation builds exactly one
+// method takes s.mu for its entire body (not just its mutating tail) up to
+// and including applying its batch, so reads and writes alike observe and
+// produce a fully consistent view without relying on Pebble's own MVCC
+// snapshots. Only the WAL fsync that makes an applied batch durable is
+// awaited with s.mu released (see guard.commit), so concurrent durable
+// writes share fsyncs instead of queueing one fsync each behind s.mu; no call
+// returns before everything it wrote or observed is durable. Every mutation builds exactly one
 // *pebble.Batch and commits it once: the row or shard record, every index key
 // that must change with it (is/, ie/, iq/), and every per-pool counter it
 // touches are all written in that same batch, so a crash between two
@@ -150,6 +154,7 @@ type Store struct {
 	now func() time.Time
 
 	mu        sync.Mutex
+	tail      *durableMark // under mu: the mark of the most recently applied batch (see commit)
 	closeOnce sync.Once
 	closed    atomic.Bool
 }
@@ -200,7 +205,7 @@ func Open(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 	if cfg.NoSync {
 		wo = pdb.NoSync
 	}
-	s := &Store{db: db, wo: wo, now: oc.now}
+	s := &Store{db: db, wo: wo, now: oc.now, tail: doneMark()}
 	if err := s.ensureSchema(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -238,8 +243,8 @@ func (s *Store) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	g := s.lock()
+	defer g.unlock()
 	if s.closed.Load() {
 		return errClosed
 	}
@@ -258,6 +263,9 @@ func (s *Store) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
+		// Every applied batch's WAL sync must finish before Pebble closes:
+		// its committer is waiting on it with s.mu released (see commit).
+		<-s.tail.done
 		err = s.db.Close()
 	})
 	return err
@@ -344,20 +352,101 @@ func (s *Store) applyCounters(b *pdb.Batch, deltas map[string]int64) error {
 	return nil
 }
 
-// commit applies b and wraps any error as store.ErrUnavailable. An empty
-// batch (a call that matched no rows/shards, such as an idle reaper's
-// Quarantine tick finding nothing due, or a Reserve batch that hit no
-// available or same-token-replay row) short-circuits without ever reaching
-// Pebble's WAL: there is nothing to make durable, so there is no reason to pay
-// for a fsync (or even a WAL append) on every no-op call.
-func (s *Store) commit(b *pdb.Batch) error {
-	if b.Empty() {
-		return nil
+// durableMark is closed once one applied batch, and every batch applied
+// before it, is durable (its WAL fsync returned) or has failed; err is the
+// first such failure and is only read after done is closed.
+type durableMark struct {
+	done chan struct{}
+	err  error
+}
+
+func doneMark() *durableMark {
+	m := &durableMark{done: make(chan struct{})}
+	close(m.done)
+	return m
+}
+
+// guard is one public method's hold on s.mu. It is released exactly once:
+// by commit (which applies the method's batch under s.mu, then releases s.mu
+// before waiting for the WAL fsync), or by the method's deferred unlock.
+type guard struct {
+	s        *Store
+	released bool
+}
+
+// lock takes s.mu for one public method; the method must defer g.unlock().
+func (s *Store) lock() *guard {
+	s.mu.Lock()
+	return &guard{s: s}
+}
+
+// unlock releases s.mu if commit has not already, then waits until every
+// batch applied before it is durable. A method that returns without
+// committing a batch of its own (a read, a no-op or a rejected write) may
+// have observed another call's batch that is applied (Pebble makes a batch
+// visible as soon as it is in the memtable) but whose fsync is still in
+// flight; waiting here means nothing it returns is based on state that a
+// crash could still take back. The wait is ignored for errors: a failed sync
+// is reported to the call that wrote the batch.
+func (g *guard) unlock() {
+	if g.released {
+		return
 	}
-	if err := b.Commit(s.wo); err != nil {
+	g.released = true
+	tail := g.s.tail
+	g.s.mu.Unlock()
+	<-tail.done
+}
+
+// commit applies b and returns once it is durable, wrapping any error as
+// store.ErrUnavailable. It releases the method's hold on s.mu (the method
+// must return right after it): b is applied to the memtable under s.mu, so
+// every later call observes it, but its WAL fsync is waited for with s.mu
+// released, so concurrent calls' fsyncs coalesce in Pebble's WAL writer (one
+// fsync covers every batch appended since the last) instead of serializing
+// one fsync per call behind s.mu -- which capped every durable call, reads
+// included, at 1/fsync-latency per second (≈65/s on a SATA SSD under btrfs).
+// commit does not return until every batch applied before b is durable too,
+// so an acknowledged call never depends on a write a crash could revert.
+//
+// An empty batch (a call that matched no rows/shards, such as an idle
+// reaper's Quarantine tick finding nothing due, or a Reserve batch that hit
+// no available or same-token-replay row) never reaches Pebble's WAL: there is
+// nothing to make durable, so there is no reason to pay for a fsync (or even
+// a WAL append) on every no-op call. It still waits, as unlock does, for the
+// batches it may have observed, and reports their sync failure if any.
+func (g *guard) commit(b *pdb.Batch) error {
+	s := g.s
+	prev := s.tail
+	if b.Empty() || !s.wo.Sync {
+		var err error
+		if !b.Empty() {
+			err = b.Commit(s.wo) // NoSync: nothing to wait for
+		}
+		g.released = true
+		s.mu.Unlock()
+		<-prev.done
+		if err == nil {
+			err = prev.err
+		}
 		return wrapErr(err)
 	}
-	return nil
+	if err := s.db.ApplyNoSyncWait(b, s.wo); err != nil {
+		_ = b.SyncWait() // required before b.Close; returns at once if b never queued a sync
+		return wrapErr(err)
+	}
+	mine := &durableMark{done: make(chan struct{})}
+	s.tail = mine
+	g.released = true
+	s.mu.Unlock()
+	err := b.SyncWait()
+	<-prev.done
+	if err == nil {
+		err = prev.err
+	}
+	mine.err = err
+	close(mine.done)
+	return wrapErr(err)
 }
 
 // iterate calls fn for every key in [lower, upper) in ascending order, until
@@ -519,13 +608,13 @@ func (s *Store) setShard(b *pdb.Batch, prev, next *store.Shard, deltas map[strin
 // writeShardOnly writes next's shard record without touching the is/ index
 // or counters, for a lease-only change (Owner/LeaseUntil), whose status is
 // unchanged.
-func (s *Store) writeShardOnly(next *store.Shard) error {
+func (s *Store) writeShardOnly(g *guard, next *store.Shard) error {
 	b := s.db.NewBatch()
 	defer func() { _ = b.Close() }()
 	if err := b.Set(shardKey(next.Pool, next.TxID), encodeShard(next), nil); err != nil {
 		return wrapErr(err)
 	}
-	return s.commit(b)
+	return g.commit(b)
 }
 
 func lessShardVal(a, b store.Shard) bool {
