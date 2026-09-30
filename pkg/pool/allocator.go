@@ -24,21 +24,39 @@ type shardQueue struct {
 	fifo []store.Row // front at index 0
 }
 
+// rowState is where a tracked row currently sits.
+type rowState uint8
+
+const (
+	// rowQueued is sitting in its shard's FIFO, available to Pop.
+	rowQueued rowState = iota
+	// rowInflight has been Popped and not yet Returned or Forgotten.
+	rowInflight
+)
+
 // Allocator is the per-pool in-memory FIFO of available rows across owned
-// shards. Rows are popped oldest-shard-first. A row is "known" from Add until
-// Forget (or RemoveShard); known rows are never re-added, which makes rescans
-// safe while rows are in flight to the coalescer.
+// shards. Rows are popped oldest-shard-first.
+//
+// Every row Add has accepted is tracked in rows as either queued (sitting in
+// a shard's FIFO) or inflight (handed out by Pop, not yet resolved). A row is
+// tracked from Add until it leaves via Forget or RemoveShard; a tracked row
+// is never re-added, which makes rescans safe while rows are in flight to the
+// coalescer. Tracking the state (not just membership) is what lets Return and
+// Forget be idempotent: each only acts on a row in the state it expects and
+// is a silent no-op otherwise, so calling either twice, or calling one after
+// the other has already resolved the row, can never double-queue a row or
+// double-hand it out from Pop.
 type Allocator struct {
 	mu    sync.Mutex
 	order []*shardQueue // oldest first
 	byTx  map[chainhash.Hash]*shardQueue
-	known map[store.Outpoint]struct{}
+	rows  map[store.Outpoint]rowState
 	avail int
 }
 
 // NewAllocator returns an empty allocator.
 func NewAllocator() *Allocator {
-	return &Allocator{byTx: map[chainhash.Hash]*shardQueue{}, known: map[store.Outpoint]struct{}{}}
+	return &Allocator{byTx: map[chainhash.Hash]*shardQueue{}, rows: map[store.Outpoint]rowState{}}
 }
 
 func lessOwned(a, b OwnedShard) bool {
@@ -62,9 +80,12 @@ func (a *Allocator) AddShard(sh OwnedShard) bool {
 	return true
 }
 
-// RemoveShard drops a shard and its FIFO, forgetting those rows. Returns how
-// many queued rows were dropped. Rows of that shard currently in flight stay
-// known until Forget.
+// RemoveShard drops a shard and its FIFO. Returns how many queued rows were
+// dropped; those rows are untracked immediately (a rescan may re-Add them
+// under a new AddShard). Rows of that shard currently in flight are left
+// tracked as inflight until Forget resolves them, or until Return is called
+// for them -- at which point, since the shard is gone, Return drops them from
+// tracking too instead of re-queuing them.
 func (a *Allocator) RemoveShard(txid chainhash.Hash) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -73,7 +94,7 @@ func (a *Allocator) RemoveShard(txid chainhash.Hash) int {
 		return 0
 	}
 	for _, r := range q.fifo {
-		delete(a.known, r.Outpoint)
+		delete(a.rows, r.Outpoint) // only queued rows are in q.fifo; inflight rows stay tracked
 	}
 	n := len(q.fifo)
 	a.avail -= n
@@ -104,8 +125,9 @@ func (a *Allocator) UpdateHead(txid chainhash.Hash, status store.ShardStatus, ve
 	}
 }
 
-// Add appends rows to the shard's FIFO, skipping known outpoints and rows of
-// other shards. Returns how many were added.
+// Add appends rows to the shard's FIFO as queued, skipping rows already
+// tracked (queued or inflight) and rows belonging to another shard. Returns
+// how many were added.
 func (a *Allocator) Add(txid chainhash.Hash, rows []store.Row) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -118,10 +140,10 @@ func (a *Allocator) Add(txid chainhash.Hash, rows []store.Row) int {
 		if r.TxID != txid {
 			continue
 		}
-		if _, dup := a.known[r.Outpoint]; dup {
+		if _, tracked := a.rows[r.Outpoint]; tracked {
 			continue
 		}
-		a.known[r.Outpoint] = struct{}{}
+		a.rows[r.Outpoint] = rowQueued
 		q.fifo = append(q.fifo, r)
 		n++
 	}
@@ -129,14 +151,22 @@ func (a *Allocator) Add(txid chainhash.Hash, rows []store.Row) int {
 	return n
 }
 
-// Pop removes up to n rows, oldest shard first. Popped rows remain known.
+// Pop removes up to n rows, oldest shard first, marking each one inflight.
 //
-// The fifo slice is drained from the front by re-slicing and copying the
-// remainder down (via append to a fresh backing array), not by advancing a
-// head index. That keeps the array Pop copies out of (out = append(out,
-// q.fifo[:take]...)) fully detached from the array Return later prepends
-// onto, so Return's `append([]store.Row{r}, q.fifo...)` can never alias or
-// overwrite memory a caller is still holding from a prior Pop.
+// The returned slice is built into its own fresh backing array (out starts
+// from make, and every element is copied into it by append), so it never
+// aliases any shard's fifo array. Each shard's fifo is then advanced past the
+// popped prefix with a plain reslice (q.fifo = q.fifo[take:]), an O(1)
+// operation that keeps sharing the same backing array rather than copying the
+// remainder down. That sharing is safe precisely because out never aliases
+// fifo's array (so nothing written through a later append to fifo can be
+// observed through a row a caller is still holding from Pop) and because
+// Return always allocates a brand new backing array when it prepends rather
+// than mutating fifo's array in place. Once a shard's fifo is fully drained
+// its backing array reference is dropped (set to nil) so it can be collected;
+// if a large fifo has shrunk to a small fraction of its backing array's
+// capacity, it is compacted into a right-sized array so that one big burst
+// does not pin a large array in memory indefinitely.
 func (a *Allocator) Pop(n int) []store.Row {
 	if n <= 0 {
 		return nil
@@ -152,24 +182,41 @@ func (a *Allocator) Pop(n int) []store.Row {
 		if take > len(q.fifo) {
 			take = len(q.fifo)
 		}
-		out = append(out, q.fifo[:take]...)
-		q.fifo = append([]store.Row(nil), q.fifo[take:]...)
+		taken := q.fifo[:take]
+		for _, r := range taken {
+			a.rows[r.Outpoint] = rowInflight
+		}
+		out = append(out, taken...)
+		q.fifo = q.fifo[take:]
+		switch {
+		case len(q.fifo) == 0:
+			q.fifo = nil
+		case cap(q.fifo) > 4096 && len(q.fifo) < cap(q.fifo)/8:
+			compact := make([]store.Row, len(q.fifo))
+			copy(compact, q.fifo)
+			q.fifo = compact
+		}
 	}
 	a.avail -= len(out)
 	return out
 }
 
 // Return puts rows that never reached the store back at the FRONT of their
-// shard's FIFO, preserving their relative order. Callers must only pass rows
-// obtained from Pop that have not since been Forgotten (a row already back in
-// a FIFO, or already re-added by a rescan, must never be passed to Return).
+// shard's FIFO, preserving their relative order, transitioning each from
+// inflight to queued.
 //
-// If a row is no longer known -- because Forget already ran for it (the CAS
-// applied) or RemoveShard dropped its shard -- it is dropped here silently
-// rather than re-queued, even if the shard still exists. Re-queuing it would
-// resurrect a row that is already reserved (or otherwise spoken for) under a
-// Forget-then-Return race. If the shard is gone entirely the row is also
-// forgotten so it does not leak in the known set.
+// Return is idempotent: it only acts on a row it finds inflight. A row that
+// is instead found queued (an earlier Return already requeued it, so this is
+// a duplicate call), or not tracked at all (Forget already ran for it because
+// the CAS applied, or it was never popped), is left exactly as it is -- so
+// calling Return twice for the same rows, or calling it after Forget, can
+// never create a duplicate in a FIFO or resurrect a row that is already
+// spoken for. If the row's shard no longer exists (RemoveShard dropped it)
+// the row is untracked entirely, since there is nowhere left to queue it.
+//
+// Return always allocates a fresh backing array when it prepends; see Pop's
+// doc comment for why that, together with Pop never returning a slice that
+// aliases a shard's fifo array, keeps the two methods safe to use together.
 func (a *Allocator) Return(rows []store.Row) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -177,25 +224,35 @@ func (a *Allocator) Return(rows []store.Row) {
 		r := rows[i]
 		q, ok := a.byTx[r.TxID]
 		if !ok {
-			delete(a.known, r.Outpoint)
+			delete(a.rows, r.Outpoint)
 			continue
 		}
-		if _, known := a.known[r.Outpoint]; !known {
-			// Already Forgotten (CAS applied) or otherwise no longer ours: do not resurrect it.
+		if a.rows[r.Outpoint] != rowInflight {
+			// Already queued (duplicate Return) or untracked (already Forgotten, or
+			// never popped): leave it alone.
 			continue
 		}
+		a.rows[r.Outpoint] = rowQueued
 		q.fifo = append([]store.Row{r}, q.fifo...)
 		a.avail++
 	}
 }
 
-// Forget removes outpoints from the known set (after a CAS result, applied or
-// missed). They are not in any FIFO at that point.
+// Forget resolves outpoints that are inflight (a CAS result applied) by
+// untracking them; they are not in any FIFO at that point.
+//
+// Forget is idempotent: it only deletes an outpoint it finds inflight. An
+// outpoint that is instead queued (still sitting in a FIFO -- for instance
+// because Return already ran for it) or already untracked is left alone, so
+// Forget can never remove a row that a rescan or a Return has since put back
+// into circulation.
 func (a *Allocator) Forget(ops []store.Outpoint) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, op := range ops {
-		delete(a.known, op)
+		if a.rows[op] == rowInflight {
+			delete(a.rows, op)
+		}
 	}
 }
 

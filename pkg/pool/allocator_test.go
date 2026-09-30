@@ -25,6 +25,15 @@ func owned(created time.Time) pool.OwnedShard {
 	return pool.OwnedShard{TxID: storetest.NewTxID(), Status: store.ShardMined, Version: 1, CreatedAt: created}
 }
 
+func assertDistinctOutpoints(t *testing.T, rows []store.Row) {
+	t.Helper()
+	seen := map[store.Outpoint]bool{}
+	for _, r := range rows {
+		assert.False(t, seen[r.Outpoint], "duplicate outpoint %v", r.Outpoint)
+		seen[r.Outpoint] = true
+	}
+}
+
 func TestAllocatorOrderAndPop(t *testing.T) {
 	a := pool.NewAllocator()
 	t0 := storetest.Start
@@ -140,10 +149,82 @@ func TestAllocatorNoDoubleInFlight(t *testing.T) {
 	first := a.Pop(1000)
 	again := a.Pop(1000)
 	assert.Empty(t, again, "a second Pop yields nothing until Forget/Add")
-	ops := map[store.Outpoint]bool{}
-	for _, r := range first {
-		assert.False(t, ops[r.Outpoint], "duplicate in one Pop")
-		ops[r.Outpoint] = true
-	}
+	assertDistinctOutpoints(t, first)
 	assert.Equal(t, 0, a.Available())
+}
+
+func TestAllocatorReturnAndForgetAreIdempotent(t *testing.T) {
+	a := pool.NewAllocator()
+	sh := owned(storetest.Start)
+	require.True(t, a.AddShard(sh))
+	rows := mkRows(store.Outpoint{TxID: sh.TxID}, 3)
+	require.Equal(t, 3, a.Add(sh.TxID, rows))
+
+	got := a.Pop(3)
+	require.Len(t, got, 3)
+	a.Return(got)
+	a.Return(got) // duplicate Return must not double-queue
+	assert.Equal(t, 3, a.Available())
+	popped := a.Pop(10)
+	require.Len(t, popped, 3)
+	assertDistinctOutpoints(t, popped)
+
+	// Return then Forget on the same (now in-flight again) rows: by the time
+	// Forget runs the row is queued, not in flight, so Forget is a no-op and
+	// the row stays queued (not lost).
+	a.Return(popped)
+	a.Forget(storetest.Ops(popped))
+	assert.Equal(t, 3, a.Available(), "row stays queued; Forget on a queued row is a no-op")
+	assert.Equal(t, 0, a.Add(sh.TxID, popped), "queued rows are not re-added")
+	popped2 := a.Pop(10)
+	require.Len(t, popped2, 3)
+	assertDistinctOutpoints(t, popped2)
+}
+
+func TestAllocatorAddIgnoresForeignRows(t *testing.T) {
+	a := pool.NewAllocator()
+	shA := owned(storetest.Start)
+	shB := owned(storetest.Start.Add(time.Minute))
+	require.True(t, a.AddShard(shA))
+	require.True(t, a.AddShard(shB))
+
+	foreign := mkRows(store.Outpoint{TxID: shB.TxID}, 1) // belongs to shard B, never added anywhere
+	assert.Equal(t, 0, a.Add(shA.TxID, foreign), "row of another shard is ignored")
+	assert.Equal(t, 0, a.Available())
+	assert.Empty(t, a.Pop(10), "foreign row must not appear anywhere")
+	assert.Equal(t, 0, a.ShardAvailable(shA.TxID))
+	assert.Equal(t, 0, a.ShardAvailable(shB.TxID))
+
+	// the row was never actually tracked, so shard B can still add it for real.
+	assert.Equal(t, 1, a.Add(shB.TxID, foreign))
+}
+
+func TestAllocatorForgetThenReturnDoesNotResurrect(t *testing.T) {
+	a := pool.NewAllocator()
+	sh := owned(storetest.Start)
+	require.True(t, a.AddShard(sh))
+	rows := mkRows(store.Outpoint{TxID: sh.TxID}, 1)
+	require.Equal(t, 1, a.Add(sh.TxID, rows))
+
+	got := a.Pop(1)
+	require.Len(t, got, 1)
+	a.Forget(storetest.Ops(got)) // simulate CAS applied: the row is gone for good
+	a.Return(got)                // late/duplicate Return must not resurrect it
+	assert.Equal(t, 0, a.Available())
+	assert.Empty(t, a.Pop(1))
+}
+
+func BenchmarkAllocatorPopSteadyState100k(b *testing.B) {
+	a := pool.NewAllocator()
+	sh := owned(storetest.Start)
+	a.AddShard(sh)
+	all := mkRows(store.Outpoint{TxID: sh.TxID}, 100_000)
+	a.Add(sh.TxID, all)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		got := a.Pop(3)
+		a.Forget(storetest.Ops(got))
+		a.Add(sh.TxID, got)
+	}
 }
