@@ -27,13 +27,28 @@ type Treasury struct {
 	failMinedBEEF  error
 	nBuilt         int
 	nBuildAttempts int
+	onSend         func(txid chainhash.Hash)
 }
 
 var _ treasury.Treasury = (*Treasury)(nil)
 
+// Option configures a Treasury built by New.
+type Option func(*Treasury)
+
+// WithOnSend registers a callback invoked after every successful Send, with
+// the mutex released (see Send). Used by "nullnet" mode to simulate mining a
+// split some time after it is sent.
+func WithOnSend(fn func(txid chainhash.Hash)) Option {
+	return func(t *Treasury) { t.onSend = fn }
+}
+
 // New returns an empty mock treasury.
-func New() *Treasury {
-	return &Treasury{built: map[chainhash.Hash]*treasury.BuiltShard{}, sent: map[chainhash.Hash]int{}}
+func New(opts ...Option) *Treasury {
+	t := &Treasury{built: map[chainhash.Hash]*treasury.BuiltShard{}, sent: map[chainhash.Hash]int{}}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
 }
 
 // Sends returns how many times txid was sent.
@@ -174,17 +189,26 @@ func cloneBytes(b []byte) []byte {
 	return out
 }
 
-// Send records a broadcast of a previously built split.
+// Send records a broadcast of a previously built split. On success, the
+// WithOnSend callback (if any) is invoked after the mutex is released, so it
+// may safely call back into the mock (e.g. from a timer) without deadlocking.
 func (t *Treasury) Send(_ context.Context, txid chainhash.Hash) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if _, ok := t.built[txid]; !ok {
+		t.mu.Unlock()
 		return treasury.ErrUnknownTx
 	}
 	if t.failSend != nil {
-		return t.failSend
+		err := t.failSend
+		t.mu.Unlock()
+		return err
 	}
 	t.sent[txid]++
+	fn := t.onSend
+	t.mu.Unlock()
+	if fn != nil {
+		fn(txid)
+	}
 	return nil
 }
 

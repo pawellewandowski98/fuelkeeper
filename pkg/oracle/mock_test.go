@@ -97,3 +97,32 @@ func TestMockOracle(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, ts.Known)
 }
+
+// TestMockOracleAssumeUnspent covers the "nullnet" development mode: with
+// SetAssumeUnspent(true), an outpoint with no verdict answers Unspent instead
+// of Unknown, but an outpoint with an explicit verdict (spent or
+// conflicting) keeps that verdict.
+func TestMockOracleAssumeUnspent(t *testing.T) {
+	ctx := context.Background()
+	m := oracle.NewMock()
+	unset := store.Outpoint{TxID: storetest.NewTxID(), Vout: 0}
+	spent := store.Outpoint{TxID: storetest.NewTxID(), Vout: 1}
+	spender := storetest.NewTxID()
+	m.SetSpent(spent, spender)
+
+	res, err := m.Outpoints(ctx, []store.Outpoint{unset, spent})
+	require.NoError(t, err)
+	assert.Equal(t, oracle.StatusUnknown, res[0].Status, "default: no verdict means unknown")
+	assert.Equal(t, oracle.StatusSpent, res[1].Status)
+
+	m.SetAssumeUnspent(true)
+	res, err = m.Outpoints(ctx, []store.Outpoint{unset, spent})
+	require.NoError(t, err)
+	assert.Equal(t, oracle.StatusUnspent, res[0].Status, "assume-unspent: no verdict now means unspent")
+	assert.Equal(t, oracle.StatusSpent, res[1].Status, "an explicit verdict is never overridden")
+
+	m.SetAssumeUnspent(false)
+	res, err = m.Outpoints(ctx, []store.Outpoint{unset})
+	require.NoError(t, err)
+	assert.Equal(t, oracle.StatusUnknown, res[0].Status, "turning it back off restores unknown")
+}

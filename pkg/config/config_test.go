@@ -36,6 +36,10 @@ func TestLoadMinimalAppliesDefaults(t *testing.T) {
 	assert.Equal(t, "none", c.Oracle.Kind)
 	assert.Equal(t, "mock", c.Treasury.Kind)
 	assert.Equal(t, "info", c.Log.Level)
+	assert.True(t, c.Oracle.Mock.AssumeUnspent, "nullnet default: mock oracle assumes unspent")
+	assert.Equal(t, 2*time.Second, c.Treasury.Mock.ConfirmAfter, "nullnet default: mock treasury confirms after 2s")
+	assert.Equal(t, 10*time.Second, c.API.RequestTimeout)
+	assert.Empty(t, c.API.AdminKeys, "admin_keys defaults empty (falls back to api_keys)")
 }
 
 func TestLoadFullOverridesAndExpandsEnv(t *testing.T) {
@@ -155,6 +159,24 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 	c = base()
 	c.API.ReadTimeout = 0
 	require.ErrorContains(t, c.Validate(), "read_timeout")
+
+	c = base()
+	c.API.RequestTimeout = 0
+	require.ErrorContains(t, c.Validate(), "api.request_timeout")
+
+	c = base()
+	c.API.RequestTimeout = c.Instance.ReserveTimeout
+	err = c.Validate()
+	require.ErrorContains(t, err, "api.request_timeout")
+	require.ErrorContains(t, err, "instance.reserve_timeout")
+
+	c = base()
+	c.Treasury.Mock.ConfirmAfter = 0
+	require.ErrorContains(t, c.Validate(), "treasury.mock.confirm_after")
+
+	c = base()
+	c.Treasury.Mock.ConfirmAfter = -time.Second
+	require.ErrorContains(t, c.Validate(), "treasury.mock.confirm_after")
 
 	_, err = config.Load("testdata/does-not-exist.yaml")
 	require.Error(t, err)

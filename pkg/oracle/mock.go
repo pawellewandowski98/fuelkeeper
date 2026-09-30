@@ -11,11 +11,12 @@ import (
 
 // Mock is a controllable oracle for tests.
 type Mock struct {
-	mu    sync.Mutex
-	ops   map[store.Outpoint]Result
-	txs   map[chainhash.Hash]TxStatus
-	down  bool
-	calls int
+	mu            sync.Mutex
+	ops           map[store.Outpoint]Result
+	txs           map[chainhash.Hash]TxStatus
+	down          bool
+	calls         int
+	assumeUnspent bool
 }
 
 var _ Oracle = (*Mock)(nil)
@@ -61,6 +62,15 @@ func (m *Mock) SetTx(txid chainhash.Hash, st TxStatus) {
 	m.txs[txid] = copyTxStatus(st)
 }
 
+// SetAssumeUnspent makes Outpoints answer Unspent instead of Unknown for
+// outpoints with no verdict. Development/benchmark ("nullnet") mode only: a
+// real oracle never guesses.
+func (m *Mock) SetAssumeUnspent(v bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.assumeUnspent = v
+}
+
 // SetDown makes every call fail with ErrUnavailable.
 func (m *Mock) SetDown(down bool) {
 	m.mu.Lock()
@@ -92,7 +102,11 @@ func (m *Mock) Outpoints(_ context.Context, ops []store.Outpoint) ([]Result, err
 			}
 			out[i] = r
 		} else {
-			out[i] = Result{Outpoint: op, Status: StatusUnknown}
+			status := StatusUnknown
+			if m.assumeUnspent {
+				status = StatusUnspent
+			}
+			out[i] = Result{Outpoint: op, Status: status}
 		}
 	}
 	return out, nil

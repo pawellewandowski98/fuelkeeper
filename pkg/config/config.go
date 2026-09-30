@@ -42,7 +42,12 @@ type JobsConfig struct {
 
 // OracleConfig selects the chain oracle. teranode/arcade/composite are wired in Plan 5.
 type OracleConfig struct {
-	Kind     string `yaml:"kind"` // none | mock | teranode | arcade | composite
+	Kind string `yaml:"kind"` // none | mock | teranode | arcade | composite
+	Mock struct {
+		// AssumeUnspent makes the mock oracle answer Unspent instead of Unknown
+		// for outpoints it has no verdict for; "nullnet" development mode only.
+		AssumeUnspent bool `yaml:"assume_unspent"`
+	} `yaml:"mock"`
 	Teranode struct {
 		URL string `yaml:"url"`
 	} `yaml:"teranode"`
@@ -54,16 +59,25 @@ type OracleConfig struct {
 // TreasuryConfig selects the treasury. toolbox fields are added in Plan 5.
 type TreasuryConfig struct {
 	Kind string `yaml:"kind"` // mock | toolbox
+	Mock struct {
+		// ConfirmAfter is how long after a successful Send the mock treasury's
+		// nullnet wiring marks the split mined; must be > 0 when Kind is mock.
+		ConfirmAfter time.Duration `yaml:"confirm_after"`
+	} `yaml:"mock"`
 }
 
 // APIConfig configures the HTTP listener.
 type APIConfig struct {
 	Listen       string        `yaml:"listen"`
 	APIKeys      []string      `yaml:"api_keys"`
+	AdminKeys    []string      `yaml:"admin_keys"`
 	ReadTimeout  time.Duration `yaml:"read_timeout"`
 	WriteTimeout time.Duration `yaml:"write_timeout"`
 	IdleTimeout  time.Duration `yaml:"idle_timeout"`
 	MaxBodyBytes int64         `yaml:"max_body_bytes"`
+	// RequestTimeout bounds a single HTTP request end-to-end; it must exceed
+	// instance.reserve_timeout (see Validate).
+	RequestTimeout time.Duration `yaml:"request_timeout"`
 }
 
 // LogConfig configures slog.
@@ -74,6 +88,10 @@ type LogConfig struct {
 
 // Default returns a config with every default filled and no pools.
 func Default() *Config {
+	oracleCfg := OracleConfig{Kind: "none"}
+	oracleCfg.Mock.AssumeUnspent = true
+	treasuryCfg := TreasuryConfig{Kind: "mock"}
+	treasuryCfg.Mock.ConfirmAfter = 2 * time.Second
 	return &Config{
 		Instance: pool.DefaultInstanceConfig(),
 		Store:    factory.Config{Backend: factory.BackendMemory},
@@ -86,14 +104,15 @@ func Default() *Config {
 			Watcher:  jobs.DefaultWatcherConfig(),
 			Minter:   jobs.DefaultMinterConfig(),
 		},
-		Oracle:   OracleConfig{Kind: "none"},
-		Treasury: TreasuryConfig{Kind: "mock"},
+		Oracle:   oracleCfg,
+		Treasury: treasuryCfg,
 		API: APIConfig{
-			Listen:       ":8080",
-			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 30 * time.Second,
-			IdleTimeout:  120 * time.Second,
-			MaxBodyBytes: 1 << 20,
+			Listen:         ":8080",
+			ReadTimeout:    10 * time.Second,
+			WriteTimeout:   30 * time.Second,
+			IdleTimeout:    120 * time.Second,
+			MaxBodyBytes:   1 << 20,
+			RequestTimeout: 10 * time.Second,
 		},
 		Log: LogConfig{Level: "info", Format: "text"},
 	}
@@ -316,6 +335,9 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("config: treasury.kind %q is not one of mock|toolbox", c.Treasury.Kind)
 	}
+	if c.Treasury.Kind == "mock" && c.Treasury.Mock.ConfirmAfter <= 0 {
+		return errors.New("config: treasury.mock.confirm_after must be > 0")
+	}
 	if c.Jobs.Enabled {
 		if err := c.Jobs.Reaper.Validate(); err != nil {
 			return fmt.Errorf("config: jobs.reaper: %w", err)
@@ -373,6 +395,13 @@ func (c *Config) Validate() error {
 	}
 	if c.API.ReadTimeout <= 0 || c.API.WriteTimeout <= 0 || c.API.IdleTimeout <= 0 {
 		return errors.New("config: api.read_timeout, api.write_timeout and api.idle_timeout must be > 0")
+	}
+	if c.API.RequestTimeout <= 0 {
+		return errors.New("config: api.request_timeout must be > 0")
+	}
+	if c.API.RequestTimeout <= c.Instance.ReserveTimeout {
+		return fmt.Errorf("config: api.request_timeout (%s) must exceed instance.reserve_timeout (%s)",
+			c.API.RequestTimeout, c.Instance.ReserveTimeout)
 	}
 	return nil
 }
