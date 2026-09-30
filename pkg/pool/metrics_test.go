@@ -177,6 +177,17 @@ func TestMetricsCompensatingReleaseNotCountedOnAbandonedSuccess(t *testing.T) {
 		return true
 	}, 2*time.Second, 5*time.Millisecond, "rows applied for an abandoned request are released back")
 
+	// Rows being available only shows releaseByToken's store.Release call
+	// landed; it says nothing about which counter (if any) flush's own
+	// bookkeeping bumped, since that happens around the same time in a
+	// different goroutine. Wait for the flush to fully settle (its deferred
+	// inflight decrement is the last thing it does) before reading the
+	// counter, so a mutant that increments compensating_release_total here
+	// is never read too early to be caught.
+	require.Eventually(t, func() bool {
+		return c.InflightOps() == 0
+	}, 2*time.Second, 5*time.Millisecond, "the flush that carried the abandoned request has fully settled")
+
 	assert.InDelta(t, compBefore, testutil.ToFloat64(pool.CompensatingRelease.WithLabelValues(poolName)), 0,
 		"a courtesy release after abandonment is not a compensating release")
 }
@@ -279,11 +290,45 @@ func TestMetricsShardDropEmptyOnAdopt(t *testing.T) {
 	storetest.MustReserve(t, st, poolName, rows, store.NewToken(), clk.Now().Add(time.Minute))
 	m, _ := newShardManager(st, poolName, clk, nil)
 
-	before := testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "empty"))
+	dropBefore := testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "empty"))
+	adoptOKBefore := testutil.ToFloat64(pool.ShardAdoptions.WithLabelValues(poolName, "ok"))
 	adopted, err := m.AdoptOnce(ctx)
 	require.NoError(t, err)
 	assert.False(t, adopted, "the adopted shard turned out to have nothing available")
-	assert.InDelta(t, before+1, testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "empty")), 0)
+	assert.InDelta(t, dropBefore+1, testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "empty")), 0)
+	assert.InDelta(t, adoptOKBefore, testutil.ToFloat64(pool.ShardAdoptions.WithLabelValues(poolName, "ok")), 0,
+		"immediate-empty is not counted as a real adoption")
+}
+
+// TestMetricsShardAdoptDeclinedWhileClosedNotCounted covers AdoptOnce's
+// closed-while-adopting race (ReleaseAll sets closed and releases every
+// owned shard; a concurrent AdoptOnce that then claims one of those
+// newly-freed leases must give it straight back without ever tracking it):
+// the shard was never owned, so there is nothing to drop, and it was never a
+// real adoption, so shard_adoptions_total{result="ok"} must not move either.
+func TestMetricsShardAdoptDeclinedWhileClosedNotCounted(t *testing.T) {
+	const poolName = "metrics-adopt-closed"
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	storetest.MintShard(t, st, poolName, 3, store.ShardMined)
+	m, alloc := newShardManager(st, poolName, clk, nil)
+	require.NoError(t, m.FeedOnce(ctx))
+	require.Len(t, alloc.Shards(), 1, "one shard adopted")
+
+	require.NoError(t, m.ReleaseAll(ctx)) // sets closed=true and frees the owned shard's lease
+
+	dropClosedBefore := testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "closed"))
+	adoptOKBefore := testutil.ToFloat64(pool.ShardAdoptions.WithLabelValues(poolName, "ok"))
+
+	adopted, err := m.AdoptOnce(ctx)
+	require.NoError(t, err)
+	assert.False(t, adopted, "a closed manager declines even an adoptable shard")
+
+	assert.InDelta(t, dropClosedBefore, testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "closed")), 0,
+		"a shard AdoptOnce never tracked in owned was never dropped")
+	assert.InDelta(t, adoptOKBefore, testutil.ToFloat64(pool.ShardAdoptions.WithLabelValues(poolName, "ok")), 0,
+		"declined-while-closing is not counted as a real adoption")
 }
 
 // TestMetricsShardDropClosedOnReleaseAll covers the "closed" reason: graceful
