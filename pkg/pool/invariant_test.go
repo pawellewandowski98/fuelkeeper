@@ -32,6 +32,7 @@ import (
 type live struct {
 	mu       sync.Mutex
 	held     map[store.Outpoint]liveRes
+	relIn    map[store.Outpoint]store.Token // Release call in progress for op under this token
 	st       store.Store
 	poolName string
 }
@@ -48,7 +49,11 @@ const storeGetRowsChunk = 1000
 func (l *live) claim(ctx context.Context, t *testing.T, now time.Time, tok store.Token, exp time.Time, ops []store.Outpoint) {
 	l.mu.Lock()
 	for _, op := range ops {
-		if prev, ok := l.held[op]; ok && prev.tok != tok && now.Before(prev.exp) {
+		// A Release under prev.tok that is still in flight may already have
+		// freed the row in the store (drop only runs once Release returns),
+		// so a re-handout then is legitimate; the store-side check below
+		// still verifies the new reservation.
+		if prev, ok := l.held[op]; ok && prev.tok != tok && now.Before(prev.exp) && l.relIn[op] != prev.tok {
 			t.Errorf("G1 violated: %s handed to %s while live under %s until %s (now %s)", op, tok, prev.tok, prev.exp, now)
 		}
 		l.held[op] = liveRes{tok: tok, exp: exp}
@@ -82,6 +87,29 @@ func (l *live) claim(ctx context.Context, t *testing.T, now time.Time, tok store
 			case r.State != store.StateReserved || r.ReservedBy != tok:
 				t.Errorf("G1 store check: %s state=%s reservedBy=%s, want reserved by %s", op, r.State, r.ReservedBy, tok)
 			}
+		}
+	}
+}
+
+// mark records that a Release of ops under tok is about to start.
+func (l *live) mark(tok store.Token, ops []store.Outpoint) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.relIn == nil {
+		l.relIn = map[store.Outpoint]store.Token{}
+	}
+	for _, op := range ops {
+		l.relIn[op] = tok
+	}
+}
+
+// unmark clears mark's record, only where it is still tok's.
+func (l *live) unmark(tok store.Token, ops []store.Outpoint) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, op := range ops {
+		if l.relIn[op] == tok {
+			delete(l.relIn, op)
 		}
 	}
 }
@@ -403,11 +431,13 @@ func TestInvariantsConcurrentClients(t *testing.T) {
 				case action < 75 && len(mine) > 0: // release
 					i := rng.Intn(len(mine))
 					h := mine[i]
+					lv.mark(h.tok, h.ops)
 					n, err := in.p.Release(ctx, h.tok, h.ops)
 					assert.NoError(t, err)
 					if n > 0 {
 						lv.drop(h.ops)
 					}
+					lv.unmark(h.tok, h.ops)
 					mine = append(mine[:i], mine[i+1:]...)
 				case len(mine) > 0: // spend on-chain then notify
 					i := rng.Intn(len(mine))
@@ -426,11 +456,13 @@ func TestInvariantsConcurrentClients(t *testing.T) {
 			// Drain this goroutine's own remaining reservations before returning.
 			drainInstance := instances[0]
 			for _, h := range mine {
+				lv.mark(h.tok, h.ops)
 				n, err := drainInstance.p.Release(ctx, h.tok, h.ops)
 				assert.NoError(t, err)
 				if n > 0 {
 					lv.drop(h.ops)
 				}
+				lv.unmark(h.tok, h.ops)
 			}
 		}(int64(1000 + c))
 	}

@@ -273,8 +273,8 @@ Runs every `minter.interval`. Responsibilities:
 
 The shard manager per instance (not the minter) owns shards and replenishes in-memory rows:
 
-- Adopts one shard at a time when in-memory rows < `low_water_rows` and owned shards < `max_shards`
-- A reserve request waits at most `instance.adopt_timeout` for adoption to complete
+- Adopts one shard at a time when in-memory rows < `low_water_rows` and owned shards < `max_shards`; at `max_shards` it rescans up to 2 drained shards (oldest first), keeps any whose rows are back, releases those the store shows empty (excluded from re-adoption by this instance for 60 s), and adopts into the freed slots
+- A reserve request waits at most `instance.adopt_timeout` for adoption to complete; lease releases from that rotation run in the background (each bounded at 1 s) and are not charged to the request
 - A crashed instance's shards are re-adopted by others after `instance.lease_ttl` expires
 
 The metric `fuelkeeper_cas_missed_total` counts brief moments when two instances briefly serve the same shard; it clears within one rescan cycle.

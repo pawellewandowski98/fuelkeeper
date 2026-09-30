@@ -606,11 +606,15 @@ func TestEnsureRowsRotatesDrainedShardsWithoutRescanTick(t *testing.T) {
 	assert.False(t, alloc.Has(shards[1].TxID))
 	assert.True(t, alloc.Has(shards[2].TxID))
 	assert.True(t, alloc.Has(shards[3].TxID))
-	for _, sh := range shards[:2] {
-		got, err := st.GetShard(ctx, poolName, sh.TxID)
-		require.NoError(t, err)
-		assert.Empty(t, got.Owner, "released in the store")
-	}
+	require.Eventually(t, func() bool { // the request path releases leases in the background
+		for _, sh := range shards[:2] {
+			got, err := st.GetShard(ctx, poolName, sh.TxID)
+			if err != nil || got.Owner != "" {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 5*time.Millisecond, "released in the store")
 
 	// Keep consuming: every time the FIFO runs dry EnsureRows must find rows
 	// until all 40 are gone.
@@ -740,4 +744,93 @@ func TestRotationBoundedPerCall(t *testing.T) {
 	// Rows are available now, so a further call does not rotate anything.
 	require.True(t, m.EnsureRows(ctx))
 	assert.InDelta(t, dropsBefore+2, dropsEmpty(poolName), 0)
+}
+
+// TestRotationStopsAtFirstRefilledShard pins the keep branch with two
+// candidates: both owned shards are drained, only the older one gets rows
+// back in the store, so rotation re-adds them, keeps it and stops there: the
+// second drained shard is neither rescanned into a drop nor released.
+func TestRotationStopsAtFirstRefilledShard(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "rotate-stop"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, _ := mintN(t, st, clk, poolName, 3, 5)
+	cfg := testInstanceConfig() // MaxShards=2
+	cfg.LowWaterRows = 100
+	m, alloc := newMgr(t, st, clk, cfg, pc)
+	require.NoError(t, m.FeedOnce(ctx))
+	require.True(t, alloc.Has(shards[0].TxID))
+	require.True(t, alloc.Has(shards[1].TxID))
+
+	tok, popped := drainAll(t, st, clk, poolName, alloc)
+	var back []store.Row
+	for _, r := range popped {
+		if r.TxID == shards[0].TxID {
+			back = append(back, r)
+		}
+	}
+	require.Len(t, back, 5)
+	_, err := st.Release(ctx, poolName, tok, storetest.Ops(back[:2]))
+	require.NoError(t, err)
+	dropsBefore := dropsEmpty(poolName)
+
+	require.True(t, m.EnsureRows(ctx))
+	assert.Equal(t, 2, alloc.Available())
+	assert.True(t, alloc.Has(shards[0].TxID), "refilled shard kept")
+	assert.True(t, alloc.Has(shards[1].TxID), "rotation stops at the first refill: the other drained shard is not dropped")
+	assert.False(t, alloc.Has(shards[2].TxID))
+	assert.InDelta(t, dropsBefore, dropsEmpty(poolName), 0)
+	got, err := st.GetShard(ctx, poolName, shards[1].TxID)
+	require.NoError(t, err)
+	assert.Equal(t, m.Holder(), got.Owner)
+}
+
+// slowReleaseStore delays every ReleaseShard call.
+type slowReleaseStore struct {
+	store.Store
+	delay time.Duration
+}
+
+func (w *slowReleaseStore) ReleaseShard(ctx context.Context, pool string, txid chainhash.Hash, holder string) error {
+	time.Sleep(w.delay)
+	return w.Store.ReleaseShard(ctx, pool, txid, holder)
+}
+
+// TestEnsureRowsRotationDoesNotWaitForLeaseRelease pins that the request
+// path does not charge a Reserve for ReleaseShard latency: rotated-out
+// shards are forgotten and excluded synchronously, their leases released in
+// the background.
+func TestEnsureRowsRotationDoesNotWaitForLeaseRelease(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "rotate-slowrel"
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, _ := mintN(t, base, clk, poolName, 4, 10)
+	cfg := testInstanceConfig() // MaxShards=2
+	cfg.LowWaterRows = 100
+	cfg.AdoptTimeout = 200 * time.Millisecond
+	wrapped := &slowReleaseStore{Store: base, delay: 400 * time.Millisecond}
+	m, alloc := newMgr(t, wrapped, clk, cfg, pc)
+	require.NoError(t, m.FeedOnce(ctx))
+	drainAll(t, base, clk, poolName, alloc)
+
+	start := time.Now()
+	require.True(t, m.EnsureRows(ctx))
+	assert.Less(t, time.Since(start), cfg.AdoptTimeout, "EnsureRows must not block on ReleaseShard")
+	assert.False(t, alloc.Has(shards[0].TxID))
+	assert.False(t, alloc.Has(shards[1].TxID))
+	assert.True(t, alloc.Has(shards[2].TxID))
+
+	require.Eventually(t, func() bool {
+		for _, sh := range shards[:2] {
+			got, err := base.GetShard(ctx, poolName, sh.TxID)
+			if err != nil || got.Owner != "" {
+				return false
+			}
+		}
+		return true
+	}, 3*time.Second, 10*time.Millisecond, "leases still released, asynchronously")
 }

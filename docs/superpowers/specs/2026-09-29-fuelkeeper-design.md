@@ -151,8 +151,11 @@ wait for expiry; `spent` is reachable only through the oracle. With
   and owned shards < `max_shards`, `AcquireShard` (oldest `created_at` first,
   status in the serve set, `owner=''` or lease expired, excluding shards this
   instance dropped as empty in the last 60 s), then page `ListAvailable` into
-  the allocator. Adoption never writes fuel rows, so an instance crash loses
-  nothing. Fairness across instances falls out of hunger-driven pulls and the
+  the allocator. At `max_shards` while hungry, the manager rotates instead
+  (as built, 2026-09-30): it rescans up to 2 drained shards oldest first,
+  keeps any whose rows are back, releases those the store shows empty (60 s
+  re-adoption exclusion), and adopts into the freed slots. Adoption never
+  writes fuel rows, so an instance crash loses nothing. Fairness across instances falls out of hunger-driven pulls and the
   cap; no coordinator.
 - Renewal outcomes: ok → refresh cached status/version (refetch BEEF if
   changed); `ErrNotOwner` → drop the shard now; status `retired`/`invalid` →
@@ -160,8 +163,10 @@ wait for expiry; `spent` is reachable only through the oracle. With
   safe), stop adopting, and drop shards whose lease has been expired for more
   than one ttl.
 - A CAS miss on a shard's row triggers an immediate renew + rescan of that
-  shard. Empty after two rescans → `ReleaseShard`. Graceful shutdown releases
-  all shards.
+  shard. Empty after two consecutive periodic rescans → `ReleaseShard`; when
+  hungry at `max_shards`, a drained shard whose store rows show zero
+  available is released at once (rotation; as built, 2026-09-30). Graceful
+  shutdown releases all shards.
 
 **Allocator**
 - Per pool: owned shards oldest-first, each with a FIFO of rows and a `known`
@@ -169,8 +174,8 @@ wait for expiry; `spent` is reachable only through the oracle. With
   request usually maps to one shard (one BEEF). `Add` skips known outpoints,
   which makes rescans safe against double-pop. `Forget` after a CAS miss or a
   successful reserve. Rows return to the FIFO front only if they never reached
-  a flush. No negative cache: an empty FIFO triggers adopt/rescan, never a
-  cached verdict.
+  a flush. No negative cache: an empty FIFO triggers adopt/rescan or rotation
+  (as built, 2026-09-30), never a cached verdict.
 
 **Coalescer** (group commit)
 - `K` flush slots and batch cap `B` from `Store.Capabilities()` (Postgres/
