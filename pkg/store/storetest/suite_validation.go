@@ -177,8 +177,16 @@ func testPoolIsolation(t *testing.T, s store.Store, clk *Clock) {
 	// would still find and mutate main's shard when called against "other" with
 	// main's txid: this must instead find nothing (ErrNotFound per store.go).
 	leaseShard, leaseRows := MintShard(t, s, "main", 2, store.ShardMined)
-	_, err = s.AcquireShard(ctx, "main", "h", clk.Now(), clk.Now().Add(time.Minute), []store.ShardStatus{store.ShardMined}, nil)
+	// Exclude the older, unowned "shard" minted above: adoption picks the oldest
+	// eligible shard first, so without the exclude AcquireShard would adopt
+	// "shard" instead of "leaseShard", leaving leaseShard unowned and making the
+	// RenewShard/ReleaseShard cross-pool assertions below compare "" with "" --
+	// vacuously true even if pool scoping were broken.
+	leaseGot, err := s.AcquireShard(ctx, "main", "h", clk.Now(), clk.Now().Add(time.Minute),
+		[]store.ShardStatus{store.ShardMined}, []chainhash.Hash{shard.TxID})
 	require.NoError(t, err)
+	require.NotNil(t, leaseGot)
+	require.Equal(t, leaseShard.TxID, leaseGot.TxID)
 	beforeLease, err := s.GetShard(ctx, "main", leaseShard.TxID)
 	require.NoError(t, err)
 

@@ -42,7 +42,10 @@ func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl 
 		got = time.UnixMicro(exp.UnixMicro()).UTC()
 		return nil
 	})
-	return got, err
+	if err != nil {
+		return time.Time{}, err
+	}
+	return got, nil
 }
 
 // ReleaseLease implements store.Leaser.

@@ -31,6 +31,8 @@ func testCancelledContextRejected(t *testing.T, s store.Store, clk *Clock) {
 
 	before, err := s.Stats(live, "main")
 	require.NoError(t, err)
+	beforeShard, err := s.GetShard(live, "main", shard.TxID)
+	require.NoError(t, err)
 
 	assertCancelled := func(err error, what string) {
 		t.Helper()
@@ -96,4 +98,21 @@ func testCancelledContextRejected(t *testing.T, s store.Store, clk *Clock) {
 	after, err := s.Stats(live, "main")
 	require.NoError(t, err)
 	assert.Equal(t, before, after, "no cancelled-context call above may have changed anything")
+
+	afterShard, err := s.GetShard(live, "main", shard.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, beforeShard.Owner, afterShard.Owner, "no cancelled-context call above may have changed the shard's owner")
+	assert.Equal(t, beforeShard.LeaseUntil, afterShard.LeaseUntil, "no cancelled-context call above may have changed the shard's lease")
+	assert.Equal(t, beforeShard.Version, afterShard.Version, "no cancelled-context call above may have bumped the shard's version")
+	assert.Equal(t, beforeShard.Status, afterShard.Status, "no cancelled-context call above may have changed the shard's status")
+
+	// The lease acquired before the cancelled calls (as holder "h") must still be
+	// renewable by that same holder afterward: had the cancelled ReleaseLease or
+	// TryAcquireOrRenew above taken effect for another holder, "h" would either
+	// find the lease gone (masked by the insert branch recreating it) or, more
+	// tellingly, find it now unrenewable because another holder holds it
+	// unexpired -- TryAcquireOrRenew returns the zero time in that case.
+	renewed, err := s.TryAcquireOrRenew(live, "jobs/cancel-test", "h", time.Minute)
+	require.NoError(t, err)
+	assert.False(t, renewed.IsZero(), "the lease's original holder must still be able to renew it after the cancelled calls")
 }

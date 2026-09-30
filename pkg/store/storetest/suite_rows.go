@@ -721,6 +721,8 @@ func testSubMicrosecondArguments(t *testing.T, s store.Store, clk *Clock) {
 	got, err := s.AcquireShard(ctx, "main", "h", now, now.Add(time.Microsecond+500*time.Nanosecond), mined, nil)
 	require.NoError(t, err)
 	require.NotNil(t, got, "until a full microsecond after now must be accepted")
+	assert.Equal(t, now.Add(time.Microsecond+500*time.Nanosecond).Truncate(time.Microsecond), got.LeaseUntil.UTC())
+	assert.Equal(t, now.Truncate(time.Microsecond), got.UpdatedAt.UTC())
 
 	// Quarantine's `before` compared against the row's stored (already-truncated)
 	// expires_at.

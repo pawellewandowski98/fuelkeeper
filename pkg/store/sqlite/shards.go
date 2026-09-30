@@ -296,7 +296,10 @@ func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, unti
 		out = &sh
 		return nil
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // RenewShard implements store.Store.
@@ -337,7 +340,10 @@ func (s *Store) RenewShard(ctx context.Context, pool string, txid chainhash.Hash
 		}
 		return store.ErrNotOwner
 	})
-	return head, err
+	if err != nil {
+		return store.ShardHead{}, err
+	}
+	return head, nil
 }
 
 // ReleaseShard implements store.Store.
