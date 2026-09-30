@@ -61,9 +61,30 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("fuelkeeper: %s (code=%s, status=%d)", e.Message, e.Code, e.Status)
 }
 
+// Classification rule (the one place this is decided; both (*APIError).Is
+// and IsRetryable below build on it):
+//
+//   - Sentinel matching (Is) answers "is this the exact, named failure mode":
+//     it only equates an *APIError with ErrUnavailable when the server said
+//     so in a wire.Error ("unavailable"/"internal"), or when a 5xx response's
+//     body could not be parsed as one at all ("http_<5xx>" -- e.g. an HTML
+//     error page from a proxy in front of FuelKeeper). A 409/insufficient or
+//     503/exhausted or 503/backpressure is not ErrUnavailable; it has (and
+//     matches) its own sentinel.
+//   - Retryability (IsRetryable) answers a coarser question, "will retrying
+//     likely help": every 5xx is retryable, whether or not its body parsed
+//     into a recognized code, because a 5xx is by definition the server
+//     reporting its own failure. 409 (insufficient) and 429 (too many
+//     requests) are also retryable even though they are not 5xx. So a 500
+//     with Code "internal" is both ErrUnavailable and retryable; a 502 with
+//     an HTML body is retryable but, since its Code is merely "http_502",
+//     also happens to equal ErrUnavailable through Is's same 5xx-without-a-
+//     recognized-code case above; a 409 (insufficient) is retryable but is
+//     never ErrUnavailable.
+
 // Is reports whether target is one of the package sentinels that e's Code
 // maps to, so callers can use errors.Is(err, client.ErrNotFound) and similar
-// instead of comparing e.Code directly.
+// instead of comparing e.Code directly. See "Classification rule" above.
 func (e *APIError) Is(target error) bool {
 	switch target {
 	case ErrBadRequest:
@@ -79,9 +100,6 @@ func (e *APIError) Is(target error) bool {
 	case ErrBackpressure:
 		return e.Code == "backpressure"
 	case ErrUnavailable:
-		// "http_5xx" is newAPIError's fallback code for a 5xx response whose
-		// body could not be parsed as a wire.Error (e.g. an HTML error page
-		// from a proxy in front of FuelKeeper): that is unavailability too.
 		return e.Code == "unavailable" || e.Code == "internal" ||
 			(e.Status >= http.StatusInternalServerError && strings.HasPrefix(e.Code, "http_"))
 	default:
@@ -90,11 +108,11 @@ func (e *APIError) Is(target error) bool {
 }
 
 // IsRetryable reports whether a client is likely to succeed by retrying err
-// after a short delay.
+// after a short delay. See "Classification rule" above.
 //
-// For an *APIError: a positive RetryAfter, a 503/409/429 status, or any 5xx
-// whose body could not be parsed as a wire.Error (Code "http_5xx" -- see
-// (*APIError).Is).
+// For an *APIError: any 5xx status (regardless of whether its body parsed
+// into a recognized wire.Error code), a 409 or 429 status, or any status
+// paired with a positive RetryAfter.
 //
 // Otherwise: whether err wraps ErrUnavailable. This intentionally does not
 // special-case context.Canceled/context.DeadlineExceeded: wrapTransportErr
@@ -106,11 +124,10 @@ func (e *APIError) Is(target error) bool {
 func IsRetryable(err error) bool {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		return apiErr.RetryAfter > 0 ||
-			apiErr.Status == http.StatusServiceUnavailable ||
+		return apiErr.Status >= http.StatusInternalServerError ||
 			apiErr.Status == http.StatusConflict ||
 			apiErr.Status == http.StatusTooManyRequests ||
-			(apiErr.Status >= http.StatusInternalServerError && strings.HasPrefix(apiErr.Code, "http_"))
+			apiErr.RetryAfter > 0
 	}
 	return errors.Is(err, ErrUnavailable)
 }

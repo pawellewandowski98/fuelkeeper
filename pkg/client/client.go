@@ -32,11 +32,15 @@ const (
 	// an unusually large BEEF blob may need a longer bound; pass a custom
 	// *http.Client via WithHTTPClient to change it.
 	defaultTimeout = 10 * time.Second
-	// maxIdleConnsPerHost and idleConnTimeout tune the default transport's
-	// keep-alive pool for a client that talks to one FuelKeeper server
-	// repeatedly (every Reserve/Release/Spend/BEEF call).
-	maxIdleConnsPerHost = 64
-	idleConnTimeout     = 90 * time.Second
+	// maxIdleConnsPerHost and maxIdleConns raise the default transport's
+	// keep-alive pool (cloned from http.DefaultTransport, which caps both far
+	// lower) well past a single-server client's own needs, so a load
+	// generator that reuses one Client for many concurrent calls to one
+	// FuelKeeper host (e.g. fuelbench) does not thrash connections. Pass a
+	// custom *http.Client via WithHTTPClient for an even larger pool, a
+	// different proxy, or per-host tuning across several FuelKeeper hosts.
+	maxIdleConnsPerHost = 256
+	maxIdleConns        = 512
 	// defaultUserAgent is sent unless overridden with WithUserAgent.
 	defaultUserAgent = "fuelkeeper-client/1"
 
@@ -74,12 +78,25 @@ type beefEntry struct {
 	bytes   []byte
 }
 
+// Observer is a per-call hook invoked after every HTTP request a Client
+// makes (a cache hit that never reaches the network does not invoke it): for
+// timing/telemetry, e.g. fuelbench or fueldemo. method and path identify the
+// endpoint (path excludes the query string, to keep cardinality low); status
+// is the resulting HTTP status code, or 0 if no response was ever received
+// (a transport failure); d is the request's wall-clock duration, from just
+// before it was sent to just after its body was fully read or the failure
+// was known; err is the error the call is returning (nil on success). An
+// Observer must return quickly and must not call back into the Client that
+// invoked it, to avoid deadlocking that Client.
+type Observer func(method, path string, status int, d time.Duration, err error)
+
 // Client is a FuelKeeper HTTP API client. It is safe for concurrent use.
 type Client struct {
 	base      *url.URL
 	hc        *http.Client
 	apiKey    string
 	userAgent string
+	observer  Observer
 
 	mu      sync.Mutex
 	beefIdx map[string]*list.Element // "pool/txid" -> element in beefLRU[pool]
@@ -97,8 +114,14 @@ func WithAPIKey(key string) Option {
 	return func(c *Client) { c.apiKey = key }
 }
 
-// WithHTTPClient overrides the default *http.Client (a 10 s timeout over a
-// keep-alive transport with MaxIdleConnsPerHost 64 and IdleConnTimeout 90 s).
+// WithHTTPClient overrides the default *http.Client: a 10 s timeout over a
+// transport cloned from http.DefaultTransport (keeping its dial and TLS
+// handshake timeouts, proxy support and the rest of its defaults) with
+// MaxIdleConnsPerHost raised to 256 and MaxIdleConns to 512. A load generator
+// driving far more concurrent requests at one FuelKeeper host than that --
+// fuelbench, say -- should pass its own *http.Client with a larger pool
+// still (and no per-request Timeout, if it wants requests bounded by ctx
+// alone).
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.hc = hc }
 }
@@ -106,6 +129,13 @@ func WithHTTPClient(hc *http.Client) Option {
 // WithUserAgent overrides the default "User-Agent" header value.
 func WithUserAgent(ua string) Option {
 	return func(c *Client) { c.userAgent = ua }
+}
+
+// WithObserver sets a per-call hook invoked after every HTTP request (see
+// Observer). Only one observer may be set; a later WithObserver replaces an
+// earlier one.
+func WithObserver(fn Observer) Option {
+	return func(c *Client) { c.observer = fn }
 }
 
 // New builds a Client for the FuelKeeper server at baseURL, which must be an
@@ -121,11 +151,8 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 	c := &Client{
 		base: u,
 		hc: &http.Client{
-			Timeout: defaultTimeout,
-			Transport: &http.Transport{
-				MaxIdleConnsPerHost: maxIdleConnsPerHost,
-				IdleConnTimeout:     idleConnTimeout,
-			},
+			Timeout:   defaultTimeout,
+			Transport: newDefaultTransport(),
 		},
 		userAgent: defaultUserAgent,
 		beefIdx:   make(map[string]*list.Element),
@@ -135,6 +162,16 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 		opt(c)
 	}
 	return c, nil
+}
+
+// newDefaultTransport clones http.DefaultTransport -- keeping its dial and
+// TLS handshake timeouts, proxy support and the rest of its defaults -- and
+// only raises the idle-connection pool limits (see WithHTTPClient).
+func newDefaultTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone() // http.DefaultTransport is always *http.Transport
+	t.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	t.MaxIdleConns = maxIdleConns
+	return t
 }
 
 // newRequest builds an HTTP request against path (joined onto the base URL)
@@ -187,31 +224,59 @@ func readErrorBody(resp *http.Response) []byte {
 	return body
 }
 
+// notify invokes the configured Observer (if any) for one completed request:
+// status is 0 when no response was ever received.
+func (c *Client) notify(method, path string, status int, start time.Time, err error) {
+	if c.observer == nil {
+		return
+	}
+	c.observer(method, path, status, time.Since(start), err)
+}
+
+// statusOf extracts the HTTP status err carries as an *APIError, or 0 for a
+// transport failure (which never reached a response).
+func statusOf(err error) int {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Status
+	}
+	return 0
+}
+
 // doJSON sends a JSON request and, on a 2xx response, decodes the body into
 // into (which may be nil to discard it). A non-2xx response is mapped to
 // *APIError. A failure reading or decoding a 2xx body (e.g. a connection
 // dropped mid-response) goes through wrapTransportErr like any other
 // transport failure, since the client cannot tell that apart from the server
 // having gone away. The response body is always closed before doJSON
-// returns.
-func (c *Client) doJSON(ctx context.Context, method, path, rawQuery string, body, into any) error {
+// returns. The configured Observer (see WithObserver), if any, is notified
+// once per call.
+func (c *Client) doJSON(ctx context.Context, method, path, rawQuery string, body, into any) (err error) {
+	start := time.Now()
+	status := 0
+	defer func() { c.notify(method, path, status, start, err) }()
+
 	req, err := c.newRequest(ctx, method, path, rawQuery, acceptJSON, body)
 	if err != nil {
 		return err
 	}
 	resp, err := c.do(ctx, req)
 	if err != nil {
+		status = statusOf(err)
 		return err
 	}
+	status = resp.StatusCode
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return newAPIError(resp.StatusCode, readErrorBody(resp), resp.Header)
+		err = newAPIError(resp.StatusCode, readErrorBody(resp), resp.Header)
+		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if into == nil {
 		return nil
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJSONBytes)).Decode(into); err != nil {
-		return wrapTransportErr(ctx, err)
+	if decErr := json.NewDecoder(io.LimitReader(resp.Body, maxJSONBytes)).Decode(into); decErr != nil {
+		err = wrapTransportErr(ctx, decErr)
+		return err
 	}
 	return nil
 }
@@ -281,22 +346,31 @@ const (
 )
 
 // ReserveWithRetry calls Reserve, retrying while the error is IsRetryable:
-// waiting the server-given Retry-After when the error carries one, or
-// otherwise an exponential backoff starting at retryBaseDelay and doubling up
-// to retryMaxDelay with +/-20% jitter. It gives up and returns the last error
-// once a non-retryable error is returned, once ctx is done, or (with
-// WithMaxAttempts) once the attempt cap is reached.
+// waiting the server-given Retry-After (also jittered by +/-20%, so many
+// clients hitting the same Retry-After do not all retry in lockstep) when the
+// error carries one, or otherwise an exponential backoff starting at
+// retryBaseDelay and doubling up to retryMaxDelay with +/-20% jitter. Either
+// wait is capped to ctx's remaining time, so ReserveWithRetry never sleeps
+// past ctx's deadline. It gives up once a non-retryable error is returned or
+// (with WithMaxAttempts) once the attempt cap is reached, returning that
+// error; if ctx ends first (while waiting to retry), it returns
+// errors.Join(ctx.Err(), lastErr) so the last API error is not lost.
 func (c *Client) ReserveWithRetry(ctx context.Context, pool string, req ReserveRequest, opts ...RetryOption) (*wire.ReserveResponse, error) {
 	var cfg retryConfig
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 	delay := retryBaseDelay
+	var lastErr error
 	for attempt := 1; ; attempt++ {
+		if cErr := ctx.Err(); cErr != nil {
+			return nil, errors.Join(cErr, lastErr)
+		}
 		res, err := c.Reserve(ctx, pool, req)
 		if err == nil {
 			return res, nil
 		}
+		lastErr = err
 		if !IsRetryable(err) {
 			return nil, err
 		}
@@ -306,14 +380,31 @@ func (c *Client) ReserveWithRetry(ctx context.Context, pool string, req ReserveR
 		wait := jitter(delay)
 		var apiErr *APIError
 		if errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
-			wait = time.Duration(apiErr.RetryAfter) * time.Second
+			wait = jitter(time.Duration(apiErr.RetryAfter) * time.Second)
 		}
 		delay = min(delay*2, retryMaxDelay)
+
+		// If ctx's own deadline is the limiting factor, block on ctx.Done()
+		// directly instead of racing a separately-scheduled timer against
+		// it: two independent timers set for "the same" instant have no
+		// guaranteed firing order, so a timer merely capped to
+		// time.Until(deadline) can still fire microseconds before ctx is
+		// actually marked done, letting the loop slip through to one more
+		// Reserve call against an already-expiring ctx -- which fails with
+		// its own context-flavored transport error mid-request and would
+		// silently lose lastErr. Waiting on ctx.Done() itself has no such
+		// race: it only ever unblocks once ctx.Err() is already set.
+		if deadline, ok := ctx.Deadline(); ok {
+			if remaining := time.Until(deadline); remaining <= wait {
+				<-ctx.Done()
+				return nil, errors.Join(ctx.Err(), lastErr)
+			}
+		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, ctx.Err()
+			return nil, errors.Join(ctx.Err(), lastErr)
 		case <-timer.C:
 		}
 	}
@@ -467,17 +558,26 @@ func (c *Client) BEEF(ctx context.Context, pool string, shard wire.Shard) ([]byt
 // fetchBEEF is BEEF's singleflight-deduplicated leader: it runs detached
 // from any single caller's ctx (c.hc's own Timeout bounds it instead),
 // because one caller giving up must not abort the fetch for every other
-// caller still waiting on the same shard and version.
-func (c *Client) fetchBEEF(pool string, shard wire.Shard) ([]byte, error) {
+// caller still waiting on the same shard and version. The configured
+// Observer (see WithObserver), if any, is notified once per call.
+func (c *Client) fetchBEEF(pool string, shard wire.Shard) (body []byte, err error) {
+	path := poolPath(pool, "/beef/"+url.PathEscape(shard.TxID))
+	start := time.Now()
+	status := 0
+	defer func() { c.notify(http.MethodGet, path, status, start, err) }()
+
 	ctx := context.Background()
-	resp, err := c.getRaw(ctx, poolPath(pool, "/beef/"+url.PathEscape(shard.TxID)))
+	resp, err := c.getRaw(ctx, path)
 	if err != nil {
+		status = statusOf(err)
 		return nil, err
 	}
+	status = resp.StatusCode
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBEEFBytes))
+	body, err = io.ReadAll(io.LimitReader(resp.Body, maxBEEFBytes))
 	if err != nil {
-		return nil, wrapTransportErr(ctx, err)
+		err = wrapTransportErr(ctx, err)
+		return nil, err
 	}
 	version := parseETagVersion(resp.Header.Get("ETag"))
 	c.mu.Lock()

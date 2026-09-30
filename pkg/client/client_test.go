@@ -373,3 +373,113 @@ func TestReserveWithRetryMaxAttempts(t *testing.T) {
 	require.ErrorIs(t, err, client.ErrExhausted)
 	assert.Equal(t, int32(2), n.Load(), "WithMaxAttempts(2) should try exactly twice")
 }
+
+// TestReserveWithRetryRespectsDeadlineAndJoinsLastError covers ReserveWithRetry
+// capping its wait to ctx's remaining time (never oversleeping a long
+// server-given Retry-After) and, once ctx ends, returning an error that still
+// carries the last API error via errors.Join rather than only ctx.Err().
+func TestReserveWithRetryRespectsDeadlineAndJoinsLastError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// A deliberately long Retry-After: ctx should cut this short well
+		// before the client would otherwise wait it out.
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(wire.Error{Code: "exhausted", Message: "no fuel", RetryAfter: 10})
+	}))
+	defer srv.Close()
+
+	c, err := client.New(srv.URL)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err = c.ReserveWithRetry(ctx, "main", client.ReserveRequest{Count: 1})
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "ctx ending should be part of the returned error")
+	require.ErrorIs(t, err, client.ErrExhausted, "the last API error must not be lost when ctx ends")
+	assert.Less(t, elapsed, time.Second, "ReserveWithRetry must not sleep past ctx's deadline despite a 10s Retry-After")
+}
+
+// TestIsRetryableAllFiveXX covers every 5xx being retryable even when its
+// body parses into a wire.Error with a code IsRetryable/Is do not recognize
+// (i.e. retryability does not depend on the server's body being well-formed
+// or its code being one FuelKeeper's own server ever sends); such a status,
+// having its own specific code, is deliberately not ErrUnavailable (see the
+// "Classification rule" comment in errors.go).
+func TestIsRetryableAllFiveXX(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(wire.Error{Code: "database_error", Message: "boom"})
+	}))
+	defer srv.Close()
+
+	c, err := client.New(srv.URL)
+	require.NoError(t, err)
+
+	_, err = c.Pools(context.Background())
+	require.Error(t, err)
+	var apiErr *client.APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusInternalServerError, apiErr.Status)
+	assert.Equal(t, "database_error", apiErr.Code)
+	assert.True(t, client.IsRetryable(err), "every 5xx is retryable, whether or not its body parses into a recognized code")
+	assert.NotErrorIs(t, err, client.ErrUnavailable, "a 5xx with its own recognized (if unfamiliar) code is not ErrUnavailable")
+}
+
+// TestWithObserver covers the per-call Observer hook firing once per actual
+// HTTP request (not per cache hit), with the method, path, status and error
+// it observed.
+func TestWithObserver(t *testing.T) {
+	type observed struct {
+		method string
+		path   string
+		status int
+		err    error
+	}
+	srv, st, _ := startAPI(t, nil)
+	sh, _ := storetest.MintShard(t, st, "main", 1, store.ShardMined)
+
+	var mu sync.Mutex
+	var calls []observed
+	c, err := client.New(srv.URL, client.WithObserver(func(method, path string, status int, d time.Duration, err error) {
+		assert.Positive(t, d, "observer should see a non-zero duration")
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, observed{method, path, status, err})
+	}))
+	require.NoError(t, err)
+
+	_, err = c.Pools(context.Background())
+	require.NoError(t, err)
+
+	_, err = c.Reserve(context.Background(), "nope", client.ReserveRequest{Count: 1})
+	require.Error(t, err)
+
+	shardRef := wire.Shard{TxID: sh.TxID.String(), Version: sh.Version}
+	_, err = c.BEEF(context.Background(), "main", shardRef)
+	require.NoError(t, err)
+	_, err = c.BEEF(context.Background(), "main", shardRef) // cache hit: must not add another observer call
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, calls, 3, "one observer call per actual request; the cache hit must not add a fourth")
+
+	assert.Equal(t, "GET", calls[0].method)
+	assert.Equal(t, "/v1/pools", calls[0].path)
+	assert.Equal(t, http.StatusOK, calls[0].status)
+	require.NoError(t, calls[0].err)
+
+	assert.Equal(t, "POST", calls[1].method)
+	assert.Equal(t, "/v1/pools/nope/reserve", calls[1].path)
+	assert.Equal(t, http.StatusNotFound, calls[1].status)
+	require.Error(t, calls[1].err)
+
+	assert.Equal(t, "GET", calls[2].method)
+	assert.Equal(t, "/v1/pools/main/beef/"+sh.TxID.String(), calls[2].path)
+	assert.Equal(t, http.StatusOK, calls[2].status)
+	assert.NoError(t, calls[2].err)
+}
