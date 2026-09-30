@@ -42,6 +42,7 @@ func subtests() []subtest {
 		{"ReleaseGuard", testReleaseGuard},
 		{"SpendGuard", testSpendGuard},
 		{"QuarantineByExpiry", testQuarantineByExpiry},
+		{"EdgeTimeBoundsMatchNothing", testEdgeTimeBoundsMatchNothing},
 		{"ResolveGuard", testResolveGuard},
 		{"ListAvailablePagination", testListAvailablePagination},
 		{"StatsCounts", testStatsCounts},

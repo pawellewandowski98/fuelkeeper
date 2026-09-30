@@ -227,21 +227,21 @@ func packVouts(rows []store.Row) []byte {
 }
 
 // shardOutpoints decodes a shard record's vo bin into its rows' outpoints.
-// A record without vo (none exist under schema version 2) falls back to
-// vouts 0..size-1, the layout every minted shard uses.
-func shardOutpoints(txid chainhash.Hash, vo []byte, size int) []store.Outpoint {
+// Schema v2's migration refuses to start against a v1 store (see aerospike.go),
+// so every record this backend ever reads was written with a vo bin: one
+// missing here means the record is corrupt, not merely legacy. Guessing vouts
+// 0..size-1 in that case would silently retire or adopt the wrong rows
+// whenever a shard's actual vout list ever differed from that assumption, so
+// this fails loudly instead.
+func shardOutpoints(txid chainhash.Hash, vo []byte) ([]store.Outpoint, error) {
 	if len(vo) == 0 {
-		out := make([]store.Outpoint, size)
-		for i := range out {
-			out[i] = store.Outpoint{TxID: txid, Vout: uint32(i)} //nolint:gosec // size <= maxBatch
-		}
-		return out
+		return nil, fmt.Errorf("%w: aerospike: shard record has no vout list (txid %s)", store.ErrUnavailable, txid)
 	}
 	out := make([]store.Outpoint, 0, len(vo)/4)
 	for i := 0; i+4 <= len(vo); i += 4 {
 		out = append(out, store.Outpoint{TxID: txid, Vout: binary.BigEndian.Uint32(vo[i:])})
 	}
-	return out
+	return out, nil
 }
 
 // rowBins builds the bin map PutShard inserts for a fresh, available row.

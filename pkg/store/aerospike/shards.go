@@ -234,7 +234,10 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 		}
 		return 0, wrap(aerr)
 	}
-	outpoints := shardOutpoints(txid, toBytes(rec.Bins[binVO]), int(toInt64(rec.Bins[binSize])))
+	outpoints, err := shardOutpoints(txid, toBytes(rec.Bins[binVO]))
+	if err != nil {
+		return 0, err
+	}
 
 	now := s.now().Truncate(time.Microsecond)
 	n, err := s.retireRows(ctx, pool, outpoints, now)

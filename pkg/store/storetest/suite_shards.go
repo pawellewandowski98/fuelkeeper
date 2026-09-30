@@ -481,7 +481,7 @@ func testRetireShardCascade(t *testing.T, s store.Store, clk *Clock) {
 
 	changed, err = s.RetireShard(ctx, "main", shard.TxID)
 	require.NoError(t, err)
-	assert.Equal(t, 0, changed, "idempotent")
+	assert.Equal(t, 0, changed, "the shard is already invalid and every row is now terminal (invalid), so this returns 0")
 	shAfterSecondRetire, err := s.GetShard(ctx, "main", shard.TxID)
 	require.NoError(t, err)
 	assert.Equal(t, sh.Version, shAfterSecondRetire.Version, "second retire does not bump Version")

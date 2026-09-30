@@ -182,6 +182,13 @@ func TestValidateAcquireUntilRejectsPreEpoch(t *testing.T) {
 	require.NoError(t, store.ValidateAcquireUntil(now.Add(time.Minute), now))
 }
 
+func TestValidateRenewUntilRejectsEpochAndPreEpoch(t *testing.T) {
+	require.ErrorIs(t, store.ValidateRenewUntil(time.Time{}), store.ErrInvalidArgument, "zero until is indistinguishable from unowned")
+	require.ErrorIs(t, store.ValidateRenewUntil(time.Unix(0, 0)), store.ErrInvalidArgument, "the exact epoch instant collides with the zero-time sentinel on disk")
+	require.ErrorIs(t, store.ValidateRenewUntil(time.Unix(-1, 0)), store.ErrInvalidArgument, "before the epoch")
+	require.NoError(t, store.ValidateRenewUntil(time.Now().Add(time.Minute)))
+}
+
 func TestValidateReserveOpsRejectsPreEpochExpiry(t *testing.T) {
 	tok := store.NewToken()
 	preEpoch := []store.ReserveOp{{Outpoint: store.Outpoint{TxID: hashN(1), Vout: 0}, Token: tok, ExpiresAt: time.Unix(0, 0)}}

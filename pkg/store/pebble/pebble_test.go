@@ -126,6 +126,48 @@ func TestNoOpCommitWritesNothing(t *testing.T) {
 	require.Equal(t, store.Stats{}, st, "counters must stay correct after no-op calls")
 }
 
+// TestQuarantineEdgeTimes pins that Quarantine's before and ListQuarantined's
+// before/after are comparison bounds, not stored data (store.go, "Clocks"):
+// the zero time, the exact Unix epoch instant, or an earlier time all match
+// nothing and return 0 / an empty page, never ErrInvalidArgument -- unlike
+// ValidateTime, which still applies to Reserve's ExpiresAt and
+// AcquireShard/RenewShard's until, because those ARE stored as data. This
+// also guards against the key-encoding trap: pebble's us() maps a time to an
+// *unsigned* microsecond count, so a pre-epoch before's negative Unix time
+// would otherwise wrap around to a huge value and match everything instead
+// of nothing. Mirrors pkg/store/aerospike's TestQuarantineEdgeTimes, the
+// behaviour this backend is aligned to.
+func TestQuarantineEdgeTimes(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	s, err := pebblestore.Open(ctx, pebblestore.Config{Path: t.TempDir(), NoSync: true}, pebblestore.WithClock(clk.Now))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	_, rows := storetest.MintShard(t, s, "main", 2, store.ShardMined)
+	tok := store.NewToken()
+	storetest.MustReserve(t, s, "main", rows, tok, clk.Now().Add(time.Minute))
+	_, err = s.Spend(ctx, "main", tok, storetest.Ops(rows[:1]), storetest.NewTxID(), false)
+	require.NoError(t, err) // one quarantined, one reserved: both queries have something to (not) find
+
+	for _, before := range []time.Time{{}, time.Unix(0, 0), time.Unix(-100, 0), time.Unix(0, 1000)} {
+		n, err := s.Quarantine(ctx, "main", before, 10)
+		require.NoError(t, err, "Quarantine(before=%v)", before)
+		require.Zero(t, n)
+		got, err := s.ListQuarantined(ctx, "main", before, nil, 10)
+		require.NoError(t, err, "ListQuarantined(before=%v)", before)
+		require.Empty(t, got)
+	}
+	for _, at := range []time.Time{clk.Now(), clk.Now().Add(time.Hour)} {
+		got, err := s.ListQuarantined(ctx, "main", clk.Now(), &store.RowCursor{At: at}, 10)
+		require.NoError(t, err, "after.At=%v >= before", at)
+		require.Empty(t, got)
+	}
+	got, err := s.ListQuarantined(ctx, "main", clk.Now().Add(time.Second), nil, 10)
+	require.NoError(t, err)
+	require.Len(t, got, 1, "control: the quarantined row is listed for a normal before")
+}
+
 // diskUsage sums the size of every file under dir.
 func diskUsage(t *testing.T, dir string) (int64, error) {
 	t.Helper()

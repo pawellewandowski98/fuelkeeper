@@ -25,6 +25,10 @@ func fromUS(v uint64) time.Time {
 	return time.UnixMicro(int64(v)).UTC() //nolint:gosec // bounded
 }
 
+// unixEpoch mirrors store.ValidateTime's rejection boundary (that var is
+// unexported there): see matchesNothingBefore in rows.go.
+var unixEpoch = time.Unix(0, 0).UTC()
+
 // appendPool appends a length-prefixed pool name to k. store.ValidatePool caps
 // pool names at 64 bytes but places no restriction on which bytes a pool name
 // may contain (the design sketch's "pool + 0x00" separator would be ambiguous

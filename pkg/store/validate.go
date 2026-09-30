@@ -123,12 +123,17 @@ func ValidateAcquireUntil(until, now time.Time) error {
 }
 
 // ValidateRenewUntil checks the lease expiry passed to RenewShard: it must be
-// non-zero (a zero time would be indistinguishable from "unowned").
+// non-zero (a zero time would be indistinguishable from "unowned") and, like
+// every other time argument stored as data, strictly after the Unix epoch
+// (ValidateTime). RenewShard stores until as the shard's LeaseUntil, so an
+// epoch-or-earlier until would otherwise round-trip indistinguishably from
+// "unset" (store.go, "Clocks"), breaking "Owner is empty iff LeaseUntil is
+// zero": Owner would stay set while LeaseUntil read back as the zero time.
 func ValidateRenewUntil(until time.Time) error {
 	if until.IsZero() {
 		return invalidf("renew until must not be zero")
 	}
-	return nil
+	return ValidateTime(until, "renew until")
 }
 
 // ValidateShardStatuses checks an AcquireShard status set: at least one status,

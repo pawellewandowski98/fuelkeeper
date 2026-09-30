@@ -165,7 +165,7 @@ func testRetireVsReleaseRace(t *testing.T, s store.Store, clk *Clock) {
 	close(stop)
 	wg.Wait()
 
-	assert.Equal(t, n, changed, "no row is ever spent in this test, so the single RetireShard call must cascade all of them")
+	assert.Equal(t, n, changed, "no row is ever spent in this test, so the single RetireShard call must move every non-terminal row to invalid exactly once")
 
 	got := RowsByOutpoint(t, s, pool, Ops(rows))
 	require.Len(t, got, n)
@@ -197,7 +197,7 @@ func testRetireVsReleaseRace(t *testing.T, s store.Store, clk *Clock) {
 
 	again, err := s.RetireShard(ctx, pool, sh.TxID)
 	require.NoError(t, err)
-	assert.Zero(t, again, "a second RetireShard is the documented no-op")
+	assert.Zero(t, again, "the shard is already invalid and every row is now terminal (invalid), so a second RetireShard returns 0")
 
 	gotShard, err := s.GetShard(ctx, pool, sh.TxID)
 	require.NoError(t, err)

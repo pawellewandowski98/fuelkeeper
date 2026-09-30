@@ -81,11 +81,24 @@ func TestBoundedTopKeepsSmallest(t *testing.T) {
 func TestShardOutpointsRoundTrip(t *testing.T) {
 	sh, rows := storetest.BuildShard("main", 5, store.ShardMined)
 	rows[2].Vout = 77 // vouts need not be 0..n-1
-	got := shardOutpoints(sh.TxID, packVouts(rows), sh.Size)
+	got, err := shardOutpoints(sh.TxID, packVouts(rows))
+	require.NoError(t, err)
 	assert.Equal(t, storetest.Ops(rows), got)
+}
 
-	legacy := shardOutpoints(sh.TxID, nil, 3)
-	assert.Equal(t, []store.Outpoint{{TxID: sh.TxID, Vout: 0}, {TxID: sh.TxID, Vout: 1}, {TxID: sh.TxID, Vout: 2}}, legacy)
+// TestShardOutpointsRejectsMissingVoutList pins the nit fix: schema v2's
+// migration refuses to start against a v1 store, so a shard record with no vo
+// bin is corrupt, not legacy, and must never be papered over by guessing
+// vouts 0..size-1. A hand-built record (no vo bin at all, and one with an
+// empty vo bin) must fail loudly instead.
+func TestShardOutpointsRejectsMissingVoutList(t *testing.T) {
+	txid := storetest.NewTxID()
+
+	_, err := shardOutpoints(txid, nil)
+	require.ErrorIs(t, err, store.ErrUnavailable, "a hand-built record with no vo bin at all")
+
+	_, err = shardOutpoints(txid, []byte{})
+	require.ErrorIs(t, err, store.ErrUnavailable, "a hand-built record with an empty vo bin")
 }
 
 func TestKeysAndIndexValuesCarryTenant(t *testing.T) {

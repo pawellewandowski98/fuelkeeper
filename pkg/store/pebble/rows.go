@@ -17,6 +17,16 @@ func clearReservation(r *store.Row) {
 	r.SpentHint = nil
 }
 
+// matchesNothingBefore reports whether before -- Quarantine's and
+// ListQuarantined's comparison bound, not stored data (store.go, "Clocks") --
+// can only ever match nothing: the zero time, the exact Unix epoch instant,
+// or any earlier time. Every stored expires_at/quarantined_at is strictly
+// after the epoch (store.ValidateTime enforces this on write), so none of
+// these can ever be less than a real stored value.
+func matchesNothingBefore(before time.Time) bool {
+	return !before.After(unixEpoch)
+}
+
 // ListAvailable implements store.Store.
 func (s *Store) ListAvailable(ctx context.Context, pool string, txid chainhash.Hash, fromVout uint32, limit int) ([]store.Row, error) {
 	if err := ctx.Err(); err != nil {
@@ -254,10 +264,16 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 	})
 }
 
-// Quarantine implements store.Store. It additionally rejects a pre-epoch (or
-// exact-epoch) before with ErrInvalidArgument via store.ValidateTime: this
-// backend-specific check is not yet part of the shared conformance suite,
-// since it isn't (yet) applied by every other backend's Quarantine.
+// Quarantine implements store.Store. before is a comparison bound, not
+// stored data (store.go, "Clocks"): the zero time, the exact Unix epoch
+// instant, or an earlier time all match nothing, since every stored
+// expires_at is strictly after the epoch, so this returns 0, nil for them
+// without querying rather than ErrInvalidArgument (matchesNothingBefore).
+// Checking the time.Time value itself here, before it is ever encoded, also
+// sidesteps a trap in the key encoding below: us() maps a time to an
+// *unsigned* microsecond count, so a pre-epoch before's negative Unix time
+// would otherwise wrap around to a huge value and match everything instead
+// of nothing.
 func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, limit int) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -268,8 +284,8 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 	if err := store.ValidateLimit(limit); err != nil {
 		return 0, err
 	}
-	if err := store.ValidateTime(before, "before"); err != nil {
-		return 0, err
+	if matchesNothingBefore(before) {
+		return 0, nil
 	}
 	before = before.Truncate(time.Microsecond)
 	s.mu.Lock()
@@ -324,10 +340,15 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 	return n, nil
 }
 
-// ListQuarantined implements store.Store. It additionally rejects a
-// pre-epoch (or exact-epoch) before with ErrInvalidArgument via
-// store.ValidateTime; see Quarantine's doc comment for why this is not yet a
-// suite-wide conformance requirement.
+// ListQuarantined implements store.Store. before is a comparison bound, not
+// stored data (store.go, "Clocks"): a before at or before the Unix epoch
+// matches nothing (see Quarantine's doc comment for why, and for the key-
+// encoding trap this sidesteps) and returns an empty page, nil, without
+// querying, rather than ErrInvalidArgument. An after cursor at or past
+// before also matches nothing, but needs no separate check here: the range
+// [nextKey(quarantineKey(pool, after.At, after.Outpoint)), upperBoundBefore(before))
+// is already empty by construction whenever after is not strictly before
+// before.
 func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Time, after *store.RowCursor, limit int) ([]store.Row, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -338,8 +359,8 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 	if err := store.ValidateLimit(limit); err != nil {
 		return nil, err
 	}
-	if err := store.ValidateTime(before, "before"); err != nil {
-		return nil, err
+	if matchesNothingBefore(before) {
+		return nil, nil
 	}
 	before = before.Truncate(time.Microsecond)
 	s.mu.Lock()
