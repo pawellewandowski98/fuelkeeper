@@ -61,6 +61,107 @@ const listQuarantinedAfterSQL = `
 	   AND (r.quarantined_at, r.txid, r.vout) > ($3, $4, $5)
 	 ORDER BY r.quarantined_at, r.txid, r.vout LIMIT $6`
 
+// listAvailableSQL is ListAvailable's statement: pool = $1, txid = $2, fromVout = $3, limit = $4.
+const listAvailableSQL = `
+	SELECT ` + rowCols + ` FROM fuel_rows r
+	 WHERE r.pool = $1 AND r.txid = $2 AND r.state = 0 AND r.vout >= $3
+	 ORDER BY r.vout LIMIT $4`
+
+// getRowsSQL is GetRows's statement: pool = $1, txids = $2, vouts = $3.
+const getRowsSQL = `
+	SELECT ` + rowCols + ` FROM fuel_rows r
+	  JOIN unnest($2::bytea[], $3::int4[]) AS k(txid, vout) ON r.txid = k.txid AND r.vout = k.vout
+	 WHERE r.pool = $1`
+
+// reserveRowSQL is Reserve's per-row statement: pool = $1, txid = $2, vout =
+// $3, token = $4, now = $5, expiresAt = $6. updated_at is stamped only when
+// the row actually transitions from available (state = 0); a same-token
+// replay of an already-reserved row leaves it alone (see store.go
+// "Idempotency"). Unlike updateReserved/Resolve's per-row statements, this one
+// needs no IS TRUE guard: state appears only inside an OR (state = 0 OR
+// (state = 1 AND ...)), so the WHERE clause never implies a single fixed
+// value of state, and neither fuel_rows_avail nor fuel_rows_expiry's partial
+// predicate can ever be proved implied (confirmed by EXPLAIN below).
+const reserveRowSQL = `
+	UPDATE fuel_rows
+	   SET state = 1,
+	       reserved_by = $4,
+	       reserved_at = CASE WHEN state = 0 THEN $5 ELSE reserved_at END,
+	       expires_at  = CASE WHEN state = 0 THEN $6 ELSE expires_at END,
+	       updated_at  = CASE WHEN state = 0 THEN $5 ELSE updated_at END
+	 WHERE pool = $1 AND txid = $2 AND vout = $3
+	   AND (state = 0 OR (state = 1 AND reserved_by = $4))
+	RETURNING expires_at`
+
+// updateReservedWhereSQL is the WHERE clause shared by every updateReserved
+// (Release/Spend) per-row statement: pool = $1, txid = $2, vout = $3, token =
+// $4; each set clause (releaseSetClause / spendTerminalSetClause /
+// spendHintSetClause) references $5 (now) and beyond.
+//
+// (state = 1) IS TRUE, not state = 1: this predicate targets exactly one row
+// via its primary key (txid, vout), but a plain "state = 1" is *exactly* the
+// partial predicate on fuel_rows_expiry (pool, expires_at, txid, vout) WHERE
+// state = 1. Postgres's partial-index-match check is a syntactic proof, not a
+// cost comparison: once it can prove the WHERE clause implies state = 1, the
+// index becomes an eligible plan, and a generic (parameter-value-blind) plan
+// -- which every backend connection settles into after a handful of
+// executions of the same statement text -- routinely picks it whenever
+// ANALYZE last ran with few reserved rows, turning an O(log n) PK lookup into
+// an O(reserved rows in pool) scan (measured locally: Release p50 ~132ms
+// unguarded vs ~50ms guarded, 8 workers x 256 ops, ~5000 reserved rows,
+// ANALYZE taken at 0 reserved; see explain_test.go for the EXPLAIN proof).
+// Wrapping the comparison in IS TRUE (a no-op given state is NOT NULL)
+// changes its shape just enough that the proof no longer holds, so the
+// partial index is never considered and the PK is used unconditionally.
+const updateReservedWhereSQL = ` WHERE pool = $1 AND txid = $2 AND vout = $3 AND (state = 1) IS TRUE AND reserved_by = $4`
+
+const releaseSetClause = `state = 0, reserved_by = NULL, reserved_at = NULL, expires_at = NULL, quarantined_at = NULL, spent_hint = NULL, updated_at = $5`
+
+const spendTerminalSetClause = `state = 3, spent_by = $6, updated_at = $5`
+
+const spendHintSetClause = `state = 2, quarantined_at = $5, spent_hint = $6, updated_at = $5`
+
+// releaseRowSQL, spendTerminalRowSQL and spendHintRowSQL are the exact
+// statements updateReserved sends for Release and Spend's two modes.
+const releaseRowSQL = `UPDATE fuel_rows SET ` + releaseSetClause + updateReservedWhereSQL
+
+const spendTerminalRowSQL = `UPDATE fuel_rows SET ` + spendTerminalSetClause + updateReservedWhereSQL
+
+const spendHintRowSQL = `UPDATE fuel_rows SET ` + spendHintSetClause + updateReservedWhereSQL
+
+// quarantineSQL is Quarantine's statement: pool = $1, before = $2, limit =
+// $3, now = $4.
+const quarantineSQL = `
+	WITH c AS (
+	  SELECT txid, vout FROM fuel_rows
+	   WHERE pool = $1 AND state = 1 AND expires_at < $2
+	   ORDER BY expires_at, txid, vout
+	   LIMIT $3
+	   FOR UPDATE SKIP LOCKED)
+	UPDATE fuel_rows r SET state = 2, quarantined_at = $4, updated_at = $4
+	  FROM c
+	 WHERE r.txid = c.txid AND r.vout = c.vout AND r.state = 1`
+
+// resolveWhereSQL is the WHERE clause shared by both Resolve per-row
+// statements: pool = $1, txid = $2, vout = $3.
+//
+// (state = 2) IS TRUE, not state = 2: see the longer comment on
+// updateReservedWhereSQL. This predicate exactly matches fuel_rows_quar's
+// partial condition, so a plain "state = 2" is eligible for that index once
+// Postgres settles on a generic plan for this statement text, even though the
+// primary key already gives an O(log n) lookup for this exact (pool, txid, vout).
+const resolveWhereSQL = ` WHERE pool = $1 AND txid = $2 AND vout = $3 AND (state = 2) IS TRUE`
+
+const resolveAvailableSetClause = `state = 0, reserved_by = NULL, reserved_at = NULL, expires_at = NULL, quarantined_at = NULL, spent_hint = NULL, updated_at = $4`
+
+const resolveSpentSetClause = `state = 3, spent_by = $5, updated_at = $4`
+
+// resolveAvailableRowSQL and resolveSpentRowSQL are the exact statements
+// Resolve sends for its two targets.
+const resolveAvailableRowSQL = `UPDATE fuel_rows SET ` + resolveAvailableSetClause + resolveWhereSQL
+
+const resolveSpentRowSQL = `UPDATE fuel_rows SET ` + resolveSpentSetClause + resolveWhereSQL
+
 func scanRow(sc rowScanner) (store.Row, error) {
 	var (
 		r                  store.Row
@@ -117,10 +218,7 @@ func (s *Store) ListAvailable(ctx context.Context, pool string, txid chainhash.H
 	if err := store.ValidateLimit(limit); err != nil {
 		return nil, err
 	}
-	return s.queryRows(ctx, `
-		SELECT `+rowCols+` FROM fuel_rows r
-		 WHERE r.pool = $1 AND r.txid = $2 AND r.state = 0 AND r.vout >= $3
-		 ORDER BY r.vout LIMIT $4`, pool, txid[:], int32(fromVout), limit) //nolint:gosec // bounded
+	return s.queryRows(ctx, listAvailableSQL, pool, txid[:], int32(fromVout), limit) //nolint:gosec // bounded
 }
 
 // GetRows implements store.Store.
@@ -132,10 +230,7 @@ func (s *Store) GetRows(ctx context.Context, pool string, ops []store.Outpoint) 
 		return nil, err
 	}
 	txids, vouts := outpointArrays(ops)
-	return s.queryRows(ctx, `
-		SELECT `+rowCols+` FROM fuel_rows r
-		  JOIN unnest($2::bytea[], $3::int4[]) AS k(txid, vout) ON r.txid = k.txid AND r.vout = k.vout
-		 WHERE r.pool = $1`, pool, txids, vouts)
+	return s.queryRows(ctx, getRowsSQL, pool, txids, vouts)
 }
 
 // Reserve implements store.Store.
@@ -151,20 +246,7 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 
 	batch := &pgx.Batch{}
 	for _, op := range sorted {
-		// updated_at is stamped only when the row actually transitions from
-		// available (state = 0); a same-token replay of an already-reserved row
-		// leaves it alone (see store.go "Idempotency").
-		batch.Queue(`
-			UPDATE fuel_rows
-			   SET state = 1,
-			       reserved_by = $4,
-			       reserved_at = CASE WHEN state = 0 THEN $5 ELSE reserved_at END,
-			       expires_at  = CASE WHEN state = 0 THEN $6 ELSE expires_at END,
-			       updated_at  = CASE WHEN state = 0 THEN $5 ELSE updated_at END
-			 WHERE pool = $1 AND txid = $2 AND vout = $3
-			   AND (state = 0 OR (state = 1 AND reserved_by = $4))
-			RETURNING expires_at`,
-			pool, op.TxID[:], int32(op.Vout), op.Token[:], now, op.ExpiresAt) //nolint:gosec // bounded
+		batch.Queue(reserveRowSQL, pool, op.TxID[:], int32(op.Vout), op.Token[:], now, op.ExpiresAt) //nolint:gosec // bounded
 	}
 
 	applied := make([]store.ReserveOp, 0, len(ops))
@@ -190,9 +272,10 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 	return applied, nil
 }
 
-// updateReserved runs setClause against rows in state reserved under token, one
-// row at a time in sorted order (see lessOutpoint).
-func (s *Store) updateReserved(ctx context.Context, pool string, token store.Token, ops []store.Outpoint, setClause string, extra ...any) (int, error) {
+// updateReserved runs sqlText against rows in state reserved under token, one
+// row at a time in sorted order (see lessOutpoint). sqlText must be one of
+// releaseRowSQL, spendTerminalRowSQL or spendHintRowSQL.
+func (s *Store) updateReserved(ctx context.Context, pool string, token store.Token, ops []store.Outpoint, sqlText string, extra ...any) (int, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return 0, err
 	}
@@ -204,20 +287,6 @@ func (s *Store) updateReserved(ctx context.Context, pool string, token store.Tok
 	}
 	sorted := sortedOutpoints(ops)
 	now := s.now()
-	// (state = 1) IS TRUE, not state = 1: this predicate targets exactly one row
-	// via its primary key (txid, vout), but a plain "state = 1" is *exactly* the
-	// partial predicate on fuel_rows_expiry (pool, expires_at, txid, vout) WHERE
-	// state = 1. Postgres's partial-index-match check is a syntactic proof, not a
-	// cost comparison: once it can prove the WHERE clause implies state = 1, the
-	// index becomes an eligible plan, and a generic (parameter-value-blind) plan
-	// -- which every backend connection settles into after a handful of
-	// executions of the same statement text -- routinely picks it whenever
-	// ANALYZE last ran with few reserved rows, turning an O(log n) PK lookup into
-	// an O(reserved rows in pool) scan (measured: 132ms vs 18ms per call, see the
-	// Task 7 review). Wrapping the comparison in IS TRUE (a no-op given state is
-	// NOT NULL) changes its shape just enough that the proof no longer holds, so
-	// the partial index is never considered and the PK is used unconditionally.
-	sqlText := `UPDATE fuel_rows SET ` + setClause + ` WHERE pool = $1 AND txid = $2 AND vout = $3 AND (state = 1) IS TRUE AND reserved_by = $4`
 	batch := &pgx.Batch{}
 	for _, op := range sorted {
 		args := append([]any{pool, op.TxID[:], int32(op.Vout), token[:], now}, extra...) //nolint:gosec // bounded
@@ -237,16 +306,15 @@ func (s *Store) updateReserved(ctx context.Context, pool string, token store.Tok
 
 // Release implements store.Store.
 func (s *Store) Release(ctx context.Context, pool string, token store.Token, ops []store.Outpoint) (int, error) {
-	return s.updateReserved(ctx, pool, token, ops,
-		`state = 0, reserved_by = NULL, reserved_at = NULL, expires_at = NULL, quarantined_at = NULL, spent_hint = NULL, updated_at = $5`)
+	return s.updateReserved(ctx, pool, token, ops, releaseRowSQL)
 }
 
 // Spend implements store.Store.
 func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops []store.Outpoint, txid chainhash.Hash, terminal bool) (int, error) {
 	if terminal {
-		return s.updateReserved(ctx, pool, token, ops, `state = 3, spent_by = $6, updated_at = $5`, txid[:])
+		return s.updateReserved(ctx, pool, token, ops, spendTerminalRowSQL, txid[:])
 	}
-	return s.updateReserved(ctx, pool, token, ops, `state = 2, quarantined_at = $5, spent_hint = $6, updated_at = $5`, txid[:])
+	return s.updateReserved(ctx, pool, token, ops, spendHintRowSQL, txid[:])
 }
 
 // Quarantine implements store.Store.
@@ -257,16 +325,7 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 	if err := store.ValidateLimit(limit); err != nil {
 		return 0, err
 	}
-	tag, err := s.pool.Exec(ctx, `
-		WITH c AS (
-		  SELECT txid, vout FROM fuel_rows
-		   WHERE pool = $1 AND state = 1 AND expires_at < $2
-		   ORDER BY expires_at, txid, vout
-		   LIMIT $3
-		   FOR UPDATE SKIP LOCKED)
-		UPDATE fuel_rows r SET state = 2, quarantined_at = $4, updated_at = $4
-		  FROM c
-		 WHERE r.txid = c.txid AND r.vout = c.vout AND r.state = 1`, pool, before, limit, s.now())
+	tag, err := s.pool.Exec(ctx, quarantineSQL, pool, before, limit, s.now())
 	if err != nil {
 		return 0, wrap(err)
 	}
@@ -311,20 +370,12 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 	}
 	sorted := sortedOutpoints(ops)
 	now := s.now()
-	var set string
+	sqlText := resolveAvailableRowSQL
 	var extra []any
-	if to == store.StateAvailable {
-		set = `state = 0, reserved_by = NULL, reserved_at = NULL, expires_at = NULL, quarantined_at = NULL, spent_hint = NULL, updated_at = $4`
-	} else {
-		set = `state = 3, spent_by = $5, updated_at = $4`
+	if to != store.StateAvailable {
+		sqlText = resolveSpentRowSQL
 		extra = []any{spentBy[:]}
 	}
-	// (state = 2) IS TRUE, not state = 2: see the comment in updateReserved. This
-	// predicate exactly matches fuel_rows_quar's partial condition, so a plain
-	// "state = 2" is eligible for that index once Postgres settles on a generic
-	// plan for this statement text, even though the primary key already gives an
-	// O(log n) lookup for this exact (pool, txid, vout).
-	sqlText := `UPDATE fuel_rows SET ` + set + ` WHERE pool = $1 AND txid = $2 AND vout = $3 AND (state = 2) IS TRUE`
 	batch := &pgx.Batch{}
 	for _, op := range sorted {
 		args := append([]any{pool, op.TxID[:], int32(op.Vout), now}, extra...) //nolint:gosec // bounded

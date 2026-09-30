@@ -16,6 +16,39 @@ import (
 
 const shardCols = `pool, txid, size, denomination, lock_mode, status, owner, lease_until, version, beef, created_at, updated_at`
 
+// acquireShardSQL is AcquireShard's statement: pool = $1, statuses = $2,
+// now = $3, holder = $4, until = $5, exclude = $6, store-clock now = $7 (see
+// the AcquireShard stamps UpdatedAt from the store clock comment there). The
+// lease-free predicate uses "<=" (a lease is free at exactly LeaseUntil ==
+// now, per store.go's "Owner == "" or LeaseUntil <= now" rule), and NOT
+// (txid = ANY(exclude)) so a caller can skip shards it already knows about.
+const acquireShardSQL = `
+	WITH c AS (
+	  SELECT pool, txid FROM fuel_shards
+	   WHERE pool = $1 AND status = ANY($2::int2[])
+	     AND (owner = '' OR lease_until IS NULL OR lease_until <= $3)
+	     AND NOT (txid = ANY($6::bytea[]))
+	   ORDER BY created_at, txid
+	   LIMIT 1
+	   FOR UPDATE SKIP LOCKED)
+	UPDATE fuel_shards s SET owner = $4, lease_until = $5, updated_at = $7
+	  FROM c
+	 WHERE s.pool = c.pool AND s.txid = c.txid
+	   AND (s.owner = '' OR s.lease_until IS NULL OR s.lease_until <= $3)
+	RETURNING s.pool, s.txid, s.size, s.denomination, s.lock_mode, s.status, s.owner, s.lease_until, s.version, s.beef, s.created_at, s.updated_at`
+
+// retireShardRowSQL is RetireShard's per-row statement: pool = $1, txid = $2,
+// vout = $3, now = $4.
+//
+// (state IN (0,1,2)) IS TRUE, not state IN (0,1,2): see the longer comment on
+// updateReservedWhereSQL (rows.go). This predicate exactly matches
+// fuel_rows_shard_live's partial condition, and unlike the discovery read in
+// RetireShard (which legitimately wants that index, since it's scanning a
+// whole shard), this is a per-row point update keyed by the primary key.
+const retireShardRowSQL = `
+	UPDATE fuel_rows SET state=4, updated_at=$4
+	 WHERE pool=$1 AND txid=$2 AND vout=$3 AND (state IN (0,1,2)) IS TRUE`
+
 type rowScanner interface{ Scan(dest ...any) error }
 
 func scanShard(sc rowScanner, withBEEF bool) (store.Shard, error) {
@@ -204,16 +237,9 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 		if len(vouts) == 0 {
 			return nil
 		}
-		// (state IN (0,1,2)) IS TRUE, not state IN (0,1,2): see the comment in
-		// updateReserved (rows.go). This predicate exactly matches
-		// fuel_rows_shard_live's partial condition, and unlike the discovery read
-		// above (which legitimately wants that index, since it's scanning a whole
-		// shard), this is a per-row point update keyed by the primary key.
 		batch := &pgx.Batch{}
 		for _, v := range vouts {
-			batch.Queue(`
-				UPDATE fuel_rows SET state=4, updated_at=$4
-				 WHERE pool=$1 AND txid=$2 AND vout=$3 AND (state IN (0,1,2)) IS TRUE`, pool, txid[:], v, now)
+			batch.Queue(retireShardRowSQL, pool, txid[:], v, now)
 		}
 		n, err = execBatch(ctx, tx, batch, len(vouts))
 		return err
@@ -246,21 +272,7 @@ func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, unti
 	for i := range exclude {
 		ex[i] = exclude[i][:]
 	}
-	row := s.pool.QueryRow(ctx, `
-		WITH c AS (
-		  SELECT pool, txid FROM fuel_shards
-		   WHERE pool = $1 AND status = ANY($2::int2[])
-		     AND (owner = '' OR lease_until IS NULL OR lease_until <= $3)
-		     AND NOT (txid = ANY($6::bytea[]))
-		   ORDER BY created_at, txid
-		   LIMIT 1
-		   FOR UPDATE SKIP LOCKED)
-		UPDATE fuel_shards s SET owner = $4, lease_until = $5, updated_at = $7
-		  FROM c
-		 WHERE s.pool = c.pool AND s.txid = c.txid
-		   AND (s.owner = '' OR s.lease_until IS NULL OR s.lease_until <= $3)
-		RETURNING s.pool, s.txid, s.size, s.denomination, s.lock_mode, s.status, s.owner, s.lease_until, s.version, s.beef, s.created_at, s.updated_at`,
-		pool, st, now, holder, until, ex, s.now())
+	row := s.pool.QueryRow(ctx, acquireShardSQL, pool, st, now, holder, until, ex, s.now())
 	sh, err := scanShard(row, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil //nolint:nilnil // contract: nothing adoptable
