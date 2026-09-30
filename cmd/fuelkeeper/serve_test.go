@@ -543,26 +543,42 @@ func recordAttrs(r slog.Record) map[string]any {
 	return m
 }
 
-// TestLogOracleMode covers both shapes logOracleMode reports: an oracle that
-// answers outpoint queries (mock, teranode, composite with teranode_url),
-// and the arcade-only shape that does not, whose message points at
-// jobs.reaper.unknown_requeue_age (or expiry_policy: hold) and
-// oracle.teranode_url as the optional accelerator.
+// TestLogOracleMode covers all three shapes logOracleMode reports -- none
+// (no chain source at all), arcade-only (does not answer outpoint queries,
+// whose message points at jobs.reaper.unknown_requeue_age, expiry_policy:
+// hold and oracle.teranode_url as the optional accelerator), and
+// outpoint-capable (mock/teranode/composite+teranode_url) -- crossed with
+// jobs.enabled: the unknown_requeue_age promise (the reaper's unhinted-row
+// policy) only appears when the reaper actually runs.
 func TestLogOracleMode(t *testing.T) {
 	h := &capturingHandler{}
 	log := slog.New(h)
 	cfg := shutdownTestConfig(t)
 
-	cfg.Oracle.Kind = "arcade"
-	cfg.Oracle.ArcadeURL = "http://arcade"
+	// none (jobs enabled): shutdownTestConfig's default oracle.kind. Must
+	// not be mislabeled arcade-only -- it never talks to arcade at all.
 	logOracleMode(log, cfg)
 	rec := h.last(t)
 	attrs := recordAttrs(rec)
+	assert.Equal(t, "none", attrs["oracle"])
+	assert.Equal(t, false, attrs["answers_outpoints"])
+	assert.Equal(t, true, attrs["jobs_enabled"])
+	assert.Contains(t, rec.Message, "no chain source")
+	assert.Contains(t, rec.Message, "unknown_requeue_age")
+	assert.NotContains(t, rec.Message, "arcade-only")
+
+	h.records = nil
+	cfg.Oracle.Kind = "arcade"
+	cfg.Oracle.ArcadeURL = "http://arcade"
+	logOracleMode(log, cfg)
+	rec = h.last(t)
+	attrs = recordAttrs(rec)
 	assert.Equal(t, "arcade", attrs["oracle"])
 	assert.Equal(t, false, attrs["answers_outpoints"])
 	assert.Contains(t, rec.Message, "unknown_requeue_age")
 	assert.Contains(t, rec.Message, "expiry_policy: hold")
 	assert.Contains(t, rec.Message, "oracle.teranode_url")
+	assert.NotContains(t, rec.Message, "unhinted spend")
 
 	h.records = nil
 	cfg.Oracle.Kind = "mock"
@@ -572,4 +588,17 @@ func TestLogOracleMode(t *testing.T) {
 	assert.Equal(t, "mock", attrs["oracle"])
 	assert.Equal(t, true, attrs["answers_outpoints"])
 	assert.NotContains(t, rec.Message, "unknown_requeue_age")
+
+	// jobs disabled: no reaper runs, so the unknown_requeue_age promise must
+	// not appear even for the arcade-only shape that would otherwise state
+	// it -- it would never come true.
+	h.records = nil
+	cfg.Oracle.Kind = "arcade"
+	cfg.Jobs.Enabled = false
+	logOracleMode(log, cfg)
+	rec = h.last(t)
+	attrs = recordAttrs(rec)
+	assert.Equal(t, false, attrs["jobs_enabled"])
+	assert.NotContains(t, rec.Message, "unknown_requeue_age")
+	assert.Contains(t, rec.Message, "jobs.enabled is false")
 }

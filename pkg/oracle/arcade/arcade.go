@@ -6,11 +6,21 @@
 // Outpoints always reports StatusUnknown. It also never supplies Inputs on
 // Tx, since it does not serve raw transactions. Pair this oracle with
 // pkg/oracle/composite and a teranode oracle to get outpoint verdicts and
-// input details alongside arcade's lifecycle verdict. Used alone, or paired
-// via composite with a nil outpoints oracle, no oracle ever confirms an
-// outpoint spent, so the reaper never requeues a row through that path and
-// quarantine grows without bound; only the mined-hint path can still move a
-// row forward.
+// input details alongside arcade's lifecycle verdict.
+//
+// Used alone, or paired via composite with a nil outpoints oracle, no
+// oracle ever confirms an outpoint spent, so an Unknown Outpoints verdict
+// never itself resolves a quarantined row — what happens to it next is the
+// reaper's policy, not this package's (pkg/jobs, the Reaper doc comment):
+// an unhinted row (an expired reservation, or a verify release) is
+// requeued after unknown_requeue_age only when its pool's expiry_policy is
+// requeue, and stays quarantined under expiry_policy hold (or
+// unknown_requeue_age 0, for an operator to clear); a hinted row
+// (spend_policy verify) is instead decided from Tx(hint) via the reaper's
+// classifyHinted rules — a mined spend, a rejection naming spent inputs, a
+// rejection classified TxInvalid (requeued after HintPatience), or an
+// unresolved hint (requeued after HintMaxWait) — which is exactly what this
+// oracle's Tx, RejectReason and SpentInputs exist to drive.
 package arcade
 
 import (

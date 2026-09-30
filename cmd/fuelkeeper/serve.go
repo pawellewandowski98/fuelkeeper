@@ -195,23 +195,48 @@ func warnInsecureListener(log *slog.Logger, cfg *config.Config) {
 }
 
 // logOracleMode logs one Info line describing the configured oracle's shape
-// at start-up: its kind and whether it answers outpoint queries
-// (ofactory.Config.AnswersOutpoints). Answering false is the normal,
-// expected arcade-only production shape, not a deficiency; the message then
-// also explains that a row needing an outpoint verdict is still resolved --
-// requeued once quarantined for jobs.reaper.unknown_requeue_age, or held
-// for an operator on a pool configured with expiry_policy: hold -- and that
-// oracle.teranode_url (oracle.kind: composite) is an optional accelerator
-// that resolves such rows immediately from the UTXO set instead. See
-// ofactory.Config.AnswersOutpoints and docs/OPERATIONS.md "Oracle kinds and
-// policies".
+// at start-up and how a quarantined row is resolved under it.
+//
+// Three oracle shapes: none (no chain source at all -- config separately
+// forbids spend_policy: verify and release_policy: verify for it, since
+// neither could ever be confirmed), arcade-only or composite without
+// oracle.teranode_url (ofactory.Config.AnswersOutpoints false -- the
+// normal, expected production shape, not a deficiency), and a shape that
+// answers outpoint queries directly (mock, teranode, or composite with
+// oracle.teranode_url).
+//
+// Only the reaper (pkg/jobs) ever requeues or resolves a quarantined row,
+// so the message's second half follows cfg.Jobs.Enabled: with jobs disabled
+// it says so instead of promising something that will never happen; with
+// jobs enabled, the none/arcade-only shapes state the unhinted-row requeue
+// policy (jobs.reaper.unknown_requeue_age under expiry_policy: requeue,
+// held under expiry_policy: hold) -- "unhinted" meaning an expired
+// reservation or a release_policy: verify release, never a spend: Spend
+// always carries a txid, so there is no such thing as an unhinted spend.
+// See ofactory.Config.AnswersOutpoints, pkg/jobs.Reaper's doc comment, and
+// docs/OPERATIONS.md "Oracle kinds and policies".
 func logOracleMode(log *slog.Logger, cfg *config.Config) {
 	answers := cfg.Oracle.AnswersOutpoints()
-	msg := "oracle: answers outpoint queries directly"
-	if !answers {
-		msg = "oracle: arcade-only (does not answer outpoint queries); expired reservations and unhinted spends are requeued after jobs.reaper.unknown_requeue_age (or held, for a pool with expiry_policy: hold); oracle.teranode_url (oracle.kind: composite) is an optional accelerator that resolves such rows from the UTXO set instead"
+	none := cfg.Oracle.Kind == ofactory.KindNone
+
+	var msg string
+	switch {
+	case none:
+		msg = "oracle: no chain source configured (oracle.kind: none); spend_policy: verify and release_policy: verify are not allowed with this oracle kind"
+	case answers:
+		msg = "oracle: answers outpoint queries directly; a quarantined row's spent or unspent verdict resolves it directly"
+	default:
+		msg = "oracle: arcade-only (does not answer outpoint queries); a hinted spend is resolved from its transaction status instead; oracle.teranode_url is an optional accelerator that resolves an unhinted row immediately from the UTXO set"
 	}
-	log.Info(msg, "oracle", cfg.Oracle.Kind, "answers_outpoints", answers)
+
+	switch {
+	case !cfg.Jobs.Enabled:
+		msg += "; jobs.enabled is false, so no reaper runs and quarantined rows are never resolved or requeued"
+	case none || !answers:
+		msg += "; expired or verify-released reservations are requeued after jobs.reaper.unknown_requeue_age (or held, for a pool with expiry_policy: hold)"
+	}
+
+	log.Info(msg, "oracle", cfg.Oracle.Kind, "answers_outpoints", answers, "jobs_enabled", cfg.Jobs.Enabled)
 }
 
 // serveHooks lets tests observe or intercept points runServeConfig would

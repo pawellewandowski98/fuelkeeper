@@ -351,20 +351,33 @@ func TestTxDoubleSpendAttempted(t *testing.T) {
 	assert.Equal(t, oracle.RejectReasonUnknown, st.RejectReason)
 }
 
-// TestTxRejectReasonGatedOnRejected pins that RejectReason is computed only
-// when arcade's verdict is Rejected. A txStatus that carries a stray
-// nonzero numeric "status" without being REJECTED (nothing in the arcade
-// contract forbids this; arcade.openapi.yaml only documents "status" as
-// populated alongside REJECTED, it doesn't require every other txStatus to
-// omit it) must not have that code run through rejectReasonForCode — 476
-// StatusNotFinal, in particular, is also meaningful on a live, still-
-// pending transaction, so leaking it through here would misreport pending
-// work as reaper-actionable.
+// TestTxRejectReasonGatedOnRejected pins that RejectReason (and, for 466,
+// SpentInputs / the named spender in CompetingTxs) is computed only when
+// arcade's verdict is Rejected. A txStatus that carries a stray nonzero
+// numeric "status" — here 466, with an extraInfo that is a textbook
+// UTXO_SPENT line, i.e. exactly the shape that would otherwise classify
+// InputsSpent and populate SpentInputs/CompetingTxs — without being
+// REJECTED (nothing in the arcade contract forbids this; arcade.openapi.yaml
+// only documents "status" as populated alongside REJECTED, it doesn't
+// require every other txStatus to omit it) must not have any of that run
+// through rejectReasonForCode or spentInputsFromExtraInfo: 476 StatusNotFinal,
+// in particular, is also meaningful on a live, still-pending transaction, so
+// leaking it through here would misreport pending work as reaper-actionable,
+// and a mutation that dropped the Rejected gate (e.g. computing RejectReason
+// unconditionally) would otherwise survive every other test in this file,
+// since they all set txStatus REJECTED.
 func TestTxRejectReasonGatedOnRejected(t *testing.T) {
 	hash := storetest.NewTxID()
 	txid := hash.String()
+	existing := storetest.NewTxID().String()
+	spentTxID := storetest.NewTxID().String()
+	spenderTxID := storetest.NewTxID().String()
+	extraInfo := fmt.Sprintf("UTXO_SPENT (70): %s:3 utxo already spent by tx %s[1]", spentTxID, spenderTxID)
 	srv := fakeArcade(t, map[string]any{
-		txid: map[string]any{"txid": txid, "txStatus": "SEEN_ON_NETWORK", "status": 466},
+		txid: map[string]any{
+			"txid": txid, "txStatus": "SEEN_ON_NETWORK", "status": 466, "extraInfo": extraInfo,
+			"competingTxs": []string{existing},
+		},
 	}, "")
 	defer srv.Close()
 
@@ -376,6 +389,8 @@ func TestTxRejectReasonGatedOnRejected(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, st.Rejected)
 	assert.Equal(t, oracle.RejectReasonUnknown, st.RejectReason, "a stray status code on a non-Rejected verdict must not be classified")
+	assert.Nil(t, st.SpentInputs, "a stray UTXO_SPENT-shaped extraInfo on a non-Rejected verdict must not be parsed")
+	assert.Equal(t, []string{existing}, st.CompetingTxs, "CompetingTxs must not gain the named spender on a non-Rejected verdict")
 }
 
 func TestTxNotFound(t *testing.T) {

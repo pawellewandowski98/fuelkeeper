@@ -25,10 +25,17 @@ var _ oracle.Oracle = (*Oracle)(nil)
 // New returns an Oracle that answers Tx from tx and Outpoints from
 // outpoints. outpoints may be nil, in which case Outpoints also falls back
 // to tx: with a tx-only oracle such as arcade and no outpoints oracle,
-// Outpoints then always reports Unknown, so the reaper never resolves a row
-// via a spent verdict and quarantine grows without bound (only the
-// mined-hint path can still move a row forward). tx must not be nil; New
-// panics if it is.
+// Outpoints then always reports Unknown, so no row is ever resolved to
+// spent through that path. This does not by itself leave quarantine
+// unbounded: the reaper's other two paths still apply (pkg/jobs, the
+// Reaper doc comment) — an unhinted row (an expired reservation, or a
+// verify release) is requeued after unknown_requeue_age when its pool's
+// expiry_policy is requeue (held under expiry_policy hold, or
+// unknown_requeue_age 0), and a hinted row (spend_policy verify) is
+// decided from Tx(hint) via the reaper's classifyHinted rules — a mined
+// spend, a rejection naming spent inputs, a rejection classified TxInvalid
+// (requeued after HintPatience), or an unresolved hint (requeued after
+// HintMaxWait). tx must not be nil; New panics if it is.
 func New(tx oracle.Oracle, outpoints oracle.Oracle) *Oracle {
 	if tx == nil {
 		panic("composite: tx oracle must not be nil")
