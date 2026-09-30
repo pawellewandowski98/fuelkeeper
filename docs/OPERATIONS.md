@@ -23,11 +23,11 @@ instance:
   max_shards: 8                # Max shards this instance can own; default 8
   low_water_rows: 5000         # When in-memory rows fall below this, adopt a new shard; default 5000
   lease_ttl: 30s               # Duration the instance holds shard leases; must exceed rescan_interval; default 30s
-  rescan_interval: 5s          # How often to rescan the store for new shards; default 5s
+  rescan_interval: 5s          # How often to reload available rows of shards this instance already owns, and drop ones that stay empty; default 5s
   reserve_timeout: 2s          # Max time a single reserve request can take; default 2s
   flush_window: 0s             # Extra time the coalescer waits to batch concurrent Reserve calls into one store write; default 0 (flush as soon as a slot is free)
-  max_batch: 0                 # Max rows to batch before flushing; default 0 (no limit)
-  flush_timeout: 5s            # Max time to hold a partial batch before flushing; default 5s
+  max_batch: 0                 # Max ops per coalescer flush; 0 means at least 256 (and at least pools[].max_count if that is larger), capped at the store's own max batch size
+  flush_timeout: 5s            # Per-attempt timeout for the store call each flush (and each retried attempt) makes; default 5s
   adopt_timeout: 200ms         # Max time a reserve request waits for shard adoption; default 200ms
 
 # Store backend (memory, sqlite, postgres, pebble, mongodb, aerospike)
@@ -439,7 +439,7 @@ make bench-run                            # cmd/fuelbench against :8081-8083; WO
 make bench-cluster-down                   # stop and remove volumes
 ```
 
-`bench-run`'s `OUT` defaults to `/tmp/fuelbench-last.json` (`docs/benchmarks/` does not exist in this tree). Give the minter a few seconds after `bench-cluster-up` to fill `pools[0].available` toward `target_available` before a long run, or lower `target_available` in the bench config for a quick smoke test; a handful of `exhausted` errors right after start-up, before the mock treasury's first splits are mined, is expected and not a bug. Every service sets `SETTINGS_ENV_FILE=/dev/null` (see "Teratestnet" above) so the toolbox's settings package does not pick up a stray `.env`/`settings.conf`.
+`bench-run`'s `OUT` defaults to `/tmp/fuelbench-last.json` for a throwaway run; pass `OUT=docs/benchmarks/results/<name>.json` to save a result alongside the published ones (see `docs/PERFORMANCE.md` and `docs/benchmarks/README.md`). Give the minter a few seconds after `bench-cluster-up` to fill `pools[0].available` toward `target_available` before a long run, or lower `target_available` in the bench config for a quick smoke test; a handful of `exhausted` errors right after start-up, before the mock treasury's first splits are mined, is expected and not a bug. Every service sets `SETTINGS_ENV_FILE=/dev/null` (see "Teratestnet" above) so the toolbox's settings package does not pick up a stray `.env`/`settings.conf`.
 
 `fk1`-`fk3` bind-mount the same `deploy/fuelkeeper-bench.yaml` read-only with the SELinux relabel option `z` (lowercase), not `Z`: all three containers read the one host file, and `Z` relabels it privately for whichever container starts last, leaving the other two unable to read it (`permission denied` on startup) under rootless Podman.
 
@@ -588,17 +588,24 @@ rescan cycle once the overlap resolves.
   ones, adoption can still cycle indefinitely. The planned fix is a
   store-side `AcquireShard` that skips row-less shards server-side instead
   of relying on a bounded client-side exclusion list.
-- **`/spend` is not coalesced.** Reserve requests are batched by the
-  per-pool coalescer (group-commit), but every `spend` and `release` call is
-  its own store write, one per call -- there is no equivalent batching path
-  for them. A write-bound store (see "Durability and Consistency" above)
-  therefore sees roughly one write transaction per output spent or
-  released, versus roughly one write transaction per *batch* of outputs
-  reserved: at a `count` of 20 per reserve, that is on the order of 20×
-  more write transactions from spends than from reserves for the same
-  throughput of outputs. Size `split_size`/`target_available` and the
-  store's write capacity with that ratio in mind, not just the reserve
-  rate.
+- **`/spend` is not coalesced.** Reserve requests from many concurrent
+  callers are batched by the per-pool coalescer into one store write per
+  flush (group-commit); `spend` and `release` are not -- `Pool.storeSpend`
+  (`pkg/pool/service.go`) makes one store write per *request*, covering
+  every outpoint that request names, but each caller's request is always
+  its own store call, never merged with another caller's. So the
+  spend:reserve write-transaction ratio is roughly the coalescer's batch
+  size divided by `count` (outputs per reserve): a store write is cheaper
+  per output on the reserve side whenever concurrent demand fills a batch
+  bigger than `count`, and the two sides are roughly even otherwise. A
+  write-bound store (see "Durability and Consistency" above) still pays
+  for this per request, though sqlite and pebble's group-commit (concurrent
+  writers sharing one `fsync` per flush) applies at the store layer to
+  spend/release writes the same as to reserve writes, so the per-request
+  cost is not one `fsync` per writer there either. Watch
+  `fuelkeeper_coalescer_batch_size` against `count` to see which side is
+  paying more per output in a given deployment, rather than assuming a
+  fixed multiplier.
 
 ## Development Mode (Nullnet)
 

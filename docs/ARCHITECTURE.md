@@ -67,23 +67,32 @@ attribute) is in exactly one state:
 
 ```
 available ---Reserve(token,ttl)---> reserved
-reserved  ---Release(token)-------> available
-reserved  ---Spend(token,txid)----> quarantined (SpentHint=txid)    spend is a HINT
-reserved  ---expiry (reaper)------> quarantined (SpentHint=nil)
+reserved  ---Release(token), release_policy=trust------> available
+reserved  ---Release(token), release_policy=verify-----> quarantined (SpentHint=nil)   same path as an expired reservation
+reserved  ---Spend(token,txid), spend_policy=trust-----> spent (SpentBy=txid)          terminal, trusted outright, no oracle wait
+reserved  ---Spend(token,txid), spend_policy=verify----> quarantined (SpentHint=txid)  spend is a HINT
+reserved  ---expiry (reaper)----------------------------> quarantined (SpentHint=nil)
 quarantined --oracle proves spent-> spent (SpentBy=txid)            terminal, oracle-proven
 quarantined --oracle proves unspent (after age)--> available
 quarantined --no verdict, aged past unknown_requeue_age (expiry_policy: requeue)--> available   blind requeue, unhinted
 quarantined --hinted tx rejected with inputs already spent--> spent (SpentBy=hint)              terminal, see below
+quarantined --hinted tx rejected as invalid (RejectReasonTxInvalid), aged past hint_patience--> available   the fuel output was untouched
 quarantined --hinted tx never resolved, aged past hint_max_wait--> available                     blind requeue, hinted
+quarantined --admin requeue (POST .../quarantined/requeue)--> available                          operator action, any age
 any non-terminal row --RetireShard--> invalid                       terminal, split tx dead
 ```
 
 `spent` and `invalid` are the only terminal states. A client's `spend` call
-is never itself proof: it only lets FuelKeeper stop waiting out the
-reservation's TTL before checking. The row only reaches `spent` once the
-chain oracle proves it (`pkg/jobs/reaper.go`'s terminal-state policy, below);
-under `spend_policy=trust` (no oracle configured) `Spend` moves the row
-straight to `spent`, trusting the client outright. `release_policy=verify`
+is not itself proof under `spend_policy=verify`: it only lets FuelKeeper
+stop waiting out the reservation's TTL before checking, and the row only
+reaches `spent` once the chain oracle proves it
+(`pkg/jobs/reaper.go`'s terminal-state policy, below). Under
+`spend_policy=trust`, `Spend` moves the row straight to `spent`, trusting
+the client outright, with no oracle involved -- `trust` is not only the
+no-oracle default: it is also the default for an arcade-only oracle
+(`oracle.kind: arcade`, or `composite` without `teranode_url`, the expected
+production shape), since arcade alone answers no outpoint queries (see
+`docs/OPERATIONS.md#oracle-kinds-and-policies`). `release_policy=verify`
 routes `Release` through the same quarantine-then-oracle path as an expired
 reservation instead of returning the row straight to `available` -- with an
 arcade-only oracle this is a delayed release, requeued after

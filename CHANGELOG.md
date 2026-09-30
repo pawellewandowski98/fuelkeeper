@@ -176,10 +176,16 @@ hot path.
   durable writes on both backends now share one fsync per commit;
   durability semantics are unchanged -- see `docs/OPERATIONS.md`'s
   "Durability and Consistency" and `docs/ARCHITECTURE.md`'s store backends
-  matrix. This and the shard-retirement fix above landed after the
-  published `docs/PERFORMANCE.md` benchmark run (commit `236642c`); its
-  SQLite/Pebble numbers and any run affected by shard exhaustion predate
-  both fixes.
+  matrix. This and the shard-retirement fix above landed after
+  `docs/PERFORMANCE.md`'s benchmark numbers were first published at commit
+  `236642c`; the API (single-instance and cluster) benchmark pages under
+  `docs/benchmarks/` have since been re-run at commit `91e1331`, after both
+  fixes, with the `236642c` numbers kept in each page's "Before the fixes"
+  appendix for comparison. The store microbenchmark page
+  (`docs/benchmarks/20260930-store-micro.md`) remains at `236642c`: its
+  pebble numbers run with `NoSync: true` (no fsync at all) and its sqlite
+  numbers fsync against tmpfs, so neither fix changes those particular
+  numbers regardless.
 - **The memory store's `Stats` no longer scans every row.** Spent and
   invalid rows are never pruned, so the previous full-row scan (polled once
   a second by the minter, and served from `GET /v1/pools`) got slower the
@@ -196,6 +202,7 @@ hot path.
 - The teratestnet demo (a funded go-wallet-toolbox treasury driving
   `fueldemo` against the public Teranode test network) was not run for this
   release: no funded teratestnet environment was available. The exact
-  procedure is documented in `docs/TREASURY.md` and `docs/OPERATIONS.md`'s
-  "Teratestnet (Real Treasury)" section, ready to run against a funded
+  procedure -- both `fueldemo` modes, what to record, and how it relates to
+  the mock-oracle benchmark numbers -- is documented in
+  `docs/benchmarks/20260930-demo-ttn.md`, ready to run against a funded
   wallet.

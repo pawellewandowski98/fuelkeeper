@@ -202,11 +202,11 @@ not per row; `rows/s` already divides by batch size). `Quarantine/1000` moves
   shards.** At `leased=0` it costs 31.5 µs; at `leased=100` it is 11.8×
   slower (372 µs); at `leased=1000` it is 100× slower than the baseline
   (3.16 ms) and allocations grow from 146 to 16,155. `AcquireShard` scans
-  past shards this instance already holds a lease on to find the next
-  unleased one, and pebble's LSM iterator pays a seek/merge cost per
-  already-leased key it steps over — so instances that accumulate many
-  leased shards without releasing them pay steadily more per adoption
-  attempt. Postgres, MongoDB and memory show much flatter `AcquireShard`
+  past shards leased by any holder (not just this instance's own leases) to
+  find the next unleased one, and pebble's LSM iterator pays a seek/merge
+  cost per already-leased key it steps over — so the more shards are
+  currently leased at all, by any instance, the more each adoption attempt
+  pays. Postgres, MongoDB and memory show much flatter `AcquireShard`
   curves (memory: 893 ns → 18.5 µs, a 21× spread but from a much smaller
   base and no I/O; postgres/mongodb: under 1.5× across the same range)
   because their indexed lookups (a `WHERE` clause / index scan) don't pay a
@@ -241,16 +241,23 @@ not per row; `rows/s` already divides by batch size). `Quarantine/1000` moves
   caller for much higher aggregate throughput, most valuably on the
   durable, multi-process backends.
 
-- **sqlite/pebble numbers above are on tmpfs, not the SSD named in
-  "Machine".** `go test`'s default temp directory (`os.TempDir()`, `/tmp`
-  unless `TMPDIR` is set) is a `tmpfs` (RAM-backed) mount on this host, and
-  neither benchmark overrides it, so every `fsync`/write-batch-sync these
-  two backends' benchmarks measure was against RAM, not disk -- `fsync` on
-  tmpfs is already close to free. Commit `fd4dc56`/`91e1331` (after this
-  page, 2026-09-30) changed sqlite/pebble to group-commit concurrent
-  writers into one `fsync` per flush instead of one per writer; that fix
-  does **not** change the numbers on this page (there was barely any real
-  fsync cost here to amortize) -- its effect shows up instead in
-  [`20260930-api-single.md`](20260930-api-single.md), whose sqlite/pebble
-  data directories are on this host's real SSD (see that page's own
+- **The sqlite and pebble numbers above do not pay a real durable-commit
+  cost, for two different reasons.** `pkg/store/pebble/bench_test.go` and
+  `store_bench_test.go` open pebble with `NoSync: true` -- these benchmarks
+  make **zero** `fsync` calls, on any filesystem, regardless of where
+  `b.TempDir()` lands. `pkg/store/sqlite`'s bench opens with no `Sync`
+  override, so it keeps the default `synchronous=FULL` (an `fsync` per
+  commit) -- but `go test`'s default temp directory (`os.TempDir()`, `/tmp`
+  unless `TMPDIR` is set) is a `tmpfs` (RAM-backed) mount on this host, so
+  those `fsync` calls are real but cheap (against RAM, not the disk named
+  in "Machine"). Neither number on this page reflects this host's real SSD
+  fsync cost; sqlite at least exercises the fsync *call*, pebble does not
+  exercise it at all. Commit `fd4dc56`/`91e1331` (after this page,
+  2026-09-30) changed sqlite/pebble to group-commit concurrent writers into
+  one `fsync` per flush instead of one per writer; that fix does **not**
+  change the numbers on this page (pebble was never fsyncing here, and
+  sqlite's tmpfs fsync had little cost to amortize) -- its effect shows up
+  instead in [`20260930-api-single.md`](20260930-api-single.md), whose
+  sqlite/pebble data directories are on this host's real SSD with sqlite's
+  default durability and pebble's `no_sync: false` (see that page's own
   numbers, re-run after the fix).

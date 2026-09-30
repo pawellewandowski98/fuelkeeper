@@ -92,6 +92,45 @@ With no keys configured, the API is open (development mode only).
 
 Health checks (`/healthz`, `/readyz`, `/metrics`, `/openapi.yaml`) are unauthenticated.
 
+## Pool Info and BEEF
+
+These three read-only routes require only a fuel key (not admin-tier, unlike "Admin Operations" below):
+
+- **List pools**: `GET /v1/pools` → array of `Pool` objects, one per configured pool
+- **Get one pool**: `GET /v1/pools/{pool}` → one `Pool` object
+- **Fetch a shard's BEEF**: `GET /v1/pools/{pool}/beef/{txid}` → the shard's raw BEEF bytes (`Content-Type: application/octet-stream`); this is what the `beef_url` in a reserve response points to
+
+A `Pool` object:
+
+```json
+{
+  "name": "main",
+  "denomination": 50,
+  "lock_mode": "puzzle",
+  "split_size": 500,
+  "serve_policy": "mined_only",
+  "release_policy": "trust",
+  "spend_policy": "trust",
+  "max_count": 100,
+  "default_ttl_seconds": 120,
+  "min_ttl_seconds": 30,
+  "max_ttl_seconds": 600,
+  "constraints": { "tx_version": 1, "lock_time": 0, "sequence": 4294967295 },
+  "stats": {
+    "available": 82341,
+    "reserved": 512,
+    "quarantined": 3,
+    "spent": 991204,
+    "invalid": 0,
+    "shards": { "unmined": 2, "mined": 41, "retired": 3, "invalid": 0 }
+  }
+}
+```
+
+`constraints` is only present for P2PKH pools (see "Lock Modes" above); `stats` mirrors the store's live row and shard counts for that pool at the moment of the call. The Go client's `Pools(ctx)`/`Pool(ctx, poolName)` (below) wrap these two routes.
+
+`GET /v1/pools/{pool}/beef/{txid}` also sets `ETag` (versioned as `"v<shard version>"`) and `X-Shard-Status` (`unmined`/`mined`/`retired`/`invalid`); a mined shard's BEEF is immutable, so the response adds `Cache-Control: public, max-age=31536000, immutable` and honors a conditional `If-None-Match` request with `304 Not Modified` — an unmined shard's BEEF can still change (not yet final) and is served `Cache-Control: no-cache` instead. `404 not_found` if the pool or shard doesn't exist.
+
 ## Admin Operations
 
 The four admin operations require authentication (admin key when configured, else fuel key):

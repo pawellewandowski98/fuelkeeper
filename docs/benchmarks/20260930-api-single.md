@@ -3,7 +3,7 @@
 `cmd/fuelbench` load-generator runs against one `fuelkeeper serve` process per
 store backend (memory, sqlite, pebble, postgres, mongodb, aerospike), all on
 `127.0.0.1` with a mock oracle and mock treasury (nullnet-style), at commit
-**`91e1331`** — re-run after two fixes landed on top of the `236642c` run this
+**`91e1331`** — re-run after three fixes landed on top of the `236642c` run this
 page originally published (see "Before the fixes" at the bottom for that
 data and why it looked the way it did):
 
@@ -16,8 +16,10 @@ data and why it looked the way it did):
   concurrent writers now share one `fsync` per group-commit flush instead of
   paying one `fsync` per writer; durability is unchanged (`no_sync`/`sync`
   settings still mean what they did).
-- **`34512a0`** (`pkg/store/memory`): `Stats` is now O(1) (per-state
-  counters) instead of a full scan.
+- **`34512a0`** (`pkg/store/memory`): `Stats`'s row counts now read
+  incrementally maintained per-state counters in O(1) instead of a full
+  scan; the shard-status counts `Stats` also returns stay O(shards),
+  unchanged.
 
 This measures the public HTTP API end to end (coalescer, shard adoption,
 store) for one instance; see
@@ -76,38 +78,49 @@ shape that triggered it most reliably. This is the expected result of
 
 ## Rate caps used, and why
 
-Three of eighteen runs needed a `-rate` cap; all three were **legitimate**
-drain (the unbounded run's own `/metrics` showed `fuelkeeper_pool_refilling{pool="main"} 1`
+Two of eighteen runs needed a `-rate` cap; both were **legitimate** drain
+(the unbounded run's own `/metrics` showed `fuelkeeper_pool_refilling{pool="main"} 1`
 — the minter actively trying to catch up — while `stats.available` fell),
 not the old stuck state, confirmed by a clean, responsive manual reserve
 immediately after each unbounded attempt:
 
-| Backend/shape | Unbounded result | Why capped | Capped result |
+| Backend/shape | Unbounded result (observed, not recorded)* | Why capped | Capped result (recorded, in `results/`) |
 |---|---|---|---|
 | memory `w64-c10` | 5572 reserves/s, 55,722 outputs/s, 1.6% errors (`exhausted`+`insufficient`) | `pool_refilling=1` while draining: at memory's new speed, sustained `count=10` demand from 64 workers occasionally outran `jobs.minter`'s `max_per_round: 100` shards/round refill capacity | `-rate 4000`: 1931 reserves/s, 19,311 outputs/s, 7 errors total (worker-count-bound at this pacing, not rate-bound — see below) |
-| pebble `w64-c10` | 249-266 reserves/s, ~2500-2660 outputs/s, ~20% `exhausted` across three separate attempts (one fresh restart, two rate caps at 900 and then 200/s) | Same signature (`pool_refilling=1`, declining `available`) **was tried at three different rates (unbounded, 200/s, and implicitly the fresh-restart unbounded retry) and the error rate did not change** — capping does not fix this one; it is a per-shard-adoption-boundary cost (see "Residual limit" below), not a rate problem | **Reported unbounded** (no cap kept) — see "Results" below |
 | aerospike `w64-c10` | 2618 reserves/s, 26,183 outputs/s, 9.4% errors | `pool_refilling=1` while draining, same pattern as memory | `-rate 1500`: exactly 1500 reserves/s, 15,000 outputs/s, **zero errors** |
 
-memory's capped run only reached 1931 reserves/s against a 4000/s cap — that
-run's own p50/p99 spread (1.0ms / 1013ms) points at worker-count being the
-actual binding constraint at that pacing (64 workers × ~33ms per
-reserve+spend round trip ≈ 1939/s by Little's law), not the rate limiter
-itself; the cap mainly removed the burst pattern that triggered
-`pool_refilling` churn, rather than throttling a rate the workers could
-otherwise sustain.
+\* The unbounded attempt's numbers above were read from its terminal output
+during the session; that attempt was superseded by the capped rerun and no
+JSON for it was kept, so treat this column as an observation, not a
+verifiable artifact — only the "Capped result" column and `results/*.json`
+are.
 
-**Pebble's residual limit** matches `docs/OPERATIONS.md`'s "Known Limits":
-only a *fully* spent-out shard (every row terminal) is retired outright by
-`ba55a6f`; a shard whose rows are merely drained but not yet terminal
-(still reserved, under a live TTL) is only excluded from re-adoption for
-60s at a time, capped at 256 entries. At pebble's per-adoption cost (see
-[`20260930-store-micro.md`](20260930-store-micro.md)'s `AcquireShard`
-note — it scales with already-leased shard count, uniquely among the
-backends benchmarked there) this residual window is still visible as a
-~20% `exhausted` rate at `w64-c10`, unaffected by demand pacing; postgres/
-mongodb/aerospike/memory's adoption paths do not show the same
-rate-independent floor. See `docs/PERFORMANCE.md`'s caveats for the pointer
-to the planned follow-up fix.
+memory's capped run only reached 1931 reserves/s against a 4000/s cap, so
+something other than the rate limiter was also constraining it. The run's
+own p50/p99 spread (1.0ms / 1013ms -- three orders of magnitude apart) is
+the relevant clue: with 64 workers at a roughly uniform round-trip latency,
+p50 and p99 would sit close together, not 1000x apart. A gap this wide
+means a minority of requests are individually stalling for close to a
+second, not that every request is paying a uniformly higher cost -- most
+likely occasional waits tied to the `pool_refilling` churn the cap was
+meant to reduce, though this run doesn't pin down the exact mechanism.
+
+**Pebble `w64-c10` was not capped** and is reported unbounded: the recorded
+run (`results/pebble-w64-c10.json`) shows 249 reserves/s, 2489 outputs/s,
+and errors `exhausted=3770`, `insufficient=37`, `unavailable=64` (read the
+JSON for the exact counts rather than this prose). **The cause is under
+investigation** as a separate effort; this page will be updated with the
+conclusion once it lands. Note in particular that `unavailable=64` equals
+the worker count exactly (one stall affecting every worker at once), which
+is not explained by anything below and should not be assumed to share a
+cause with the `exhausted`/`insufficient` errors. Pending that
+investigation, do not attribute this to a specific mechanism here: in
+particular, `docs/OPERATIONS.md`'s "Known Limits" exclusion-list residual
+(a drained-but-not-terminal shard's 60s/256-entry re-adoption exclusion) and
+[`20260930-store-micro.md`](20260930-store-micro.md)'s note that pebble's
+`AcquireShard` cost scales with already-leased shard count are two
+*different* mechanisms, and this run's errors have not been traced to
+either one specifically.
 
 ## Results
 
@@ -121,7 +134,7 @@ to the planned follow-up fix.
 | sqlite-w64-c10 | sqlite | 64 | 10 | 303 | 3030 | 130.94 | 225.02 | 430.85 | exhausted=9 insufficient=1 |
 | pebble-w64-c1 | pebble | 64 | 1 | 716 | 716 | 42.56 | 110.78 | 157.82 | - |
 | pebble-w256-c1 | pebble | 256 | 1 | 1826 | 1826 | 68.73 | 155.90 | 323.33 | exhausted=256 |
-| pebble-w64-c10 | pebble | 64 | 10 | 249 | 2489 | 97.79 | 284.16 | 471.81 | exhausted=3770 insufficient=37 unavailable=64 (unbounded; capping did not help, see above) |
+| pebble-w64-c10 | pebble | 64 | 10 | 249 | 2489 | 97.79 | 284.16 | 471.81 | exhausted=3770 insufficient=37 unavailable=64 (unbounded; cause under investigation, see above) |
 | postgres-w64-c1 | postgres | 64 | 1 | 880 | 880 | 40.32 | 64.86 | 90.24 | - |
 | postgres-w256-c1 | postgres | 256 | 1 | 1850 | 1850 | 70.53 | 118.33 | 164.86 | - |
 | postgres-w64-c10 | postgres | 64 | 10 | 550 | 5505 | 61.57 | 116.09 | 310.78 | exhausted=581 insufficient=11 (unbounded — this is the shape that used to hit the stuck state every time; now clean) |
@@ -152,9 +165,12 @@ hit the permanent stuck state on all three; all three now complete the full
 
 ## Resource usage and coalescer batching
 
-Captured from `/metrics`; every backend's three shapes ran back-to-back in
-one continuous server session this time (no stuck-state-driven restarts),
-so CPU delta and coalescer stats below cover all three shapes' full 180s.
+**Observed, not recorded**: read from a live `curl .../metrics` during the
+session (before/after each backend's session) rather than saved to a file
+in this repo, unlike the `results/*.json` throughput numbers above. Every
+backend's three shapes ran back-to-back in one continuous server session
+this time (no stuck-state-driven restarts), so CPU delta and coalescer
+stats below cover all three shapes' full 180s.
 
 | Backend | CPU delta | Approx. cores | RSS at end | Coalescer mean batch (ops/flush) |
 |---|---|---|---|---|
@@ -171,8 +187,9 @@ other four** (15.2 GiB / 645% and 4.9 GiB / 687%, vs. well under 1 GiB and
 direct consequence of how much faster these two now are: the memory backend
 retains every row it has ever created (available, reserved, or spent) in
 process memory rather than on disk, and at ~24-40K reserves/s it processed
-roughly 4.6 million total reserve calls across its three 60s shapes (vs.
-~170-570K for the durable, disk/network-bound backends), so its resident set
+4,009,320 total reserve calls across its three 60s shapes (the JSON
+results' `reserves` fields summed; vs. 167,493-285,552 for sqlite/pebble/
+postgres/mongodb over the same three shapes), so its resident set
 scales with lifetime throughput, not with `target_available`. Aerospike's
 Go client similarly keeps per-connection/event-loop state proportional to
 request volume. **This is worth real attention before running the memory
@@ -183,15 +200,15 @@ concrete illustration of why: the process actually climbed to using a
 double-digit percentage of a 62 GiB host's RAM (and pushed the host's swap
 to near-full) over three 60s shapes.
 
-**Coalescer batch means roughly tripled for sqlite (113 → 81, actually
-slightly down) and pebble (125 → 74) is not the right comparison** — the
-mean dropped for both because group-commit means each flush now completes
-fast enough that fewer concurrent callers pile up behind it (the old,
-slower per-writer-fsync path is exactly what inflated the old means by
-forcing large queues). Lower mean batch size with much higher total
-throughput is the expected signature of the fix working as intended:
-throughput no longer depends on accumulating a large batch to amortize a
-slow fsync.
+**Coalescer mean batch size went down for both sqlite (113.0 → 80.6) and
+pebble (125.4 → 74.0), not up** — despite much higher throughput. This is
+the expected signature of the fix working as intended, not a regression:
+the old, slower one-`fsync`-per-writer path is exactly what inflated the
+old means, by forcing large queues of concurrent callers to pile up behind
+one slow flush; group-commit means each flush now completes fast enough
+that fewer callers are waiting when it fires. Lower mean batch size with
+much higher total throughput means throughput no longer depends on
+accumulating a large batch to amortize a slow fsync.
 
 ## Aerospike cleanup
 
@@ -199,7 +216,9 @@ Unchanged from the original run: `set_prefix: fk_`, `key_prefix: bench6api`,
 truncated with the same `pkg/store/aerospike.New` + `Store.Truncate()`
 helper after the session. `asinfo -v 'sets/test' | tr ';' '\n' | grep -c
 'set='` on `arcade-aerospike` read **2823** immediately before this re-run's
-aerospike session and **2823** again after the truncate.
+aerospike session and **2823** again after the truncate (observed, not
+recorded: read directly from the command's terminal output during the
+session, not saved to a file in this repo).
 
 ---
 

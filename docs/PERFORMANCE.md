@@ -5,7 +5,7 @@ This page is the entry point: method, the headline numbers, capacity
 guidance, the correctness audit statement, and caveats. The store
 microbenchmarks are from commit `236642c` (2026-09-30); the API
 (single-instance and cluster) numbers are from commit **`91e1331`**
-(2026-09-30), re-run after two fixes landed on top of the `236642c` API
+(2026-09-30), re-run after three fixes landed on top of the `236642c` API
 numbers this page originally published — see
 [`benchmarks/20260930-api-single.md`](benchmarks/20260930-api-single.md)'s
 "Before the fixes" appendix for what changed and why.
@@ -20,13 +20,19 @@ Three harnesses, each measuring a different slice of the system:
    No HTTP, no pool coalescer, no jobs: just `Store.Reserve`,
    `Store.AcquireShard` and `Store.Quarantine` called directly, in-process.
    This isolates each backend's raw commit/lookup cost from everything
-   FuelKeeper builds on top of it. **The sqlite/pebble numbers on that page
-   were measured on tmpfs** (`go test`'s default temp directory, RAM-backed
-   on this host), not the real SSD named in that page's "Machine" section —
-   `fsync` there was already close to free, so the later group-commit fix
-   (`fd4dc56`/`91e1331`, see below) does not change those particular
-   numbers; its effect is visible instead in the API single-instance
-   numbers, whose sqlite/pebble data directories are on the real disk.
+   FuelKeeper builds on top of it. **Neither the sqlite nor the pebble
+   numbers on that page pay this host's real SSD fsync cost, for two
+   different reasons**: pebble's benchmarks open the store with `NoSync:
+   true` (zero `fsync` calls, on any filesystem); sqlite's keep the default
+   `synchronous=FULL` (an `fsync` per commit) but `go test`'s default temp
+   directory is `tmpfs` (RAM-backed) on this host, not the real SSD named in
+   that page's "Machine" section, so those `fsync` calls are real but cheap.
+   The later group-commit fix (`fd4dc56`/`91e1331`, see below) does not
+   change either page's numbers (pebble was never fsyncing there; sqlite's
+   tmpfs fsync had little cost to amortize); its effect is visible instead
+   in the API single-instance numbers, whose sqlite/pebble data directories
+   are on the real disk with sqlite's default durability and pebble's
+   `no_sync: false`.
 2. **API, single instance per backend** (`cmd/fuelbench` against one
    `fuelkeeper serve` process, mock oracle/treasury, commit `91e1331` —
    [`benchmarks/20260930-api-single.md`](benchmarks/20260930-api-single.md)).
@@ -68,23 +74,26 @@ the `-rate` caps some shapes needed are in
 
 | Backend | Single instance, w64-c1 reserves/s | Single instance, w64-c10 outputs/s | 3-instance cluster, w64-c1 reserves/s | p99 reserve latency (w64-c1) |
 |---|---|---|---|---|
-| memory | 24364 | 19311 | n/a (single-process only) | 7 ms |
+| memory | 24364 | 19311 (rate-capped 4000/s) | n/a (single-process only) | 7 ms |
 | sqlite | 707 | 3030 | n/a (single-process only) | 144 ms |
 | pebble | 716 | 2489 | n/a (single-process only) | 158 ms |
 | postgres | 880 | 5505 | 1012 | 90 ms |
 | mongodb | 970 | 6669 | n/a (not benchmarked clustered) | 85 ms |
-| aerospike | 24726 | 15000 (rate-capped) | n/a (not benchmarked clustered) | 5 ms |
+| aerospike | 24726 | 15000 (rate-capped 1500/s) | n/a (not benchmarked clustered) | 5 ms |
 
 **memory and aerospike are the fastest by a wide margin** (single-digit
-millisecond p99, 24K+ reserves/s at `w64-c1`) — both benefited directly
-from the `34512a0` (memory `Stats` now O(1)) and `ba55a6f`/`a22be74`
-(shard retirement) fixes, the latter of which also applies to aerospike's
-adoption path. **sqlite and pebble moved from the slowest backends by two
-orders of magnitude to a solid middle tier** (700+ reserves/s, tens of
-milliseconds p99, down from hundreds of milliseconds) once `fd4dc56`/
-`91e1331` replaced one-`fsync`-per-writer with group commit — they are
-still bound by their single-writer lock relative to the multi-process
-backends, just no longer catastrophically so. **Postgres is the only
+millisecond p99, 24K+ reserves/s at `w64-c1`). Memory benefited from both
+`34512a0` (its row-count `Stats` reads are now O(1); the shard-status
+counts `Stats` also returns stay O(shards), unchanged) and `ba55a6f`/
+`a22be74` (shard retirement); aerospike benefited from `ba55a6f`/`a22be74`
+only -- `34512a0` is specific to `pkg/store/memory` and does not touch
+aerospike. **sqlite and pebble moved from the slowest backends by one
+order of magnitude to a solid middle tier** (700+ reserves/s at `w64-c1`,
+p50 in the tens of milliseconds -- 47.84/42.56 ms -- though p99 is still
+144/158 ms, down from hundreds of milliseconds for both percentiles) once
+`fd4dc56`/`91e1331` replaced one-`fsync`-per-writer with group commit —
+they are still bound by their single-writer lock relative to the
+multi-process backends, just no longer catastrophically so. **Postgres is the only
 backend measured clustered** (the benchmark cluster's fixed config,
 `deploy/fuelkeeper-bench.yaml`, only stands up a Postgres-backed cluster);
 it and mongodb are the two multi-process backends most likely to be run in
@@ -93,30 +102,42 @@ Topologies").
 
 ## Capacity guidance
 
-**For N reserves/s, provision a pool of at least `N x reservation_ttl x
-safety_factor` available rows**, where `reservation_ttl` is the TTL a client
-actually requests (`pools[0].default_ttl` if unspecified — 2 minutes by
-default, `pools[0].min_ttl`/`max_ttl` bound what a client may ask for; see
-`docs/OPERATIONS.md`'s config template) and `safety_factor` covers burstiness
-and the minter's own reaction lag (`jobs.minter.interval`,
-`max_per_round`/`max_pending_shards`) — 1.5-2x is a reasonable starting
-point, higher if load is bursty rather than steady. The reasoning: at a
-steady N reserves/s with every reservation held for `reservation_ttl`
-seconds before being spent or released, `N x reservation_ttl` outputs are
-"in flight" (reserved, not yet available again) at any moment — the pool
-must hold at least that many *available* rows on top of what is currently
-reserved, or a legitimate burst of new reserves starves behind existing
-holds. Worked example: at 1000 reserves/s with the default 120s TTL and a
-1.5x safety factor, `target_available` should be at least `1000 x 120 x 1.5
-= 180,000`, with `low_water` set so the minter starts refilling well before
-that (e.g. half of `target_available`) — this task's own single-instance
-configs used `target_available: 300000`, `low_water: 150000` for exactly
-this reason. Note the fixed code can now sustain 1000 reserves/s on a
-single postgres instance comfortably (880-1850 reserves/s measured,
-depending on concurrency shape) and far more on memory/aerospike; size
-`target_available` against the *sustained* rate you plan to run, not the
-peak single-shape number above, since `w256-c1`/`w64-c10` and `w64-c1`
-exercise different concurrency-vs-batch-size trade-offs.
+Two separate buffers determine how many rows a pool needs, and they should
+be sized separately rather than folded into one number:
+
+1. **Reserved-in-flight capacity.** At a steady N reserves/s, an output
+   stays in the `reserved` state (not `available`, not yet `spent` or
+   `released`) for up to its reservation TTL (`pools[].default_ttl` if a
+   client doesn't specify one — 2 minutes by default; `pools[].min_ttl`/
+   `max_ttl` bound what a client may request; see `docs/OPERATIONS.md`'s
+   config template). So roughly `N x hold_time` outputs (`hold_time` ≤ the
+   TTL; shorter if clients spend/release promptly) are parked in `reserved`
+   at any moment — capacity the minter must have produced *in addition to*
+   the available buffer below, since those rows are temporarily unusable by
+   anyone else.
+2. **The available buffer (`target_available`).** This must cover demand
+   during the minter's own reaction lag: how long it takes `jobs.minter` to
+   notice `available` has dropped and produce enough newly mined rows to
+   compensate (bounded by `jobs.minter.interval`, `max_per_round` and
+   `max_pending_shards` — how many shards it can start and how many it will
+   let sit unmined at once). Size it to `N x reaction_lag x safety_factor`,
+   where `reaction_lag` is the time from a low-water trigger to new rows
+   landing, and `safety_factor` (1.5-2x is a reasonable starting point,
+   higher if load is bursty) covers the gap between that estimate and
+   reality. `low_water` should trigger refilling well before `available`
+   actually runs out — e.g. half of `target_available` — so the minter has
+   the full reaction lag to work with, not zero.
+
+Total minted supply (what the minter needs to be able to sustain, not a
+single config value) is approximately the sum of both: reserved-in-flight
+capacity plus the available buffer. Note the fixed code's *measured* range
+on a single postgres instance across this page's three load shapes was
+550-1850 reserves/s (`w64-c10`'s 550 came with real errors — 581
+`exhausted` + 11 `insufficient`, not a comfortable margin — see
+[`benchmarks/20260930-api-single.md`](benchmarks/20260930-api-single.md));
+size `target_available` and the reserved-in-flight budget against the
+*sustained* rate you actually plan to run and the concurrency shape it
+will run under, not the single highest number measured here.
 
 **For horizontal scaling**, the cluster benchmark's single-instance-vs-
 three-instance comparison
@@ -139,33 +160,43 @@ counts rows whose *optimistic* reservation lost a compare-and-set race —
 the store had already changed the row by the time the coalescer's batch
 applied, so that op is rejected and retried against a different row; this
 is **not** a double hand-out, it is the CAS mechanism working as designed.
-As of `91e1331`, a rescan's own store listing can no longer re-add a row a
+As of `a22be74`, a rescan's own store listing can no longer re-add a row a
 concurrent `Reserve` already popped and applied (`pkg/pool/allocator.go`'s
 bracketed listing generations), so `cas_missed_total` is now a clean signal
 for a genuine second owner briefly touching a row (e.g. during a lease
 hand-over) — it no longer includes the self-inflicted misses a rescan race
 used to cause. It read **zero** across every single-instance and cluster
-run in this re-run (six single-process backends plus the three-instance
-cluster, all checked via `/metrics` after their runs), which is itself a
-consistency check: the cluster runs did have genuine concurrent instances
-competing for the same rows, and still saw no CAS conflicts serious enough
-to register in a 60s window at the loads tested.
+run in this re-run (three embedded backends plus three servers run
+single-instance, plus the three-instance cluster, all checked via a live
+`/metrics` read after their runs — observed, not recorded: not saved to a
+file in this repo, unlike the `results/*.json` throughput numbers). This is
+the *expected* reading, not a
+surprising or notable pass: genuine second-owner contention only arises
+around a lease hand-over (an instance losing and another instance adopting
+the same shard), which none of these 60s runs triggered — a zero reading
+here says the metric didn't fire spuriously, not that concurrent-ownership
+handling was exercised and survived.
 
 The actual "never handed out twice" guarantee is enforced continuously in
 CI, not just asserted here: `pkg/pool/invariant_test.go`'s
 **`TestInvariantsMultiInstance`** and **`TestInvariantsConcurrentClients`**
-drive many concurrent clients (and, in the multi-instance case, many
-FuelKeeper instances) against a shared store and fail the test the instant
-any fuel outpoint is found live under two different reservation tokens
-simultaneously — the `live.claim` helper in that file checks both its own
-in-memory bookkeeping of "who should hold this row" and asks the store
-directly whether the row really is reserved under the token it was just
-handed, so a bug in either the in-memory allocator or the store's CAS logic
-would be caught.
+(`pkg/pool/invariant_test.go:192,343`) drive many concurrent clients (and,
+in the multi-instance case, many FuelKeeper instances) against a shared
+**memory store** (the only backend these two tests use) and fail the test
+the instant any fuel outpoint is found live under two different
+reservation tokens simultaneously — the `live.claim` helper in that file
+checks both its own in-memory bookkeeping of "who should hold this row"
+and asks the store directly whether the row really is reserved under the
+token it was just handed. This catches a bug in the in-memory allocator
+(backend-agnostic) or in the memory store's own CAS logic; it does not by
+itself exercise postgres/mongodb/aerospike/sqlite/pebble's own CAS
+implementations, each of which has separate conformance coverage under
+`make test`/`make test-integration` (see the README's "Store Backends"
+table).
 
 ## Caveats
 
-- **Single machine.** Every benchmark in this task ran client
+- **Single machine.** Every benchmark on this page ran client
   (`fuelbench`/`fuelkeeper`) and server on one host (a 13th Gen Intel
   Core i9-13900K, SATA SSD — see
   [`benchmarks/20260930-store-micro.md`](benchmarks/20260930-store-micro.md)
@@ -191,34 +222,46 @@ would be caught.
   watcher never sees the minter's confirmations and the pool never fills.
   Not a FuelKeeper bug (a real chain oracle has no per-process state), but a
   real limitation of benchmarking a cluster with the mock oracle.
-- **The tmpfs vs. real-disk split for sqlite/pebble.** The store
-  microbenchmarks' sqlite/pebble numbers are on tmpfs (RAM-backed, `fsync`
-  close to free); the API single-instance sqlite/pebble numbers are on the
-  real SSD. Compare within a page, not across the store-micro and
-  API-single pages' sqlite/pebble absolute latencies.
-- **Durability settings of the local Postgres/MongoDB.** The already-running
-  `localhost:15432` Postgres (`postgres:16-alpine`,
-  `synchronous_commit=on` per `deploy/docker-compose.bench.yaml`'s cluster
-  config; the single-instance benchmark's dedicated database ran against
-  the same server's defaults) and `localhost:27017` MongoDB
-  (`mongo:7`, standalone, not a replica set) are development containers on
-  local SSD-backed storage, not a production HA topology — MongoDB in
-  particular has no replica to make `{w: majority, j: true}` meaningfully
-  redundant here, and neither server's storage is separated from the
-  benchmark client's own disk I/O.
-- **`/spend` is not coalesced.** Reserve requests are batched by the
-  per-pool coalescer (group-commit), but every `spend` and `release` call is
-  its own store write, one per call. A write-bound store therefore sees
-  roughly one write transaction per output spent or released, versus
-  roughly one write transaction per *batch* of outputs reserved: at a
-  `count` of 20 per reserve, that is on the order of 20x more write
-  transactions from spends than from reserves for the same throughput of
-  outputs (see `docs/OPERATIONS.md`'s "Known Limits"). Every benchmark on
-  this page ran in `spend` mode, so the numbers above already include this
-  cost; size `split_size`/`target_available` and the store's write capacity
-  with that ratio in mind, not just the reserve rate.
-- **Shard-adoption stability: fixed, with one residual limit.** The
-  permanent shard-adoption stall this page's numbers originally exposed
+- **The store-micro vs. API-single split for sqlite/pebble durability.**
+  The store microbenchmarks' pebble numbers make zero `fsync` calls
+  (`NoSync: true`) and its sqlite numbers fsync against tmpfs (RAM-backed,
+  cheap); the API single-instance sqlite/pebble numbers run with sqlite's
+  default durability and pebble's `no_sync: false` against the real SSD.
+  Compare within a page, not across the store-micro and API-single pages'
+  sqlite/pebble absolute latencies.
+- **Durability settings of the local Postgres/MongoDB.** Two separate
+  Postgres containers were involved: the already-running `localhost:15432`
+  dev server (`deploy/docker-compose.yaml`, `postgres:16-alpine`, no
+  explicit `synchronous_commit` override -- Postgres's own built-in default
+  is `on` -- the single-instance benchmark's dedicated database ran here),
+  and the benchmark cluster's own postgres (`deploy/docker-compose.bench.yaml`,
+  a separate container with no host port, `synchronous_commit=on` set
+  explicitly). Both land on `synchronous_commit=on` in practice, but from
+  different sources; neither is the same container. `localhost:27017`
+  MongoDB (`mongo:7`, standalone, not a replica set) served both the
+  single-instance benchmark (no cluster MongoDB config exists -- the
+  cluster benchmark is postgres-only). All of these are development
+  containers on local SSD-backed storage, not a production HA topology --
+  MongoDB in particular has no replica to make `{w: majority, j: true}`
+  meaningfully redundant here, and none of these servers' storage is
+  separated from the benchmark client's own disk I/O.
+- **`/spend` is not coalesced across callers.** Reserve requests from many
+  concurrent callers are batched by the per-pool coalescer into one store
+  write per flush; `spend`/`release` are not -- `Pool.storeSpend`
+  (`pkg/pool/service.go`) makes one store write per *request* (covering
+  every outpoint that request names), but each caller's request is always
+  its own store call, never merged with another's. So the spend:reserve
+  write-transaction ratio is roughly the coalescer's batch size divided by
+  `count` (outputs per reserve) -- not a fixed multiplier, and not
+  necessarily unfavorable to spend (see `docs/OPERATIONS.md`'s "Known
+  Limits" for the full reasoning). Every benchmark on this page ran in
+  `spend` mode, so the numbers above already include whatever this ratio
+  was for that shape; sqlite/pebble's group-commit (concurrent writers
+  sharing one `fsync` per flush) applies to spend/release writes at the
+  store layer the same as to reserve writes, so it is not only the reserve
+  side that benefited from that fix.
+- **Shard-adoption stability: fixed, with one documented residual limit.**
+  The permanent shard-adoption stall this page's numbers originally exposed
   (an instance's allocator could stop adopting shards forever even with
   rows available elsewhere) is fixed as of `ba55a6f`/`a22be74`: a fully
   spent-out shard (every row terminal) is now retired outright rather than
@@ -227,14 +270,17 @@ would be caught.
   but not yet *terminal* (still reserved under a live TTL, or quarantined)
   is only excluded from re-adoption for 60s at a time, capped at a 256-entry
   list — if more than 256 such shards precede the live ones, adoption can
-  still cycle. This measurably affected pebble's `w64-c10` shape in the
-  re-run (see
+  still cycle. The planned fix, per `docs/OPERATIONS.md`, is a store-side
+  `AcquireShard` that skips row-less shards server-side instead of relying
+  on a bounded client-side exclusion list. **Pebble's `w64-c10` shape
+  showed errors in the re-run** (see
   [`benchmarks/20260930-api-single.md`](benchmarks/20260930-api-single.md)'s
-  "Residual limit" note — a rate-independent ~20% `exhausted` rate, unique
-  to pebble among the backends benchmarked). The planned fix, per
-  `docs/OPERATIONS.md`, is a store-side `AcquireShard` that skips row-less
-  shards server-side instead of relying on a bounded client-side exclusion
-  list.
+  "Rate caps used, and why" section for the exact counts) whose cause is a
+  separate, currently open investigation — it is not yet established
+  whether this residual limit, pebble's `AcquireShard` cost (see
+  [`benchmarks/20260930-store-micro.md`](benchmarks/20260930-store-micro.md)),
+  or something else entirely is responsible; this page will be updated once
+  that investigation concludes.
 
 ## Keeping this current
 

@@ -175,10 +175,27 @@ most one finish and one snapshot, so with the toolbox treasury the config
 requires `jobs.lease_ttl > build_timeout + 20 s` (90 s > 80 s by default).
 The job lease is renewed only between rounds; because no phase waits for
 the grace, a round never outlives the lease on account of reconciliation,
-and two instances never mint concurrently because of it. (A round that
-builds several splits can still take up to `max_per_round` ×
-`build_timeout` in the worst case; every store write is a CAS, so an
-overlap in that case is harmless, as it is during any lease hand-over.)
+and two instances never mint concurrently *because of reconciliation*.
+
+A round that builds several splits can still take up to `max_per_round` x
+`build_timeout` in the worst case, which can exceed `jobs.lease_ttl` -- so
+two minters *can* overlap: one instance's round still running past its
+lease's renewal deadline, while another instance sees the lease as expired
+and starts its own round against the same pool. This is safe: every store
+write is a CAS (a split is durably recorded, or not, within its own
+`build_timeout`, the same as during any ordinary lease hand-over), so
+neither instance can corrupt or double-record the other's split. But it is
+not free of effect -- each instance computes its own top-up deficit
+(`target_available` minus the `Available` it observed at the start of its
+round) independently, so two overlapping rounds can each mint up to the
+full deficit they each saw, and the pool can end up minted past
+`target_available` by up to roughly **twice** the deficit in the worst
+case, not merely to it. This self-corrects (the next round's deficit
+calculation sees the true, higher `Available` and mints less or nothing),
+so it is a transient overshoot, not a runaway condition -- but size
+`max_pending_shards` and downstream fee/UTXO expectations with this
+possibility in mind, not on the assumption that the pool never exceeds
+`target_available`.
 
 A failed phase is logged and retried next round, keeping its snapshot;
 minting continues. The minter logs the counts at Info (Warn when anything

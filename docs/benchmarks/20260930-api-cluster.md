@@ -7,7 +7,7 @@ sharing one `postgres:16-alpine` store, all driven by
 `target_available: 300000`, `low_water: 200000`, `split_size: 1000`,
 `jobs.minter`: `max_per_round: 20`, `max_pending_shards: 100`,
 `instance.max_shards`/`low_water_rows` at config defaults `8`/`5000` — this
-file is fixed, not part of this task's editable configs). **Re-run at
+file is fixed, not part of the benchmark's editable single-instance configs). **Re-run at
 commit `91e1331`** after the shard-retirement fix (`ba55a6f`/`a22be74`) and
 the sqlite/pebble group-commit fix (`fd4dc56`/`91e1331`) landed — see
 [`20260930-api-single.md`](20260930-api-single.md) for what those fixed and
@@ -25,11 +25,10 @@ for the combined summary.
 make bench-cluster-up      # docker compose -f deploy/docker-compose.bench.yaml up -d --build --wait
 ```
 
-Images were already built from the prior run in this session (cached
-layers), so `up -d --wait` completed in under a minute this time (the
-original, cold build took roughly 8-9 minutes — see
-[`20260930-api-single.md`](20260930-api-single.md)'s equivalent note, or the
-"Before the fixes" section below).
+Images were already built from a prior `bench-cluster-up` in this session
+(cached layers), so `up -d --wait` completed in under a minute this time; a
+cold build (no cached layers) took roughly 8-9 minutes when this page was
+first produced.
 
 ## A pre-existing gotcha, not a regression: mock oracle state is per-process
 
@@ -59,7 +58,7 @@ This reproduced deterministically with the job leases split
 next `bench-cluster-down`/`bench-cluster-up` cycle, where all three leases
 happened to land on the same instance (fk3) — confirming it as a race in
 which instance wins which job lease at startup, not a deterministic bug,
-and not something any of this task's three fixes touch (none of
+and not something any of the three fixes above touch (none of
 `ba55a6f`/`a22be74`/`fd4dc56`/`91e1331`/`34512a0` touch `pkg/oracle` or the
 send-confirmation wiring). **This is a real limitation of benchmarking a
 multi-instance cluster with the mock oracle/treasury** (nullnet mode is
@@ -70,7 +69,7 @@ same external arcade/teranode. It is flagged here because it cost real time
 to diagnose and could recur on any future `bench-cluster-up`; worth a
 follow-up (e.g. pin all three jobs' leases to instance 1 in the benchmark
 compose file, or accept a retry-on-stall step in the runbook) separate from
-this benchmarking task.
+this benchmarking effort.
 
 Once the leases landed on one instance, `GET /v1/pools` on all three
 (`:8081`-`:8083`) climbed steadily to `stats.available: 300000` within
@@ -107,9 +106,12 @@ front of one durable store.
 
 ## Resource usage and coalescer batching
 
-All three instances ran the three cluster shapes back-to-back in one
-session; fk1 additionally ran the single-instance comparison shape (240s
-total vs. the other two's 180s).
+**Observed, not recorded**: read from a live `curl .../metrics` per
+instance during the session rather than saved to a file in this repo,
+unlike the `results/*.json` throughput numbers above. All three instances
+ran the three cluster shapes back-to-back in one session; fk1 additionally
+ran the single-instance comparison shape (240s total vs. the other two's
+180s).
 
 | Instance | Wall-clock covered | CPU delta | Approx. cores | RSS at end | Coalescer mean batch |
 |---|---|---|---|---|---|
@@ -130,7 +132,7 @@ make bench-cluster-down    # docker compose -f deploy/docker-compose.bench.yaml 
 ```
 
 Verified with `podman ps -a` afterward: back to the four containers that
-were already running before this task started.
+were already running before this benchmark run started.
 
 ---
 
