@@ -4,10 +4,16 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 )
+
+// WithFS opens the store on fs instead of the OS filesystem (tests only:
+// durability_test.go runs on vfs.NewStrictMem to simulate a crash that loses
+// every write not yet synced).
+func WithFS(fs vfs.FS) Option { return func(c *openConfig) { c.fs = fs } }
 
 // VerifyInternalConsistency re-derives every is/, ie/, iq/, c/ and x/ key
 // pebble should have purely from a scan of the r/ (row) and s/ (shard)

@@ -28,7 +28,7 @@ func matchesNothingBefore(before time.Time) bool {
 }
 
 // ListAvailable implements store.Store.
-func (s *Store) ListAvailable(ctx context.Context, pool string, txid chainhash.Hash, fromVout uint32, limit int) ([]store.Row, error) {
+func (s *Store) ListAvailable(ctx context.Context, pool string, txid chainhash.Hash, fromVout uint32, limit int) (_ []store.Row, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -39,14 +39,14 @@ func (s *Store) ListAvailable(ctx context.Context, pool string, txid chainhash.H
 		return nil, err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return nil, errClosed
 	}
 	lower := rowKey(store.Outpoint{TxID: txid, Vout: fromVout})
 	upper := prefixEnd(rowPrefix(txid))
 	out := make([]store.Row, 0, limit)
-	err := s.iterate(lower, upper, func(_, v []byte) (bool, error) {
+	err = s.iterate(lower, upper, func(_, v []byte) (bool, error) {
 		r, derr := decodeRow(v)
 		if derr != nil {
 			return false, derr
@@ -64,7 +64,7 @@ func (s *Store) ListAvailable(ctx context.Context, pool string, txid chainhash.H
 }
 
 // GetRows implements store.Store.
-func (s *Store) GetRows(ctx context.Context, pool string, ops []store.Outpoint) ([]store.Row, error) {
+func (s *Store) GetRows(ctx context.Context, pool string, ops []store.Outpoint) (_ []store.Row, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -75,7 +75,7 @@ func (s *Store) GetRows(ctx context.Context, pool string, ops []store.Outpoint) 
 		return nil, err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -93,7 +93,7 @@ func (s *Store) GetRows(ctx context.Context, pool string, ops []store.Outpoint) 
 }
 
 // Reserve implements store.Store.
-func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp) ([]store.ReserveOp, error) {
+func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp) (_ []store.ReserveOp, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -104,7 +104,7 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 		return nil, err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -180,7 +180,7 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 
 // mutateReserved applies mutate to every op's row currently reserved(token),
 // stamping UpdatedAt and writing exactly one batch for the whole call.
-func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpoint, mutate func(next *store.Row, now time.Time)) (int, error) {
+func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpoint, mutate func(next *store.Row, now time.Time)) (_ int, err error) {
 	if err := store.ValidateOutpoints(ops, maxBatch); err != nil {
 		return 0, err
 	}
@@ -188,7 +188,7 @@ func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpo
 		return 0, store.ErrInvalidArgument
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return 0, errClosed
 	}
@@ -274,7 +274,7 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 // *unsigned* microsecond count, so a pre-epoch before's negative Unix time
 // would otherwise wrap around to a huge value and match everything instead
 // of nothing.
-func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, limit int) (int, error) {
+func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, limit int) (_ int, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -289,7 +289,7 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 	}
 	before = before.Truncate(time.Microsecond)
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return 0, errClosed
 	}
@@ -349,7 +349,7 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 // [nextKey(quarantineKey(pool, after.At, after.Outpoint)), upperBoundBefore(before))
 // is already empty by construction whenever after is not strictly before
 // before.
-func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Time, after *store.RowCursor, limit int) ([]store.Row, error) {
+func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Time, after *store.RowCursor, limit int) (_ []store.Row, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -364,7 +364,7 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 	}
 	before = before.Truncate(time.Microsecond)
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -376,7 +376,7 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 		lower = nextKey(quarantineKey(pool, after.At, after.Outpoint))
 	}
 	out := make([]store.Row, 0, limit)
-	err := s.iterate(lower, upper, func(k, _ []byte) (bool, error) {
+	err = s.iterate(lower, upper, func(k, _ []byte) (bool, error) {
 		tail := k[len(prefix)+8:]
 		var op store.Outpoint
 		copy(op.TxID[:], tail[:32])
@@ -398,7 +398,7 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 }
 
 // Resolve implements store.Store.
-func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, to store.State, spentBy *chainhash.Hash) (int, error) {
+func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, to store.State, spentBy *chainhash.Hash) (_ int, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -412,7 +412,7 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 		return 0, err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return 0, errClosed
 	}
@@ -455,7 +455,7 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 }
 
 // Stats implements store.Store.
-func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
+func (s *Store) Stats(ctx context.Context, pool string) (_ store.Stats, err error) {
 	if err := ctx.Err(); err != nil {
 		return store.Stats{}, err
 	}
@@ -463,7 +463,7 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 		return store.Stats{}, err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return store.Stats{}, errClosed
 	}

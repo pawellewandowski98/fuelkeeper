@@ -213,27 +213,145 @@ func TestWrite_GroupCommitIsolatesFailures(t *testing.T) {
 		"%d writes queued behind one in flight must share a group commit (blocker's own + at most one more), not commit one by one", n)
 }
 
-// TestWrite_CancelledWhileQueuedIsNotApplied pins the cancellation rule: a
-// write whose context ends before writeLoop claims it returns the context
-// error and is never run.
-func TestWrite_CancelledWhileQueuedIsNotApplied(t *testing.T) {
+// insertLease is a write fn inserting a fuel_leases row named name.
+func insertLease(name string) func(context.Context, querier) error {
+	return func(ctx context.Context, c querier) error {
+		_, err := c.ExecContext(ctx, `INSERT INTO fuel_leases (name, holder, expires_at) VALUES (?, 'h', 1)`, name)
+		return err
+	}
+}
+
+// queueBehind starts a write in the background and waits until it is
+// blocked on the writer (the blocker from blockWriter is still holding it),
+// so writes queued this way land in the group that runs after the blocker.
+func queueBehind(ctx context.Context, s *Store, fn func(context.Context, querier) error) <-chan error {
+	res := make(chan error, 1)
+	go func() { res <- s.write(ctx, fn) }()
+	return res
+}
+
+// TestWrite_CancelBeforePickupIsNeverApplied pins commitGroup's skip of a
+// write whose context ended before the writer ran it, while the writes
+// grouped with it still commit. Two routes reach that state: B's context
+// ends while B waits in write's select (the common case: write returns the
+// ctx error and never hands B over), and C is handed over with an
+// already-ended context (what write's select does when the send and
+// ctx.Done are ready at once, since select picks among ready cases at
+// random) -- C is injected straight into the queue, as only commitGroup's
+// check keeps it from being run.
+func TestWrite_CancelBeforePickupIsNeverApplied(t *testing.T) {
 	s, err := Open(context.Background(), Config{Path: filepath.Join(t.TempDir(), "cancel-queued.sqlite")})
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
 
 	release, blockerRes := blockWriter(t, s)
-	cctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	werr := s.write(cctx, func(ctx context.Context, c querier) error {
-		_, err := c.ExecContext(ctx, `INSERT INTO fuel_leases (name, holder, expires_at) VALUES ('queued', 'h', 1)`)
+	aRes := queueBehind(context.Background(), s, insertLease("a"))
+
+	bctx, bcancel := context.WithCancel(context.Background())
+	bRes := queueBehind(bctx, s, insertLease("b"))
+
+	cctx, ccancel := context.WithCancel(context.Background())
+	ccancel()
+	cReq := &writeReq{ctx: cctx, fn: insertLease("c"), done: make(chan error, 1)}
+	go func() { s.writes <- cReq }()
+
+	dRes := queueBehind(context.Background(), s, insertLease("d"))
+
+	time.Sleep(50 * time.Millisecond) // let every write reach the queue
+	bcancel()
+	require.ErrorIs(t, <-bRes, context.Canceled, "B's context ended while it was queued")
+	release()
+
+	require.NoError(t, <-blockerRes)
+	require.NoError(t, <-aRes)
+	require.NoError(t, <-dRes)
+	require.ErrorIs(t, <-cReq.done, context.Canceled, "C was handed over with an ended context: it must be skipped, not run")
+	for name, want := range map[string]int{"blocker": 1, "a": 1, "b": 0, "c": 0, "d": 1} {
+		assert.Equal(t, want, countLeases(t, s, name), "lease %q", name)
+	}
+
+	// After Close, a write fails with the closed-store error instead of
+	// blocking forever, and it is store.ErrUnavailable like every backend's.
+	require.NoError(t, s.Close())
+	werr := s.write(context.Background(), func(context.Context, querier) error { return nil })
+	require.ErrorIs(t, werr, errClosed)
+	require.ErrorIs(t, werr, store.ErrUnavailable)
+}
+
+// TestWrite_CancelAfterPickupDoesNotDisturbTheGroup pins that once the
+// writer has picked a write up, its caller cancelling does not reach the
+// shared transaction: fn runs under context.WithoutCancel, so its own
+// statements still run (and the write is applied and acknowledged), and the
+// writes grouped with it commit too. With the caller's context passed to fn
+// instead, M's insert after the cancel fails (or, if the cancel lands
+// mid-statement, SQLite rolls back the whole group).
+func TestWrite_CancelAfterPickupDoesNotDisturbTheGroup(t *testing.T) {
+	s, err := Open(context.Background(), Config{Path: filepath.Join(t.TempDir(), "cancel-picked.sqlite")})
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	release, blockerRes := blockWriter(t, s)
+	aRes := queueBehind(context.Background(), s, insertLease("a"))
+	mctx, mcancel := context.WithCancel(context.Background())
+	defer mcancel()
+	mRes := queueBehind(mctx, s, func(ctx context.Context, c querier) error {
+		mcancel() // the caller gives up after the writer picked this write up
+		if _, err := c.ExecContext(ctx, `INSERT INTO fuel_leases (name, holder, expires_at) VALUES ('m1', 'h', 1)`); err != nil {
+			return err
+		}
+		_, err := c.ExecContext(ctx, `INSERT INTO fuel_leases (name, holder, expires_at) VALUES ('m2', 'h', 1)`)
 		return err
 	})
-	require.ErrorIs(t, werr, context.DeadlineExceeded)
+	dRes := queueBehind(context.Background(), s, insertLease("d"))
+	time.Sleep(50 * time.Millisecond)
+	release()
+
+	require.NoError(t, <-blockerRes)
+	require.NoError(t, <-aRes)
+	require.NoError(t, <-mRes, "a write already picked up runs to its real outcome")
+	require.NoError(t, <-dRes)
+	for _, name := range []string{"blocker", "a", "m1", "m2", "d"} {
+		assert.Equal(t, 1, countLeases(t, s, name), "lease %q", name)
+	}
+}
+
+// TestWrite_PanicFailsTheGroupAndTheWriterSurvives pins writeLoop's panic
+// recovery: a write whose fn panics fails with an error naming the panic,
+// every write grouped with it fails with store.ErrUnavailable and is not
+// applied (their shared transaction is rolled back), and the writer keeps
+// serving later writes -- neither the process nor the writer connection is
+// taken down.
+func TestWrite_PanicFailsTheGroupAndTheWriterSurvives(t *testing.T) {
+	s, err := Open(context.Background(), Config{Path: filepath.Join(t.TempDir(), "panic.sqlite")})
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	release, blockerRes := blockWriter(t, s)
+	aRes := queueBehind(context.Background(), s, insertLease("a"))
+	pRes := queueBehind(context.Background(), s, func(ctx context.Context, c querier) error {
+		if _, err := c.ExecContext(ctx, `INSERT INTO fuel_leases (name, holder, expires_at) VALUES ('p', 'h', 1)`); err != nil {
+			return err
+		}
+		panic("boom in fn")
+	})
+	dRes := queueBehind(context.Background(), s, insertLease("d"))
+	time.Sleep(50 * time.Millisecond)
 	release()
 	require.NoError(t, <-blockerRes)
-	assert.Zero(t, countLeases(t, s, "queued"), "a write cancelled while queued must never run")
 
-	// After Close, a write fails instead of blocking forever.
-	require.NoError(t, s.Close())
-	require.ErrorIs(t, s.write(context.Background(), func(context.Context, querier) error { return nil }), errClosed)
+	perr := <-pRes
+	require.Error(t, perr)
+	assert.Contains(t, perr.Error(), "boom in fn")
+	for _, r := range []<-chan error{aRes, dRes} {
+		gerr := <-r
+		require.ErrorIs(t, gerr, store.ErrUnavailable, "a write grouped with a panicking one is rolled back: retryable")
+		assert.Contains(t, gerr.Error(), "boom in fn")
+	}
+	for _, name := range []string{"a", "p", "d"} {
+		assert.Zero(t, countLeases(t, s, name), "lease %q must be rolled back with the panicking group", name)
+	}
+
+	// The writer survived: a later write (and a later panic-free group) works.
+	require.NoError(t, s.write(context.Background(), insertLease("after")))
+	assert.Equal(t, 1, countLeases(t, s, "after"))
 }

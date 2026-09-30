@@ -36,6 +36,7 @@ import (
 
 	pdb "github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
+	"github.com/cockroachdb/pebble/vfs"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
@@ -104,6 +105,7 @@ type Option func(*openConfig)
 type openConfig struct {
 	now    func() time.Time
 	logger pdb.Logger
+	fs     vfs.FS // nil: Pebble's default (the OS filesystem); tests only, see export_test.go's WithFS
 }
 
 // WithClock injects the clock used for timestamps and lease expiry.
@@ -196,6 +198,9 @@ func Open(ctx context.Context, cfg Config, opts ...Option) (*Store, error) {
 	if cfg.NoSync {
 		popts.WALBytesPerSync = walBytesPerSyncNoSync
 	}
+	if oc.fs != nil {
+		popts.FS = oc.fs
+	}
 
 	db, err := pdb.Open(cfg.Path, popts)
 	if err != nil {
@@ -239,12 +244,12 @@ func (s *Store) ensureSchema() error {
 }
 
 // Ping implements store.Store.
-func (s *Store) Ping(ctx context.Context) error {
+func (s *Store) Ping(ctx context.Context) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return errClosed
 	}
@@ -374,7 +379,8 @@ type guard struct {
 	released bool
 }
 
-// lock takes s.mu for one public method; the method must defer g.unlock().
+// lock takes s.mu for one public method; the method must defer g.unlock(&err)
+// with err its named error result.
 func (s *Store) lock() *guard {
 	s.mu.Lock()
 	return &guard{s: s}
@@ -386,16 +392,32 @@ func (s *Store) lock() *guard {
 // have observed another call's batch that is applied (Pebble makes a batch
 // visible as soon as it is in the memtable) but whose fsync is still in
 // flight; waiting here means nothing it returns is based on state that a
-// crash could still take back. The wait is ignored for errors: a failed sync
-// is reported to the call that wrote the batch.
-func (g *guard) unlock() {
+// crash could still take back. If that sync failed, unlock sets *errp (when
+// the method is not already failing) to store.ErrUnavailable wrapping the
+// sync error: the method may have read state that never became durable.
+// Pebble's WAL errors are sticky, so every later call reports it too (each
+// durableMark inherits its predecessor's error).
+func (g *guard) unlock(errp *error) {
 	if g.released {
-		return
+		return // commit already waited and reported
 	}
 	g.released = true
 	tail := g.s.tail
 	g.s.mu.Unlock()
 	<-tail.done
+	if tail.err != nil && *errp == nil {
+		*errp = syncFailed(tail.err)
+	}
+}
+
+// syncFailed wraps a WAL sync failure observed by a call: always
+// store.ErrUnavailable, even when err is one isTransient would not classify
+// (the call's outcome is unknown, never a logic error).
+func syncFailed(err error) error {
+	if errors.Is(err, store.ErrUnavailable) {
+		return err
+	}
+	return fmt.Errorf("%w: pebble: WAL sync failed: %w", store.ErrUnavailable, err)
 }
 
 // commit applies b and returns once it is durable, wrapping any error as
@@ -426,10 +448,13 @@ func (g *guard) commit(b *pdb.Batch) error {
 		g.released = true
 		s.mu.Unlock()
 		<-prev.done
-		if err == nil {
-			err = prev.err
+		if err != nil {
+			return wrapErr(err)
 		}
-		return wrapErr(err)
+		if prev.err != nil {
+			return syncFailed(prev.err)
+		}
+		return nil
 	}
 	if err := s.db.ApplyNoSyncWait(b, s.wo); err != nil {
 		_ = b.SyncWait() // required before b.Close; returns at once if b never queued a sync
@@ -446,7 +471,10 @@ func (g *guard) commit(b *pdb.Batch) error {
 	}
 	mine.err = err
 	close(mine.done)
-	return wrapErr(err)
+	if err != nil {
+		return syncFailed(err)
+	}
+	return nil
 }
 
 // iterate calls fn for every key in [lower, upper) in ascending order, until

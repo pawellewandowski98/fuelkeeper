@@ -41,8 +41,9 @@ const maxBatch = 1000
 // write in it) without limit.
 const maxGroup = 256
 
-// errClosed is returned by a write issued after Close.
-var errClosed = errors.New("sqlite: store is closed")
+// errClosed is returned by a write issued after Close (matching the other
+// backends' closed-store convention: store.ErrUnavailable).
+var errClosed = fmt.Errorf("%w: sqlite: store is closed", store.ErrUnavailable)
 
 // journalSizeLimit bounds how large the WAL file is allowed to grow before
 // SQLite truncates it back down after a checkpoint (PRAGMA
@@ -522,16 +523,37 @@ func (s *Store) commitGroup(group []*writeReq, errs []error) {
 // that applies to every member that did not fail on its own (the transaction
 // was rolled back, or the COMMIT itself failed). With savepoints false (a
 // single live member) fn's error simply rolls the whole transaction back.
-func (s *Store) runGroup(group []*writeReq, errs []error, savepoints bool) error {
+//
+// A panicking fn is recovered here, not allowed to unwind writeLoop (which
+// would take the process down) or to leave the writer connection inside an
+// open transaction: the transaction is rolled back, the panicking write gets
+// an error naming the panic, and every other write in the group gets
+// store.ErrUnavailable wrapping it (none of them was applied, so a retry is
+// safe); writeLoop then carries on with the next group.
+func (s *Store) runGroup(group []*writeReq, errs []error, savepoints bool) (gerr error) {
 	bg := context.Background()
 	tx, err := s.writer.BeginTx(bg, nil)
 	if err != nil {
 		return err
 	}
+	cur := -1
+	defer func() {
+		p := recover()
+		if p == nil {
+			return
+		}
+		_ = tx.Rollback()
+		perr := fmt.Errorf("sqlite: write panicked: %v", p)
+		if cur >= 0 {
+			errs[cur] = perr
+		}
+		gerr = fmt.Errorf("%w: sqlite: group transaction rolled back: %w", store.ErrUnavailable, perr)
+	}()
 	for i, r := range group {
 		if errs[i] != nil {
 			continue
 		}
+		cur = i
 		ctx := context.WithoutCancel(r.ctx)
 		if !savepoints {
 			if ferr := r.fn(ctx, tx); ferr != nil {

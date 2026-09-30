@@ -11,7 +11,7 @@ import (
 )
 
 // PutShard implements store.Store.
-func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Row) error {
+func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Row) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -19,7 +19,7 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 		return err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return errClosed
 	}
@@ -82,7 +82,7 @@ func (s *Store) PutShard(ctx context.Context, shard store.Shard, rows []store.Ro
 }
 
 // GetShard implements store.Store.
-func (s *Store) GetShard(ctx context.Context, pool string, txid chainhash.Hash) (*store.Shard, error) {
+func (s *Store) GetShard(ctx context.Context, pool string, txid chainhash.Hash) (_ *store.Shard, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -90,7 +90,7 @@ func (s *Store) GetShard(ctx context.Context, pool string, txid chainhash.Hash) 
 		return nil, err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -105,7 +105,7 @@ func (s *Store) GetShard(ctx context.Context, pool string, txid chainhash.Hash) 
 }
 
 // UpdateShard implements store.Store.
-func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Hash, status store.ShardStatus, beef []byte) error {
+func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Hash, status store.ShardStatus, beef []byte) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -116,7 +116,7 @@ func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Has
 		return err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return errClosed
 	}
@@ -152,7 +152,7 @@ func (s *Store) UpdateShard(ctx context.Context, pool string, txid chainhash.Has
 }
 
 // RetireShard implements store.Store.
-func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Hash) (int, error) {
+func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Hash) (_ int, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -160,7 +160,7 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 		return 0, err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return 0, errClosed
 	}
@@ -231,7 +231,7 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 }
 
 // AcquireShard implements store.Store.
-func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, until time.Time, statuses []store.ShardStatus, exclude []chainhash.Hash) (*store.Shard, error) {
+func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, until time.Time, statuses []store.ShardStatus, exclude []chainhash.Hash) (_ *store.Shard, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -255,7 +255,7 @@ func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, unti
 	}
 
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -304,7 +304,7 @@ func (s *Store) AcquireShard(ctx context.Context, pool, holder string, now, unti
 }
 
 // RenewShard implements store.Store.
-func (s *Store) RenewShard(ctx context.Context, pool string, txid chainhash.Hash, holder string, until time.Time) (store.ShardHead, error) {
+func (s *Store) RenewShard(ctx context.Context, pool string, txid chainhash.Hash, holder string, until time.Time) (_ store.ShardHead, err error) {
 	if err := ctx.Err(); err != nil {
 		return store.ShardHead{}, err
 	}
@@ -318,7 +318,7 @@ func (s *Store) RenewShard(ctx context.Context, pool string, txid chainhash.Hash
 		return store.ShardHead{}, err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return store.ShardHead{}, errClosed
 	}
@@ -341,7 +341,7 @@ func (s *Store) RenewShard(ctx context.Context, pool string, txid chainhash.Hash
 }
 
 // ReleaseShard implements store.Store.
-func (s *Store) ReleaseShard(ctx context.Context, pool string, txid chainhash.Hash, holder string) error {
+func (s *Store) ReleaseShard(ctx context.Context, pool string, txid chainhash.Hash, holder string) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -352,7 +352,7 @@ func (s *Store) ReleaseShard(ctx context.Context, pool string, txid chainhash.Ha
 		return err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return errClosed
 	}
@@ -373,7 +373,7 @@ func (s *Store) ReleaseShard(ctx context.Context, pool string, txid chainhash.Ha
 }
 
 // ListShards implements store.Store.
-func (s *Store) ListShards(ctx context.Context, pool string, f store.ShardFilter) ([]store.Shard, error) {
+func (s *Store) ListShards(ctx context.Context, pool string, f store.ShardFilter) (_ []store.Shard, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -384,7 +384,7 @@ func (s *Store) ListShards(ctx context.Context, pool string, f store.ShardFilter
 		return nil, err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -395,7 +395,7 @@ func (s *Store) ListShards(ctx context.Context, pool string, f store.ShardFilter
 	prefix := shardPrefix(pool)
 	upper := prefixEnd(prefix)
 	var out []store.Shard
-	err := s.iterate(prefix, upper, func(_, v []byte) (bool, error) {
+	err = s.iterate(prefix, upper, func(_, v []byte) (bool, error) {
 		sh, derr := decodeShard(v)
 		if derr != nil {
 			return false, derr

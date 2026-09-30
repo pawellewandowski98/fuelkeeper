@@ -24,7 +24,7 @@ func (s *Store) loadLease(name string) (*leaseDoc, error) {
 }
 
 // TryAcquireOrRenew implements store.Leaser.
-func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl time.Duration) (time.Time, error) {
+func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl time.Duration) (_ time.Time, err error) {
 	if err := ctx.Err(); err != nil {
 		return time.Time{}, err
 	}
@@ -32,7 +32,7 @@ func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl 
 		return time.Time{}, err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return time.Time{}, errClosed
 	}
@@ -58,7 +58,7 @@ func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl 
 }
 
 // ReleaseLease implements store.Leaser.
-func (s *Store) ReleaseLease(ctx context.Context, name, holder string) error {
+func (s *Store) ReleaseLease(ctx context.Context, name, holder string) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -69,7 +69,7 @@ func (s *Store) ReleaseLease(ctx context.Context, name, holder string) error {
 		return err
 	}
 	g := s.lock()
-	defer g.unlock()
+	defer g.unlock(&err)
 	if s.closed.Load() {
 		return errClosed
 	}
