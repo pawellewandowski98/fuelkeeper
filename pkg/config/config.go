@@ -70,9 +70,11 @@ type LogConfig struct {
 	Format string `yaml:"format"` // text | json
 }
 
-// Default returns a config with every default filled and no pools.
+// Default returns a config with every default filled and no pools. Oracle.Kind
+// is left empty: it depends on Treasury.Kind (see resolveOracleDefault),
+// which a caller may still change before Parse/Validate resolves it.
 func Default() *Config {
-	oracleCfg := ofactory.Config{Kind: ofactory.KindNone}
+	oracleCfg := ofactory.Config{}
 	oracleCfg.Mock.AssumeUnspent = true
 	return &Config{
 		Instance: pool.DefaultInstanceConfig(),
@@ -239,6 +241,10 @@ func Parse(data []byte) (*Config, error) {
 	for i, p := range raw.Pools {
 		c.Pools[i] = pool.Config(p)
 	}
+	// Resolve the oracle's own default before the pool loop below: each
+	// pool's SpendPolicy default (via ApplyPoolDefaults) depends on the
+	// oracle kind.
+	resolveOracleDefault(c)
 	for i := range c.Pools {
 		// Only resolve via oracle context when the operator left spend_policy
 		// unset; an explicit choice (verify or trust) is never overridden.
@@ -252,7 +258,31 @@ func Parse(data []byte) (*Config, error) {
 	return c, nil
 }
 
-// ApplyPoolDefaults resolves the two pool fields whose default cannot be a
+// resolveOracleDefault fills an empty Oracle.Kind. A direct teranode
+// connection is never assumed -- it is an opt-in accelerator (see
+// ofactory.Config.AnswersOutpoints) -- so the default is never teranode or
+// composite: it is arcade when a toolbox treasury is configured (which
+// always has an arcade endpoint the oracle can reuse; see Validate's
+// fallback that copies treasury.toolbox.arcade_url into oracle.arcade_url),
+// and none otherwise (a mock treasury, i.e. nullnet, has no chain to query).
+// Called from Parse before the ApplyPoolDefaults loop, since each pool's
+// SpendPolicy default depends on the resolved kind; also called,
+// idempotently, at the top of Validate, so a programmatic caller that builds
+// a *Config without going through Parse (e.g. config.Default() in tests)
+// still gets the kind resolved. A YAML or Go caller that sets oracle.kind
+// explicitly is never overridden.
+func resolveOracleDefault(c *Config) {
+	if c.Oracle.Kind != "" {
+		return
+	}
+	if c.Treasury.Kind == tfactory.KindToolbox {
+		c.Oracle.Kind = ofactory.KindArcade
+	} else {
+		c.Oracle.Kind = ofactory.KindNone
+	}
+}
+
+// ApplyPoolDefaults resolves the three pool fields whose default cannot be a
 // pure, context-free constant the way the rest of pool.DefaultPoolConfig's
 // fields are:
 //
@@ -265,10 +295,14 @@ func Parse(data []byte) (*Config, error) {
 //   - SpendPolicy is always resolved from the oracle: SpendVerify when it
 //     answers outpoint queries (ofactory.Config.AnswersOutpoints: mock,
 //     teranode, composite with teranode_url), SpendTrust otherwise (none,
-//     arcade, composite without teranode), since an unhinted spend could
-//     never be verified there. This overrides pool.DefaultPoolConfig's own
-//     SpendPolicy, which assumes such an oracle (see its doc comment),
-//     whenever that assumption does not hold.
+//     arcade, composite without teranode -- the expected arcade-only
+//     production shape), since an unhinted spend could never be verified
+//     there. This overrides pool.DefaultPoolConfig's own SpendPolicy, which
+//     assumes such an oracle (see its doc comment), whenever that
+//     assumption does not hold.
+//   - ExpiryPolicy is left alone once set; if still empty (again, typically
+//     a Go caller building a pool.Config{} from scratch) it is filled with
+//     pool.ExpiryRequeue, matching pool.DefaultPoolConfig.
 //
 // Go callers composing a pool.Config programmatically should call this after
 // pool.DefaultPoolConfig so they get the same resolution the YAML loader
@@ -285,10 +319,17 @@ func ApplyPoolDefaults(p *pool.Config, orc ofactory.Config) {
 	} else {
 		p.SpendPolicy = pool.SpendTrust
 	}
+	if p.ExpiryPolicy == "" {
+		p.ExpiryPolicy = pool.ExpiryRequeue
+	}
 }
 
 // Validate checks cross-field rules.
 func (c *Config) Validate() error {
+	// Idempotent: a no-op once Parse (or an earlier Validate call) has
+	// already resolved Oracle.Kind; needed here too for a programmatic
+	// caller that builds a *Config without going through Parse.
+	resolveOracleDefault(c)
 	if err := c.Instance.Validate(); err != nil {
 		return fmt.Errorf("config: instance: %w", err)
 	}
@@ -402,14 +443,6 @@ func (c *Config) Validate() error {
 		}
 		if p.ReleasePolicy == pool.ReleaseVerify && c.Oracle.Kind == "none" {
 			return fmt.Errorf("config: pool %s: release_policy=verify requires an oracle (oracle.kind is none)", p.Name)
-		}
-		if p.ReleasePolicy == pool.ReleaseVerify && !c.Oracle.AnswersOutpoints() {
-			// A verified release is requeued only on an Unspent outpoint
-			// verdict, which this oracle never gives: every released row
-			// would stay quarantined.
-			return fmt.Errorf("config: pool %s: release_policy=verify needs an oracle that answers outpoint queries, "+
-				"and oracle.kind %s does not; use kind: composite with oracle.teranode_url, or release_policy: trust",
-				p.Name, c.Oracle.Kind)
 		}
 	}
 	switch c.Log.Level {

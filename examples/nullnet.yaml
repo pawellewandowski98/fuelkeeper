@@ -14,6 +14,7 @@ pools:
     target_available: 1000
     low_water: 500
     spend_policy: trust
+    # expiry_policy is left to its default: requeue (an unhinted quarantined row returns to the pool after jobs.reaper.unknown_requeue_age)
 
 jobs:
   enabled: true

@@ -21,7 +21,6 @@ import (
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/client"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/config"
-	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
 )
@@ -507,27 +506,70 @@ func TestRunServeConfigListenFailsBeforeJobsStart(t *testing.T) {
 	assert.Zero(t, leases.Load(), "no job ran")
 }
 
-func TestWarnUnverifiableSpends(t *testing.T) {
-	var buf strings.Builder
-	log := slog.New(slog.NewTextHandler(&buf, nil))
+// capturingHandler is a minimal slog.Handler that records every emitted
+// slog.Record, so a test can assert on structured attributes (e.g.
+// answers_outpoints as a bool) instead of scraping formatted text.
+type capturingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r)
+	return nil
+}
+
+func (h *capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *capturingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *capturingHandler) last(t *testing.T) slog.Record {
+	t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	require.Len(t, h.records, 1)
+	return h.records[0]
+}
+
+func recordAttrs(r slog.Record) map[string]any {
+	m := make(map[string]any, r.NumAttrs())
+	r.Attrs(func(a slog.Attr) bool {
+		m[a.Key] = a.Value.Any()
+		return true
+	})
+	return m
+}
+
+// TestLogOracleMode covers both shapes logOracleMode reports: an oracle that
+// answers outpoint queries (mock, teranode, composite with teranode_url),
+// and the arcade-only shape that does not, whose message points at
+// jobs.reaper.unknown_requeue_age (or expiry_policy: hold) and
+// oracle.teranode_url as the optional accelerator.
+func TestLogOracleMode(t *testing.T) {
+	h := &capturingHandler{}
+	log := slog.New(h)
 	cfg := shutdownTestConfig(t)
+
 	cfg.Oracle.Kind = "arcade"
 	cfg.Oracle.ArcadeURL = "http://arcade"
-	cfg.Pools[0].SpendPolicy = pool.SpendVerify
-	warnUnverifiableSpends(log, cfg)
-	assert.Contains(t, buf.String(), "spend_policy: verify with an oracle that cannot answer outpoint queries")
-	assert.Contains(t, buf.String(), "pool=main")
+	logOracleMode(log, cfg)
+	rec := h.last(t)
+	attrs := recordAttrs(rec)
+	assert.Equal(t, "arcade", attrs["oracle"])
+	assert.Equal(t, false, attrs["answers_outpoints"])
+	assert.Contains(t, rec.Message, "unknown_requeue_age")
+	assert.Contains(t, rec.Message, "expiry_policy: hold")
+	assert.Contains(t, rec.Message, "oracle.teranode_url")
 
-	buf.Reset()
-	cfg.Oracle.TeranodeURL = "http://teranode"
-	cfg.Oracle.Kind = "composite"
-	warnUnverifiableSpends(log, cfg)
-	assert.Empty(t, buf.String(), "teranode answers outpoints")
-
-	buf.Reset()
-	cfg.Oracle = config.Default().Oracle
-	cfg.Oracle.Kind = "arcade"
-	cfg.Pools[0].SpendPolicy = pool.SpendTrust
-	warnUnverifiableSpends(log, cfg)
-	assert.Empty(t, buf.String(), "trust needs no outpoint verdict")
+	h.records = nil
+	cfg.Oracle.Kind = "mock"
+	logOracleMode(log, cfg)
+	rec = h.last(t)
+	attrs = recordAttrs(rec)
+	assert.Equal(t, "mock", attrs["oracle"])
+	assert.Equal(t, true, attrs["answers_outpoints"])
+	assert.NotContains(t, rec.Message, "unknown_requeue_age")
 }

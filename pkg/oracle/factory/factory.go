@@ -69,9 +69,17 @@ func (c Config) Validate() error {
 // AnswersOutpoints reports whether the configured oracle can give a verdict
 // on an outpoint (Oracle.Outpoints): mock, teranode, and composite with a
 // teranode_url. none, arcade, and composite without teranode answer every
-// outpoint Unknown, so rows that need an outpoint verdict (expired
-// reservations, releases under release_policy verify, unhinted spends under
-// spend_policy verify) stay quarantined until an operator requeues them.
+// outpoint Unknown -- false is the normal, expected shape in production
+// (arcade-only; a direct teranode connection is never assumed, only an
+// opt-in accelerator), not a deficiency to work around. With it false, a row
+// that needs an outpoint verdict (an expired reservation, a release under
+// release_policy: verify, an unhinted spend under spend_policy: verify) is
+// not stuck forever: the reaper requeues it once it has been quarantined for
+// jobs.reaper.unknown_requeue_age (or, for a pool configured with
+// expiry_policy: hold, holds it for an operator instead of requeuing it).
+// Configuring oracle.teranode_url (oracle.kind: composite) makes this true
+// and resolves such rows immediately from the UTXO set instead of waiting
+// out that requeue.
 func (c Config) AnswersOutpoints() bool {
 	switch c.Kind {
 	case KindMock, KindTeranode:

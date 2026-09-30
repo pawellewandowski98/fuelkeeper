@@ -221,7 +221,7 @@ on teratestnet, reconciles, runs one keeper round, builds and sends one
 export FK_TTN_ROOT_KEY=<64 hex chars; a dedicated test key>
 export FK_TTN_ARCADE_URL=https://arcade-v2-ttn-us-1.bsvblockchain.tech
 export FK_TTN_CHAINTRACKS_URL=https://arcade-v2-ttn-us-1.bsvblockchain.tech/chaintracks
-export FK_TTN_TERANODE_URL=<teranode asset API base, e.g. http://host:8090/api/v1>
+export FK_TTN_TERANODE_URL=<teranode asset API base, e.g. http://host:8090/api/v1>   # optional
 export FK_TTN_STORAGE=$HOME/fk-ttn-treasury.sqlite   # persistent: funding lands here
 go test -tags ttn -run TestTeratestnetSmoke -v -timeout 15m ./pkg/treasury/toolbox/
 ```
@@ -229,8 +229,12 @@ go test -tags ttn -run TestTeratestnetSmoke -v -timeout 15m ./pkg/treasury/toolb
 `FK_TTN_STORAGE` is optional: without it the test uses a fresh sqlite file
 in a temporary directory that is deleted when the test ends, so any funding
 sent to that wallet is stranded (the derivation data is gone with the
-file). Set it to a persistent path before funding. The test skips when a
-required variable is unset. The first run on a new storage
+file). Set it to a persistent path before funding. `FK_TTN_TERANODE_URL` is
+optional too: a direct teranode connection is never assumed, only an
+opt-in accelerator, so without it the smoke runs the arcade-only oracle --
+the expected production shape -- and does not assert on the split
+transaction's inputs (arcade alone answers no outpoint queries). The test
+skips when a required variable is unset. The first run on a new storage
 prints the treasury identity key and skips with "has no funds". To fund it,
 run FuelKeeper with the same key and treasury storage
 (`examples/teratestnet.yaml` with `FUELKEEPER_TREASURY_KEY=$FK_TTN_ROOT_KEY`

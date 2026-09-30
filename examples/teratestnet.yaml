@@ -1,6 +1,8 @@
 # Teratestnet (ttn) configuration: a real go-wallet-toolbox treasury on the
-# public Teranode test network, arcade + teranode as the chain oracle, sqlite
-# storage for both FuelKeeper and the treasury wallet.
+# public Teranode test network, arcade-only as the chain oracle (the
+# expected production shape: a direct teranode connection is never assumed,
+# only an opt-in accelerator -- see the oracle: block below), sqlite storage
+# for both FuelKeeper and the treasury wallet.
 #
 # Environment (see docs/TREASURY.md and docs/OPERATIONS.md):
 #   FUELKEEPER_TREASURY_KEY   required: the treasury wallet root key, 64 hex chars.
@@ -8,9 +10,6 @@
 #                             fuel keys) comes from it: back it up, never commit it.
 #   FUELKEEPER_API_KEY        required: the /v1 API key.
 #   FUELKEEPER_ADMIN_KEY      required: the admin key (funding, quarantine).
-#   FUELKEEPER_TERANODE_URL   optional: a teranode asset API base
-#                             (e.g. http://teranode:8090/api/v1); without it the
-#                             oracle is arcade-only and outpoint checks stay Unknown.
 #
 # References below use the brace form: a dollar sign and a braced NAME is the
 # environment variable NAME and must be set; ":-default" inside the braces
@@ -40,10 +39,16 @@ pools:
     target_available: 500
     low_water: 250
     lock_mode: puzzle
-    # spend_policy is left to its default: verify when FUELKEEPER_TERANODE_URL
-    # is set (teranode answers outpoint queries), trust when it is not (an
-    # arcade-only oracle cannot verify an unhinted spend). Keep
-    # release_policy: trust unless teranode is configured.
+    # spend_policy is left to its default: trust, since the arcade-only
+    # oracle below cannot verify an unhinted spend on its own; verify is now
+    # an allowed opt-in too (the reaper handles hinted rows with arcade).
+    # release_policy: trust is the default here as well; release_policy:
+    # verify is allowed with this arcade-only oracle, but is a delayed
+    # release -- requeued only after jobs.reaper.unknown_requeue_age.
+    # expiry_policy is left to its default: requeue, which returns an
+    # unhinted quarantined row to the pool after
+    # jobs.reaper.unknown_requeue_age; expiry_policy: hold keeps such a row
+    # quarantined for an operator instead.
 
 jobs:
   enabled: true
@@ -55,8 +60,18 @@ jobs:
     build_timeout: 60s
 
 oracle:
-  kind: composite
-  teranode_url: ${FUELKEEPER_TERANODE_URL:-}
+  # arcade_url is left out: the oracle falls back to the treasury's own
+  # arcade (see the note above). Arcade-only is the expected production
+  # shape; jobs.reaper requeues what it cannot verify (unknown_requeue_age
+  # defaults to 10m; see the pools comment above and docs/OPERATIONS.md).
+  kind: arcade
+  #
+  # Optional accelerator: UTXO-set verdicts and input verification; not
+  # required. A direct teranode connection resolves quarantined rows
+  # immediately instead of waiting out jobs.reaper.unknown_requeue_age. To
+  # opt in, replace "kind: arcade" above with:
+  # kind: composite
+  # teranode_url: http://teranode:8090/api/v1
 
 treasury:
   kind: toolbox

@@ -42,7 +42,12 @@ func TestTeratestnetSmoke(t *testing.T) {
 	cfg.RootKeyHex = ttnEnv(t, "FK_TTN_ROOT_KEY")
 	cfg.ArcadeURL = ttnEnv(t, "FK_TTN_ARCADE_URL")
 	cfg.ChaintracksURL = ttnEnv(t, "FK_TTN_CHAINTRACKS_URL")
-	teranodeURL := ttnEnv(t, "FK_TTN_TERANODE_URL")
+	// FK_TTN_TERANODE_URL is optional: a direct teranode connection is never
+	// assumed, only an opt-in accelerator (see ofactory.Config.AnswersOutpoints).
+	// Without it the oracle below is arcade-only, the expected production
+	// shape, and this test does not assert on Inputs (arcade alone answers
+	// no outpoint queries, so composite.New's outpoints backend is nil).
+	teranodeURL := os.Getenv("FK_TTN_TERANODE_URL")
 	// The wallet storage must persist across runs: it is where funding lands.
 	cfg.Storage.SQLite = os.Getenv("FK_TTN_STORAGE")
 	if cfg.Storage.SQLite == "" {
@@ -87,14 +92,25 @@ func TestTeratestnetSmoke(t *testing.T) {
 
 	ac, err := arcadeclient.New(cfg.ArcadeURL)
 	require.NoError(t, err)
-	tn, err := teranode.NewURL(teranodeURL)
-	require.NoError(t, err)
+	// tn stays nil (arcade-only) when FK_TTN_TERANODE_URL is unset;
+	// composite.New accepts a nil outpoints backend, same as
+	// ofactory.New does for oracle.kind: composite with no teranode_url.
+	var tn oracle.Oracle
+	if teranodeURL == "" {
+		t.Log("FK_TTN_TERANODE_URL not set: arcade-only oracle")
+	} else {
+		tn, err = teranode.NewURL(teranodeURL)
+		require.NoError(t, err)
+	}
 	orc := composite.New(arcade.New(ac), tn)
 	var st oracle.TxStatus
 	require.Eventually(t, func() bool {
 		st, err = orc.Tx(ctx, txid)
 		return err == nil && st.Known
 	}, 2*time.Minute, 2*time.Second, "arcade never reported the split")
-	t.Logf("split %s: status %s mined %v inputs %v", txid, st.Status, st.Mined, st.Inputs)
+	t.Logf("split %s: status %s mined %v", txid, st.Status, st.Mined)
+	if teranodeURL != "" {
+		t.Logf("inputs %v", st.Inputs)
+	}
 	require.False(t, st.Rejected, "split rejected: %s", st.Status)
 }

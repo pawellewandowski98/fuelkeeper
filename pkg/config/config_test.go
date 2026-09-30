@@ -363,7 +363,7 @@ func TestApplyPoolDefaultsForProgrammaticConfig(t *testing.T) {
 	c := config.Default()
 	p := pool.DefaultPoolConfig("main", 50)
 	require.Equal(t, pool.SpendVerify, p.SpendPolicy, "DefaultPoolConfig assumes an oracle")
-	config.ApplyPoolDefaults(&p, c.Oracle) // c.Oracle.Kind == "none"
+	config.ApplyPoolDefaults(&p, c.Oracle) // c.Oracle.Kind == "" (resolves like none: mock treasury, no oracle)
 	c.Pools = []pool.Config{p}
 	// Default().API.Listen (":8080") is not loopback-only and carries no
 	// api_keys; opt into the insecure guard here since this test is about
@@ -394,7 +394,7 @@ func TestLoadExampleTeratestnet(t *testing.T) {
 	setTeratestnetEnv(t)
 	c, err := config.Load("../../examples/teratestnet.yaml")
 	require.NoError(t, err)
-	assert.Equal(t, "composite", c.Oracle.Kind)
+	assert.Equal(t, "arcade", c.Oracle.Kind)
 	assert.Equal(t, "https://arcade-v2-ttn-us-1.bsvblockchain.tech", c.Oracle.ArcadeURL, "toolbox ttn default")
 	assert.Empty(t, c.Oracle.TeranodeURL)
 	tb := c.Treasury.Toolbox
@@ -409,12 +409,32 @@ func TestLoadExampleTeratestnet(t *testing.T) {
 	assert.Equal(t, int64(500), c.Pools[0].TargetAvailable)
 	assert.Equal(t, pool.SpendTrust, c.Pools[0].SpendPolicy, "arcade-only oracle: spends are trusted")
 	assert.Equal(t, pool.ReleaseTrust, c.Pools[0].ReleasePolicy)
+}
 
-	t.Setenv("FUELKEEPER_TERANODE_URL", "http://teranode:8090/api/v1")
-	c, err = config.Load("../../examples/teratestnet.yaml")
+// TestTeratestnetTeranodeOptIn is the YAML-literal form of uncommenting the
+// composite/teranode_url opt-in block in examples/teratestnet.yaml (the
+// file itself no longer wires teranode_url through an environment
+// variable): configuring it makes the oracle answer outpoint queries, so
+// spend_policy defaults to verify instead of trust.
+func TestTeratestnetTeranodeOptIn(t *testing.T) {
+	c, err := config.Parse([]byte(`
+store: {backend: memory}
+pools:
+  - {name: main, denomination: 50, split_size: 50}
+oracle:
+  kind: composite
+  teranode_url: http://teranode:8090/api/v1
+treasury:
+  kind: toolbox
+  toolbox:
+    root_key_hex: "0000000000000000000000000000000000000000000000000000000000000001"
+api: {listen: "127.0.0.1:0"}
+`))
 	require.NoError(t, err)
+	assert.Equal(t, "composite", c.Oracle.Kind)
 	assert.Equal(t, "http://teranode:8090/api/v1", c.Oracle.TeranodeURL)
-	assert.Equal(t, pool.SpendVerify, c.Pools[0].SpendPolicy, "with teranode, spends are verified")
+	assert.NotEmpty(t, c.Oracle.ArcadeURL, "composite falls back to the toolbox treasury's arcade too")
+	assert.Equal(t, pool.SpendVerify, c.Pools[0].SpendPolicy, "with teranode, spends default to verify")
 }
 
 func TestLoadExampleTeratestnetNeedsTreasuryKey(t *testing.T) {
@@ -505,6 +525,119 @@ func TestDefaultTreasuryToolboxIsTTN(t *testing.T) {
 	assert.Equal(t, time.Minute, c.Jobs.Minter.BuildTimeout)
 }
 
+// TestOracleKindDefaultsToArcadeWithToolboxTreasury covers
+// resolveOracleDefault's toolbox branch: an omitted oracle.kind resolves to
+// arcade (never teranode or composite -- a direct teranode connection is
+// never assumed) when a toolbox treasury is configured, and the oracle
+// falls back to that treasury's own arcade endpoint. An arcade-only oracle
+// answers no outpoint queries, so spend_policy still defaults to trust.
+func TestOracleKindDefaultsToArcadeWithToolboxTreasury(t *testing.T) {
+	c, err := config.Parse([]byte(`
+store: {backend: memory}
+pools:
+  - {name: main, denomination: 50}
+treasury:
+  kind: toolbox
+  toolbox:
+    root_key_hex: "0000000000000000000000000000000000000000000000000000000000000001"
+api: {listen: "127.0.0.1:0"}
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "arcade", c.Oracle.Kind)
+	assert.NotEmpty(t, c.Oracle.ArcadeURL, "falls back to the toolbox treasury's arcade")
+	assert.Equal(t, pool.SpendTrust, c.Pools[0].SpendPolicy, "arcade-only oracle: spends default to trust")
+}
+
+// TestOracleKindDefaultsToNoneWithMockTreasury covers resolveOracleDefault's
+// other branch (mock treasury, i.e. nullnet: no chain to query) via both
+// entry points -- Parse, and Validate alone for a programmatic caller that
+// never calls Parse (config.Default() leaves Oracle.Kind empty).
+func TestOracleKindDefaultsToNoneWithMockTreasury(t *testing.T) {
+	c, err := config.Parse([]byte(`
+store: {backend: memory}
+pools:
+  - {name: main, denomination: 50}
+api: {listen: "127.0.0.1:0"}
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "none", c.Oracle.Kind)
+
+	dc := config.Default()
+	assert.Empty(t, dc.Oracle.Kind, "Default leaves the oracle kind unresolved")
+	p := pool.DefaultPoolConfig("main", 50)
+	config.ApplyPoolDefaults(&p, dc.Oracle)
+	dc.Pools = []pool.Config{p}
+	dc.API.Insecure = true
+	require.NoError(t, dc.Validate())
+	assert.Equal(t, "none", dc.Oracle.Kind, "Validate resolves it for a programmatic caller")
+}
+
+// TestExpiryPolicyParsesAndDefaults covers pool.Config.ExpiryPolicy end to
+// end through YAML: an explicit value parses, an omitted one defaults to
+// requeue (via ApplyPoolDefaults/rawPool), and an invalid one is rejected
+// naming the pool.
+func TestExpiryPolicyParsesAndDefaults(t *testing.T) {
+	c, err := config.Parse(oracleYAML("  kind: none", "    expiry_policy: hold"))
+	require.NoError(t, err)
+	assert.Equal(t, pool.ExpiryHold, c.Pools[0].ExpiryPolicy)
+
+	c, err = config.Parse(oracleYAML("  kind: none", ""))
+	require.NoError(t, err)
+	assert.Equal(t, pool.ExpiryRequeue, c.Pools[0].ExpiryPolicy, "omitted expiry_policy defaults to requeue")
+
+	_, err = config.Parse(oracleYAML("  kind: none", "    expiry_policy: sometimes"))
+	require.ErrorContains(t, err, "pool main")
+	require.ErrorContains(t, err, "expiry_policy")
+}
+
+// TestReaperConfigKeysParse covers jobs.reaper's expiry-related keys
+// (unknown_requeue_age, hint_max_wait, tx_recheck_interval) through YAML,
+// and that jobs.reaper.Validate's bounds on them surface as config errors.
+func TestReaperConfigKeysParse(t *testing.T) {
+	c, err := config.Parse([]byte(`
+store: {backend: memory}
+pools:
+  - {name: main, denomination: 50}
+jobs:
+  reaper:
+    unknown_requeue_age: 5m
+    hint_max_wait: 2h
+    tx_recheck_interval: 15s
+api: {listen: "127.0.0.1:0"}
+`))
+	require.NoError(t, err)
+	assert.Equal(t, 5*time.Minute, c.Jobs.Reaper.UnknownRequeueAge)
+	assert.Equal(t, 2*time.Hour, c.Jobs.Reaper.HintMaxWait)
+	assert.Equal(t, 15*time.Second, c.Jobs.Reaper.TxRecheckInterval)
+
+	// unknown_requeue_age must be 0 or >= min_unspent_age.
+	_, err = config.Parse([]byte(`
+store: {backend: memory}
+pools:
+  - {name: main, denomination: 50}
+jobs:
+  reaper:
+    unknown_requeue_age: 1s
+    min_unspent_age: 30s
+api: {listen: "127.0.0.1:0"}
+`))
+	require.ErrorContains(t, err, "jobs.reaper")
+	require.ErrorContains(t, err, "unknown_requeue_age")
+
+	// tx_recheck_interval must be > 0.
+	_, err = config.Parse([]byte(`
+store: {backend: memory}
+pools:
+  - {name: main, denomination: 50}
+jobs:
+  reaper:
+    tx_recheck_interval: 0s
+api: {listen: "127.0.0.1:0"}
+`))
+	require.ErrorContains(t, err, "jobs.reaper")
+	require.ErrorContains(t, err, "tx_recheck_interval")
+}
+
 // TestOperationsDocConfigBlocksLoad parses every fenced yaml block of
 // docs/OPERATIONS.md with the strict loader, so the documented templates
 // cannot drift from what FuelKeeper accepts.
@@ -557,16 +690,16 @@ func TestSpendPolicyDefaultFollowsOutpointOracle(t *testing.T) {
 	assert.False(t, c.Oracle.AnswersOutpoints())
 }
 
-func TestReleaseVerifyNeedsOutpointOracle(t *testing.T) {
+// TestReleaseVerifyAllowsArcadeOnlyOracle covers the relaxed rule: a
+// release_policy: verify pool now loads with an arcade-only oracle (arcade,
+// or composite without teranode_url) -- it is a delayed release, requeued
+// after jobs.reaper.unknown_requeue_age, not an error -- exactly as it does
+// with an oracle that answers outpoint queries directly. Only oracle.kind:
+// none (no chain source at all) is still rejected.
+func TestReleaseVerifyAllowsArcadeOnlyOracle(t *testing.T) {
 	for _, o := range []string{
 		"  kind: arcade\n  arcade_url: http://arcade",
 		"  kind: composite\n  arcade_url: http://arcade",
-	} {
-		_, err := config.Parse(oracleYAML(o, "    release_policy: verify"))
-		require.ErrorContains(t, err, "release_policy=verify needs an oracle that answers outpoint queries", o)
-		require.ErrorContains(t, err, "teranode_url", "the message names the fix")
-	}
-	for _, o := range []string{
 		"  kind: composite\n  arcade_url: http://arcade\n  teranode_url: http://teranode",
 		"  kind: mock",
 	} {

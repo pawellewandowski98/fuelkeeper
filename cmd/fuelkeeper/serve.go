@@ -194,21 +194,24 @@ func warnInsecureListener(log *slog.Logger, cfg *config.Config) {
 		"make sure that is intentional", "listen", cfg.API.Listen)
 }
 
-// warnUnverifiableSpends logs a Warn for each pool with spend_policy: verify
-// whose oracle cannot answer outpoint queries (none is rejected by config;
-// arcade, or composite without teranode_url, answers every outpoint
-// Unknown): its unhinted spent rows stay quarantined until an operator
-// requeues them. See docs/OPERATIONS.md "Oracle kinds and policies".
-func warnUnverifiableSpends(log *slog.Logger, cfg *config.Config) {
-	if cfg.Oracle.AnswersOutpoints() {
-		return
+// logOracleMode logs one Info line describing the configured oracle's shape
+// at start-up: its kind and whether it answers outpoint queries
+// (ofactory.Config.AnswersOutpoints). Answering false is the normal,
+// expected arcade-only production shape, not a deficiency; the message then
+// also explains that a row needing an outpoint verdict is still resolved --
+// requeued once quarantined for jobs.reaper.unknown_requeue_age, or held
+// for an operator on a pool configured with expiry_policy: hold -- and that
+// oracle.teranode_url (oracle.kind: composite) is an optional accelerator
+// that resolves such rows immediately from the UTXO set instead. See
+// ofactory.Config.AnswersOutpoints and docs/OPERATIONS.md "Oracle kinds and
+// policies".
+func logOracleMode(log *slog.Logger, cfg *config.Config) {
+	answers := cfg.Oracle.AnswersOutpoints()
+	msg := "oracle: answers outpoint queries directly"
+	if !answers {
+		msg = "oracle: arcade-only (does not answer outpoint queries); expired reservations and unhinted spends are requeued after jobs.reaper.unknown_requeue_age (or held, for a pool with expiry_policy: hold); oracle.teranode_url (oracle.kind: composite) is an optional accelerator that resolves such rows from the UTXO set instead"
 	}
-	for _, p := range cfg.Pools {
-		if p.SpendPolicy == pool.SpendVerify {
-			log.Warn("spend_policy: verify with an oracle that cannot answer outpoint queries: unhinted spent rows stay quarantined until requeued by hand; set oracle.teranode_url or use spend_policy: trust",
-				"pool", p.Name, "oracle", cfg.Oracle.Kind)
-		}
-	}
+	log.Info(msg, "oracle", cfg.Oracle.Kind, "answers_outpoints", answers)
 }
 
 // serveHooks lets tests observe or intercept points runServeConfig would
@@ -274,7 +277,7 @@ func runServeConfig(ctx context.Context, cfg *config.Config, hooks serveHooks) e
 	log := newLogger(cfg.Log)
 	logNullnetHint(log, cfg)
 	warnInsecureListener(log, cfg)
-	warnUnverifiableSpends(log, cfg)
+	logOracleMode(log, cfg)
 
 	// Build the oracle and open the treasury before the store is ever opened.
 	orc, mockOrc, err := buildOracle(cfg.Oracle)
