@@ -240,3 +240,17 @@ not per row; `rows/s` already divides by batch size). `Quarantine/1000` moves
   calls into fewer, larger store batches trades a little added latency per
   caller for much higher aggregate throughput, most valuably on the
   durable, multi-process backends.
+
+- **sqlite/pebble numbers above are on tmpfs, not the SSD named in
+  "Machine".** `go test`'s default temp directory (`os.TempDir()`, `/tmp`
+  unless `TMPDIR` is set) is a `tmpfs` (RAM-backed) mount on this host, and
+  neither benchmark overrides it, so every `fsync`/write-batch-sync these
+  two backends' benchmarks measure was against RAM, not disk -- `fsync` on
+  tmpfs is already close to free. Commit `fd4dc56`/`91e1331` (after this
+  page, 2026-09-30) changed sqlite/pebble to group-commit concurrent
+  writers into one `fsync` per flush instead of one per writer; that fix
+  does **not** change the numbers on this page (there was barely any real
+  fsync cost here to amortize) -- its effect shows up instead in
+  [`20260930-api-single.md`](20260930-api-single.md), whose sqlite/pebble
+  data directories are on this host's real SSD (see that page's own
+  numbers, re-run after the fix).

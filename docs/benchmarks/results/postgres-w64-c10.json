@@ -5,15 +5,19 @@
   "workers": 64,
   "count": 10,
   "mode": "spend",
-  "seconds": 60.00082706,
-  "reserves": 16497,
-  "outputs": 164970,
-  "reserves_per_sec": 274.94621004979194,
-  "outputs_per_sec": 2749.4621004979194,
-  "p50_us": 27599,
-  "p95_us": 134271,
-  "p99_us": 596991,
-  "max_us": 836095,
+  "seconds": 60.001279066,
+  "reserves": 33030,
+  "outputs": 330300,
+  "reserves_per_sec": 550.4882648196178,
+  "outputs_per_sec": 5504.882648196178,
+  "p50_us": 61567,
+  "p95_us": 116095,
+  "p99_us": 310783,
+  "max_us": 1386495,
+  "errors": {
+    "exhausted": 581,
+    "insufficient": 11
+  },
   "go_version": "go1.26.3",
-  "timestamp": "2026-09-30T18:38:41.702337231Z"
+  "timestamp": "2026-09-30T21:15:48.016419116Z"
 }

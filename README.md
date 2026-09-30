@@ -133,12 +133,14 @@ results (`fuelbench`), and the end-to-end demo methodology and status
 (`fueldemo`, `cmd/fueldemo`) are published under `docs/benchmarks/`; see
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the method, full summary
 table, capacity guidance and caveats. Headline numbers (single FuelKeeper
-instance, mock oracle/treasury, nullnet-style config, `-workers 64 -count 1`;
-see `docs/PERFORMANCE.md` for why these are an upper bound, not a production
-forecast): memory ~2900 reserves/s, aerospike ~3000 reserves/s (rate-capped),
-mongodb ~975 reserves/s, postgres ~790 reserves/s (~950 reserves/s across a
-three-instance Postgres-backed cluster), sqlite/pebble ~60 reserves/s
-(single-writer-lock bound under concurrency).
+instance, mock oracle/treasury, nullnet-style config, `-workers 64 -count 1`,
+commit `91e1331`; see `docs/PERFORMANCE.md` for why these are an upper
+bound, not a production forecast): memory ~24,400 reserves/s, aerospike
+~24,700 reserves/s, mongodb ~970 reserves/s, postgres ~880 reserves/s
+(~1010 reserves/s across a three-instance Postgres-backed cluster),
+sqlite/pebble ~700-720 reserves/s (single-writer-lock bound under
+concurrency, an order of magnitude faster than before the group-commit fix
+in `pkg/store/sqlite`/`pkg/store/pebble`).
 
 ## Store Backends
 
