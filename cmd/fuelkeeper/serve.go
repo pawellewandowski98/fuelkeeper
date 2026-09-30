@@ -434,7 +434,7 @@ func startJobs(
 	clock pool.Clock,
 	log *slog.Logger,
 ) error {
-	reaper, err := jobs.NewReaper(st, orc, names, cfg.Jobs.Reaper, clock, log)
+	reaper, err := jobs.NewReaper(st, orc, cfg.Pools, cfg.Jobs.Reaper, clock, log)
 	if err != nil {
 		return fmt.Errorf("reaper: %w", err)
 	}

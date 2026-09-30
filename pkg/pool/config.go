@@ -52,6 +52,19 @@ const (
 	SpendTrust SpendPolicy = "trust" // reserved → spent
 )
 
+// ExpiryPolicy says what the reaper does with a quarantined row that has no
+// spend hint and no oracle verdict.
+type ExpiryPolicy string
+
+// Expiry policies.
+const (
+	// ExpiryRequeue returns such a row to the pool once it has been
+	// quarantined for the reaper's unknown_requeue_age.
+	ExpiryRequeue ExpiryPolicy = "requeue"
+	// ExpiryHold keeps such a row quarantined for an operator.
+	ExpiryHold ExpiryPolicy = "hold"
+)
+
 // Config describes one pool (one denomination).
 type Config struct {
 	// Name is the pool name (see store.ValidatePool).
@@ -90,6 +103,11 @@ type Config struct {
 	ReleasePolicy ReleasePolicy `yaml:"release_policy"`
 	// SpendPolicy says whether a client Spend is a hint or a fact.
 	SpendPolicy SpendPolicy `yaml:"spend_policy"`
+	// ExpiryPolicy is what the reaper does with a quarantined row that has no
+	// spend hint and no oracle verdict: `requeue` returns it to the pool
+	// after the reaper's `unknown_requeue_age`; `hold` keeps it quarantined
+	// for an operator.
+	ExpiryPolicy ExpiryPolicy `yaml:"expiry_policy"`
 	// ExpectedTPS is the pool's expected spend rate; optional (0 disables the
 	// check) and, when set, enables the mint-capacity check in pkg/config.
 	ExpectedTPS float64 `yaml:"expected_tps"`
@@ -115,6 +133,7 @@ func DefaultPoolConfig(name string, denomination uint64) Config {
 		MaxCount:        100,
 		ReleasePolicy:   ReleaseTrust,
 		SpendPolicy:     SpendVerify,
+		ExpiryPolicy:    ExpiryRequeue,
 	}
 }
 
@@ -165,6 +184,11 @@ func (c *Config) Validate() error {
 	case SpendVerify, SpendTrust:
 	default:
 		return fmt.Errorf("pool %s: spend_policy must be verify or trust", c.Name)
+	}
+	switch c.ExpiryPolicy {
+	case ExpiryRequeue, ExpiryHold:
+	default:
+		return fmt.Errorf("pool %s: expiry_policy must be requeue or hold, got %q", c.Name, c.ExpiryPolicy)
 	}
 	if c.ExpectedTPS < 0 {
 		return fmt.Errorf("pool %s: expected_tps must be >= 0", c.Name)

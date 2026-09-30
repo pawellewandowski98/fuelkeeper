@@ -225,7 +225,7 @@ func TestInvariantsMultiInstance(t *testing.T) {
 	rcfg.QuarantineMinAge = 2 * time.Second
 	rcfg.MinUnspentAge = 2 * time.Second
 	rcfg.HintPatience = 10 * time.Second
-	reaper, err := jobs.NewReaper(st, orc, []string{"main"}, rcfg, pool.ClockFunc(clk.Now), slog.New(slog.DiscardHandler))
+	reaper, err := jobs.NewReaper(st, orc, []pool.Config{pc}, rcfg, pool.ClockFunc(clk.Now), slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
 	instances := []*instance{startInstance(t, st, pc, clk, "i0"), startInstance(t, st, pc, clk, "i1"), startInstance(t, st, pc, clk, "i2")}
@@ -366,7 +366,7 @@ func TestInvariantsConcurrentClients(t *testing.T) {
 	rcfg.QuarantineMinAge = 2 * time.Second
 	rcfg.MinUnspentAge = 2 * time.Second
 	rcfg.HintPatience = 10 * time.Second
-	reaper, err := jobs.NewReaper(st, orc, []string{"main"}, rcfg, pool.ClockFunc(clk.Now), slog.New(slog.DiscardHandler))
+	reaper, err := jobs.NewReaper(st, orc, []pool.Config{pc}, rcfg, pool.ClockFunc(clk.Now), slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
 	instances := []*instance{startInstance(t, st, pc, clk, "c0"), startInstance(t, st, pc, clk, "c1"), startInstance(t, st, pc, clk, "c2")}

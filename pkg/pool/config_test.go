@@ -67,6 +67,18 @@ func TestPoolConfigDefaultsAndValidate(t *testing.T) {
 	bad = c
 	bad.ExpectedTPS = -1
 	require.Error(t, bad.Validate())
+	assert.Equal(t, pool.ExpiryRequeue, c.ExpiryPolicy, "unhinted quarantined rows are requeued by default")
+	bad = c
+	bad.ExpiryPolicy = pool.ExpiryHold
+	require.NoError(t, bad.Validate())
+	for _, ep := range []pool.ExpiryPolicy{"", "never"} {
+		bad = c
+		bad.ExpiryPolicy = ep
+		err := bad.Validate()
+		require.Error(t, err, "expiry_policy %q", ep)
+		require.ErrorContains(t, err, "pool main")
+		require.ErrorContains(t, err, "requeue or hold")
+	}
 
 	ic := pool.DefaultInstanceConfig()
 	require.NoError(t, ic.Validate())

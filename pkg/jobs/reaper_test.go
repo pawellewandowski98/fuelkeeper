@@ -27,9 +27,18 @@ func reaperFixture(t *testing.T) (*storetest.Clock, *memory.Store, *oracle.Mock,
 	st := memory.New(memory.WithClock(clk.Now))
 	orc := oracle.NewMock()
 	cfg := jobs.DefaultReaperConfig()
-	r, err := jobs.NewReaper(st, orc, []string{"main"}, cfg, pool.ClockFunc(clk.Now), slog.Default())
+	r, err := jobs.NewReaper(st, orc, testPools("main"), cfg, pool.ClockFunc(clk.Now), slog.Default())
 	require.NoError(t, err)
 	return clk, st, orc, r, cfg
+}
+
+// testPools returns a default pool.Config (ExpiryPolicy requeue) for each name.
+func testPools(names ...string) []pool.Config {
+	out := make([]pool.Config, len(names))
+	for i, n := range names {
+		out[i] = pool.DefaultPoolConfig(n, 50)
+	}
+	return out
 }
 
 func states(t *testing.T, st store.Store, rows []store.Row) []store.State {
@@ -128,9 +137,15 @@ func TestReaperHintedUnspentWaitsForPatience(t *testing.T) {
 // the quarantining tick: a row's quarantined_at is stamped from the same
 // clock as the QuarantineMinAge gate, so without letting time pass first the
 // gate never opens and the last tick could not resolve row 2.
+//
+// The pool's expiry_policy is hold, so row 0 (Unknown, no hint) is never
+// requeued by unknown_requeue_age however long it waits.
 func TestReaperLeavesRowsOnUnknownConflictOrOracleDown(t *testing.T) {
 	ctx := context.Background()
-	clk, st, orc, r, cfg := reaperFixture(t)
+	cfg := jobs.DefaultReaperConfig()
+	pools := testPools("main")
+	pools[0].ExpiryPolicy = pool.ExpiryHold
+	clk, st, orc, r := unhintedFixture(t, cfg, pools)
 	_, rows := storetest.MintShard(t, st, "main", 3, store.ShardMined)
 	tok := store.NewToken()
 	storetest.MustReserve(t, st, "main", rows, tok, clk.Now().Add(time.Second))
@@ -176,7 +191,7 @@ func TestReaperPagesAndChunksLargeQuarantine(t *testing.T) {
 	cfg.Batch = 50
 	cfg.MaxPages = 10
 	cfg.OracleBatch = 30
-	r, err := jobs.NewReaper(st, orc, []string{"main"}, cfg, pool.ClockFunc(clk.Now), slog.Default())
+	r, err := jobs.NewReaper(st, orc, testPools("main"), cfg, pool.ClockFunc(clk.Now), slog.Default())
 	require.NoError(t, err)
 	_, rows := storetest.MintShard(t, st, "main", 1000, store.ShardMined)
 	storetest.MustReserve(t, st, "main", rows, store.NewToken(), clk.Now().Add(time.Second))
@@ -216,7 +231,8 @@ func TestReaperCursorAdvancesPastStuckRows(t *testing.T) {
 	clk, st, orc, _, cfg := reaperFixture(t)
 	cfg.Batch = 10
 	cfg.MaxPages = 2
-	r, err := jobs.NewReaper(st, orc, []string{"main"}, cfg, pool.ClockFunc(clk.Now), slog.Default())
+	cfg.UnknownRequeueAge = 0 // the stuck rows must stay stuck: no blind requeue
+	r, err := jobs.NewReaper(st, orc, testPools("main"), cfg, pool.ClockFunc(clk.Now), slog.Default())
 	require.NoError(t, err)
 
 	_, rows := storetest.MintShard(t, st, "main", 25, store.ShardMined)
@@ -248,7 +264,7 @@ func TestReaperResolvesPartialClassificationOnOracleFailure(t *testing.T) {
 	clk, st, orc, _, cfg := reaperFixture(t)
 	cfg.OracleBatch = 10
 	fo := &failAfterNOracle{Oracle: orc, failOn: 3}
-	r, err := jobs.NewReaper(st, fo, []string{"main"}, cfg, pool.ClockFunc(clk.Now), slog.Default())
+	r, err := jobs.NewReaper(st, fo, testPools("main"), cfg, pool.ClockFunc(clk.Now), slog.Default())
 	require.NoError(t, err)
 
 	_, rows := storetest.MintShard(t, st, "main", 30, store.ShardMined)
@@ -289,7 +305,7 @@ func TestReaperTxDownIsCheckedOncePerTick(t *testing.T) {
 	ctx := context.Background()
 	clk, st, orc, _, cfg := reaperFixture(t)
 	txo := &txDownOracle{Oracle: orc}
-	r, err := jobs.NewReaper(st, txo, []string{"main"}, cfg, pool.ClockFunc(clk.Now), slog.Default())
+	r, err := jobs.NewReaper(st, txo, testPools("main"), cfg, pool.ClockFunc(clk.Now), slog.Default())
 	require.NoError(t, err)
 
 	_, rows := storetest.MintShard(t, st, "main", 50, store.ShardMined)
@@ -565,7 +581,7 @@ func TestReaperInputMismatchWarningLoggedOncePerTxidPerTick(t *testing.T) {
 	cfg := jobs.DefaultReaperConfig()
 	var logbuf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logbuf, nil))
-	r, err := jobs.NewReaper(st, orc, []string{"main"}, cfg, pool.ClockFunc(clk.Now), log)
+	r, err := jobs.NewReaper(st, orc, testPools("main"), cfg, pool.ClockFunc(clk.Now), log)
 	require.NoError(t, err)
 
 	const n = 5
@@ -604,7 +620,7 @@ func TestReaperOutpointOracleMismatchLogsAtError(t *testing.T) {
 	cfg := jobs.DefaultReaperConfig()
 	var logbuf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logbuf, nil))
-	r, err := jobs.NewReaper(st, orc, []string{"main"}, cfg, pool.ClockFunc(clk.Now), log)
+	r, err := jobs.NewReaper(st, orc, testPools("main"), cfg, pool.ClockFunc(clk.Now), log)
 	require.NoError(t, err)
 
 	_, rows := storetest.MintShard(t, st, "main", 1, store.ShardMined)
@@ -641,7 +657,7 @@ func TestReaperResolveChunksToStoreMaxBatch(t *testing.T) {
 	cfg.Batch = 500
 	cfg.MaxPages = 10
 	cfg.QuarantineBatch = 1500
-	r, err := jobs.NewReaper(st, orc, []string{"main"}, cfg, pool.ClockFunc(clk.Now), slog.Default())
+	r, err := jobs.NewReaper(st, orc, testPools("main"), cfg, pool.ClockFunc(clk.Now), slog.Default())
 	require.NoError(t, err)
 
 	_, rows := storetest.MintShard(t, st, "main", 1500, store.ShardMined)
@@ -692,12 +708,36 @@ func TestReaperConfigValidate(t *testing.T) {
 		{"max_pages", func(c jobs.ReaperConfig) jobs.ReaperConfig { c.MaxPages = 0; return c }},
 		{"quarantine_batch", func(c jobs.ReaperConfig) jobs.ReaperConfig { c.QuarantineBatch = 0; return c }},
 		{"oracle_batch", func(c jobs.ReaperConfig) jobs.ReaperConfig { c.OracleBatch = 0; return c }},
+		{"unknown_requeue_age_negative", func(c jobs.ReaperConfig) jobs.ReaperConfig { c.UnknownRequeueAge = -1; return c }},
+		{"unknown_requeue_age_below_min_unspent_age", func(c jobs.ReaperConfig) jobs.ReaperConfig {
+			c.UnknownRequeueAge = c.MinUnspentAge - time.Second
+			return c
+		}},
+		{"hint_max_wait_negative", func(c jobs.ReaperConfig) jobs.ReaperConfig { c.HintMaxWait = -1; return c }},
+		{"hint_max_wait_below_hint_patience", func(c jobs.ReaperConfig) jobs.ReaperConfig {
+			c.HintMaxWait = c.HintPatience - time.Second
+			return c
+		}},
+		{"tx_recheck_interval_zero", func(c jobs.ReaperConfig) jobs.ReaperConfig { c.TxRecheckInterval = 0; return c }},
+		{"tx_recheck_interval_negative", func(c jobs.ReaperConfig) jobs.ReaperConfig { c.TxRecheckInterval = -1; return c }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Error(t, tc.mod(valid).Validate())
 		})
 	}
+
+	assert.Equal(t, 10*time.Minute, valid.UnknownRequeueAge)
+	assert.Equal(t, 24*time.Hour, valid.HintMaxWait)
+	assert.Equal(t, 30*time.Second, valid.TxRecheckInterval)
+	disabled := valid
+	disabled.UnknownRequeueAge = 0
+	disabled.HintMaxWait = 0
+	require.NoError(t, disabled.Validate(), "0 disables unknown_requeue_age and hint_max_wait")
+	edge := valid
+	edge.UnknownRequeueAge = edge.MinUnspentAge
+	edge.HintMaxWait = edge.HintPatience
+	require.NoError(t, edge.Validate(), "equal to the lower bound is allowed")
 }
 
 func TestReaperNewRejectsInvalidConfig(t *testing.T) {
@@ -705,7 +745,7 @@ func TestReaperNewRejectsInvalidConfig(t *testing.T) {
 	orc := oracle.NewMock()
 	cfg := jobs.DefaultReaperConfig()
 	cfg.Batch = 0
-	_, err := jobs.NewReaper(st, orc, []string{"main"}, cfg, pool.RealClock{}, slog.Default())
+	_, err := jobs.NewReaper(st, orc, testPools("main"), cfg, pool.RealClock{}, slog.Default())
 	require.Error(t, err)
 }
 
@@ -728,7 +768,7 @@ func inputsFixture(t *testing.T) (*storetest.Clock, *memory.Store, *inputsOracle
 	st := memory.New(memory.WithClock(clk.Now))
 	orc := &inputsOracle{Mock: oracle.NewMock(), inputs: map[chainhash.Hash][]store.Outpoint{}, calls: map[chainhash.Hash]int{}}
 	cfg := jobs.DefaultReaperConfig()
-	r, err := jobs.NewReaper(st, orc, []string{"main"}, cfg, pool.ClockFunc(clk.Now), slog.Default())
+	r, err := jobs.NewReaper(st, orc, testPools("main"), cfg, pool.ClockFunc(clk.Now), slog.Default())
 	require.NoError(t, err)
 	return clk, st, orc, r, cfg
 }
@@ -807,4 +847,253 @@ func TestReaperEmptyInputsKeepsRowQuarantined(t *testing.T) {
 	require.NoError(t, r.RunOnce(ctx))
 	assert.Equal(t, store.StateQuarantined, states(t, st, rows)[0])
 	assert.InDelta(t, before+1, testutil.ToFloat64(jobs.ReaperInputMismatch.WithLabelValues("main", "hint")), 0)
+}
+
+// unhintedFixture builds a reaper over pools with cfg, on a fresh memory
+// store and mock oracle (which answers Unknown for every outpoint unless
+// told otherwise).
+func unhintedFixture(t *testing.T, cfg jobs.ReaperConfig, pools []pool.Config) (*storetest.Clock, *memory.Store, *oracle.Mock, *jobs.Reaper) {
+	t.Helper()
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	orc := oracle.NewMock()
+	r, err := jobs.NewReaper(st, orc, pools, cfg, pool.ClockFunc(clk.Now), slog.Default())
+	require.NoError(t, err)
+	return clk, st, orc, r
+}
+
+func statesIn(t *testing.T, st store.Store, p string, rows []store.Row) []store.State {
+	t.Helper()
+	m := storetest.RowsByOutpoint(t, st, p, storetest.Ops(rows))
+	out := make([]store.State, len(rows))
+	for i, r := range rows {
+		out[i] = m[r.Outpoint].State
+	}
+	return out
+}
+
+func allIn(t *testing.T, st store.Store, p string, rows []store.Row, want store.State) bool {
+	t.Helper()
+	for _, s := range statesIn(t, st, p, rows) {
+		if s != want {
+			return false
+		}
+	}
+	return true
+}
+
+// reserveToExpire reserves rows for one second without a hint.
+func reserveToExpire(t *testing.T, st store.Store, clk *storetest.Clock, p string, rows []store.Row) {
+	t.Helper()
+	storetest.MustReserve(t, st, p, rows, store.NewToken(), clk.Now().Add(time.Second))
+}
+
+// quarantineTick lets every one-second reservation expire past Grace and runs
+// the tick that quarantines them (stamping QuarantinedAt with clk.Now()).
+func quarantineTick(t *testing.T, r *jobs.Reaper, clk *storetest.Clock, cfg jobs.ReaperConfig) {
+	t.Helper()
+	clk.Advance(time.Second + cfg.Grace + time.Second)
+	require.NoError(t, r.RunOnce(context.Background()))
+}
+
+func TestReaperUnknownUnhintedRequeuesAfterUnknownRequeueAge(t *testing.T) {
+	ctx := context.Background()
+	const p = "unknown-aged"
+	cfg := jobs.DefaultReaperConfig()
+	clk, st, _, r := unhintedFixture(t, cfg, testPools(p))
+	const n = 3
+	_, rows := storetest.MintShard(t, st, p, n, store.ShardMined)
+	reserveToExpire(t, st, clk, p, rows)
+	quarantineTick(t, r, clk, cfg)
+	require.True(t, allIn(t, st, p, rows, store.StateQuarantined))
+	before := testutil.ToFloat64(jobs.ReaperRequeued.WithLabelValues(p, "unknown_aged"))
+	beforeAvail := testutil.ToFloat64(jobs.ReaperResolved.WithLabelValues(p, "available"))
+
+	clk.Advance(cfg.UnknownRequeueAge - time.Second)
+	require.NoError(t, r.RunOnce(ctx))
+	assert.True(t, allIn(t, st, p, rows, store.StateQuarantined), "just under unknown_requeue_age the rows are held")
+	assert.InDelta(t, float64(n), testutil.ToFloat64(jobs.ReaperHeld.WithLabelValues(p, "unknown_fresh")), 0)
+
+	clk.Advance(time.Second)
+	require.NoError(t, r.RunOnce(ctx))
+	assert.True(t, allIn(t, st, p, rows, store.StateAvailable), "at unknown_requeue_age the rows are requeued")
+	got := storetest.RowsByOutpoint(t, st, p, storetest.Ops(rows))
+	for _, row := range rows {
+		assert.True(t, got[row.Outpoint].ReservedBy.IsZero(), "provenance cleared on requeue")
+		assert.Nil(t, got[row.Outpoint].SpentHint)
+	}
+	assert.InDelta(t, before+n, testutil.ToFloat64(jobs.ReaperRequeued.WithLabelValues(p, "unknown_aged")), 0)
+	assert.InDelta(t, beforeAvail+n, testutil.ToFloat64(jobs.ReaperResolved.WithLabelValues(p, "available")), 0)
+	assert.InDelta(t, 0, testutil.ToFloat64(jobs.ReaperHeld.WithLabelValues(p, "unknown_fresh")), 0, "held gauge reset each tick")
+}
+
+func TestReaperUnknownRequeueDisabledByZeroAge(t *testing.T) {
+	ctx := context.Background()
+	const p = "unknown-disabled"
+	cfg := jobs.DefaultReaperConfig()
+	cfg.UnknownRequeueAge = 0
+	clk, st, _, r := unhintedFixture(t, cfg, testPools(p))
+	_, rows := storetest.MintShard(t, st, p, 2, store.ShardMined)
+	reserveToExpire(t, st, clk, p, rows)
+	quarantineTick(t, r, clk, cfg)
+
+	clk.Advance(30 * 24 * time.Hour)
+	require.NoError(t, r.RunOnce(ctx))
+	assert.True(t, allIn(t, st, p, rows, store.StateQuarantined), "unknown_requeue_age 0 never requeues an unhinted Unknown row")
+}
+
+func TestReaperExpiryPolicyHoldIsPerPool(t *testing.T) {
+	ctx := context.Background()
+	const held, requeued = "expiry-hold", "expiry-requeue"
+	cfg := jobs.DefaultReaperConfig()
+	pools := testPools(held, requeued)
+	pools[0].ExpiryPolicy = pool.ExpiryHold
+	clk, st, _, r := unhintedFixture(t, cfg, pools)
+	const n = 2
+	_, heldRows := storetest.MintShard(t, st, held, n, store.ShardMined)
+	_, requeuedRows := storetest.MintShard(t, st, requeued, n, store.ShardMined)
+	reserveToExpire(t, st, clk, held, heldRows)
+	reserveToExpire(t, st, clk, requeued, requeuedRows)
+	quarantineTick(t, r, clk, cfg)
+
+	clk.Advance(cfg.UnknownRequeueAge + time.Hour)
+	require.NoError(t, r.RunOnce(ctx))
+	assert.True(t, allIn(t, st, held, heldRows, store.StateQuarantined), "expiry_policy hold keeps the rows for an operator")
+	assert.True(t, allIn(t, st, requeued, requeuedRows, store.StateAvailable), "the other pool still requeues")
+	assert.InDelta(t, float64(n), testutil.ToFloat64(jobs.ReaperHeld.WithLabelValues(held, "expiry_hold")), 0)
+	assert.InDelta(t, 0, testutil.ToFloat64(jobs.ReaperHeld.WithLabelValues(held, "unknown_fresh")), 0)
+	assert.InDelta(t, 0, testutil.ToFloat64(jobs.ReaperHeld.WithLabelValues(requeued, "expiry_hold")), 0)
+}
+
+func TestReaperOutpointsOutageDefersUnknownRequeue(t *testing.T) {
+	ctx := context.Background()
+	const p = "unknown-outage"
+	cfg := jobs.DefaultReaperConfig()
+	clk, st, orc, r := unhintedFixture(t, cfg, testPools(p))
+	_, rows := storetest.MintShard(t, st, p, 2, store.ShardMined)
+	reserveToExpire(t, st, clk, p, rows)
+	quarantineTick(t, r, clk, cfg)
+
+	orc.SetDown(true)
+	clk.Advance(cfg.UnknownRequeueAge + time.Minute)
+	require.NoError(t, r.RunOnce(ctx))
+	assert.True(t, allIn(t, st, p, rows, store.StateQuarantined), "an outpoint-oracle outage never requeues on its own")
+
+	orc.SetDown(false)
+	require.NoError(t, r.RunOnce(ctx))
+	assert.True(t, allIn(t, st, p, rows, store.StateAvailable), "once the oracle answers (Unknown), aged rows are requeued")
+}
+
+// TestReaperVerifiedReleaseRequeuesAfterUnknownRequeueAge covers the
+// release_policy verify path: Spend with a zero txid quarantines the row with
+// no hint, so it is an unhinted row like an expired reservation.
+func TestReaperVerifiedReleaseRequeuesAfterUnknownRequeueAge(t *testing.T) {
+	ctx := context.Background()
+	const p = "verified-release"
+	cfg := jobs.DefaultReaperConfig()
+	clk, st, _, r := unhintedFixture(t, cfg, testPools(p))
+	_, rows := storetest.MintShard(t, st, p, 1, store.ShardMined)
+	tok := store.NewToken()
+	storetest.MustReserve(t, st, p, rows, tok, clk.Now().Add(time.Minute))
+	_, err := st.Spend(ctx, p, tok, storetest.Ops(rows), chainhash.Hash{}, false)
+	require.NoError(t, err)
+	require.Equal(t, store.StateQuarantined, statesIn(t, st, p, rows)[0])
+
+	clk.Advance(cfg.UnknownRequeueAge - time.Second)
+	require.NoError(t, r.RunOnce(ctx))
+	assert.Equal(t, store.StateQuarantined, statesIn(t, st, p, rows)[0])
+
+	clk.Advance(time.Second)
+	require.NoError(t, r.RunOnce(ctx))
+	assert.Equal(t, store.StateAvailable, statesIn(t, st, p, rows)[0], "a verified release with no verdict is requeued after unknown_requeue_age")
+}
+
+// failTxOracle wraps a Mock and fails Tx for one txid.
+type failTxOracle struct {
+	*oracle.Mock
+	bad chainhash.Hash
+}
+
+func (o *failTxOracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, error) {
+	if txid == o.bad {
+		return oracle.TxStatus{}, oracle.ErrUnavailable
+	}
+	return o.Mock.Tx(ctx, txid)
+}
+
+func TestReaperHeldGaugeReasons(t *testing.T) {
+	ctx := context.Background()
+	const a, b, c = "held-a", "held-b", "held-c"
+	cfg := jobs.DefaultReaperConfig()
+	pools := testPools(a, b, c)
+	pools[1].ExpiryPolicy = pool.ExpiryHold
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	mock := oracle.NewMock()
+	down := storetest.NewTxID()
+	orc := &failTxOracle{Mock: mock, bad: down}
+	r, err := jobs.NewReaper(st, orc, pools, cfg, pool.ClockFunc(clk.Now), slog.Default())
+	require.NoError(t, err)
+
+	hint := func(p string, rows []store.Row, txid chainhash.Hash) {
+		tok := store.NewToken()
+		storetest.MustReserve(t, st, p, rows, tok, clk.Now().Add(time.Minute))
+		_, err := st.Spend(ctx, p, tok, storetest.Ops(rows), txid, false)
+		require.NoError(t, err)
+	}
+	_, rowsA := storetest.MintShard(t, st, a, 4, store.ShardMined)
+	reserveToExpire(t, st, clk, a, rowsA[0:1]) // unknown_fresh
+	pending, unseen := storetest.NewTxID(), storetest.NewTxID()
+	mock.SetTx(pending, oracle.TxStatus{Known: true})
+	hint(a, rowsA[1:2], pending) // hint_pending
+	hint(a, rowsA[2:3], unseen)  // hint_unseen
+	reserveToExpire(t, st, clk, a, rowsA[3:4])
+	mock.SetConflicting(rowsA[3].Outpoint) // conflicting
+	_, rowsB := storetest.MintShard(t, st, b, 1, store.ShardMined)
+	reserveToExpire(t, st, clk, b, rowsB) // expiry_hold
+	_, rowsC := storetest.MintShard(t, st, c, 1, store.ShardMined)
+	hint(c, rowsC, down) // tx_down
+
+	quarantineTick(t, r, clk, cfg)
+	clk.Advance(cfg.QuarantineMinAge + time.Second)
+	require.NoError(t, r.RunOnce(ctx))
+
+	want := map[string]map[string]float64{
+		a: {"unknown_fresh": 1, "expiry_hold": 0, "hint_pending": 1, "hint_unseen": 1, "conflicting": 1, "tx_down": 0},
+		b: {"unknown_fresh": 0, "expiry_hold": 1, "hint_pending": 0, "hint_unseen": 0, "conflicting": 0, "tx_down": 0},
+		c: {"unknown_fresh": 0, "expiry_hold": 0, "hint_pending": 0, "hint_unseen": 0, "conflicting": 0, "tx_down": 1},
+	}
+	for p, reasons := range want {
+		for reason, v := range reasons {
+			assert.InDelta(t, v, testutil.ToFloat64(jobs.ReaperHeld.WithLabelValues(p, reason)), 0, "%s/%s", p, reason)
+		}
+	}
+	assert.True(t, allIn(t, st, a, rowsA, store.StateQuarantined))
+	assert.True(t, allIn(t, st, b, rowsB, store.StateQuarantined))
+	assert.True(t, allIn(t, st, c, rowsC, store.StateQuarantined))
+}
+
+func TestReaperSpentCounterBySource(t *testing.T) {
+	ctx := context.Background()
+	const p = "spent-source"
+	cfg := jobs.DefaultReaperConfig()
+	clk, st, orc, r := unhintedFixture(t, cfg, testPools(p))
+	_, rows := storetest.MintShard(t, st, p, 2, store.ShardMined)
+	spender := storetest.NewTxID()
+	reserveToExpire(t, st, clk, p, rows[:1])
+	orc.SetSpent(rows[0].Outpoint, spender) // source oracle
+	tok := store.NewToken()
+	storetest.MustReserve(t, st, p, rows[1:], tok, clk.Now().Add(time.Minute))
+	_, err := st.Spend(ctx, p, tok, storetest.Ops(rows[1:]), spender, false) // source hint (Unknown outpoint verdict)
+	require.NoError(t, err)
+	orc.SetTx(spender, oracle.TxStatus{Known: true, Mined: true})
+	beforeOracle := testutil.ToFloat64(jobs.ReaperSpent.WithLabelValues(p, "oracle"))
+	beforeHint := testutil.ToFloat64(jobs.ReaperSpent.WithLabelValues(p, "hint"))
+
+	quarantineTick(t, r, clk, cfg)
+	clk.Advance(cfg.QuarantineMinAge + time.Second)
+	require.NoError(t, r.RunOnce(ctx))
+	assert.True(t, allIn(t, st, p, rows, store.StateSpent))
+	assert.InDelta(t, beforeOracle+1, testutil.ToFloat64(jobs.ReaperSpent.WithLabelValues(p, "oracle")), 0)
+	assert.InDelta(t, beforeHint+1, testutil.ToFloat64(jobs.ReaperSpent.WithLabelValues(p, "hint")), 0)
 }
