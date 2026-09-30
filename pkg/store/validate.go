@@ -37,10 +37,18 @@ func ValidateLimit(limit int) error {
 	return nil
 }
 
-// ValidateLease checks TryAcquireOrRenew / Release arguments.
-func ValidateLease(name, holder string, ttl time.Duration) error {
+// ValidateLeaseName checks a lease/job name (TryAcquireOrRenew, ReleaseLease).
+func ValidateLeaseName(name string) error {
 	if name == "" || len(name) > 128 {
 		return invalid("lease name must be 1..128 bytes")
+	}
+	return nil
+}
+
+// ValidateLease checks TryAcquireOrRenew arguments.
+func ValidateLease(name, holder string, ttl time.Duration) error {
+	if err := ValidateLeaseName(name); err != nil {
+		return err
 	}
 	if err := ValidateHolder(holder); err != nil {
 		return err
@@ -51,17 +59,49 @@ func ValidateLease(name, holder string, ttl time.Duration) error {
 	return nil
 }
 
-// ValidateShardStatuses checks an AcquireShard status set.
+// ValidateAcquireUntil checks the lease expiry passed to AcquireShard: it must be
+// strictly after now, so a freshly granted lease is immediately held.
+func ValidateAcquireUntil(until, now time.Time) error {
+	if !until.After(now) {
+		return invalid("acquire until must be after now")
+	}
+	return nil
+}
+
+// ValidateRenewUntil checks the lease expiry passed to RenewShard: it must be
+// non-zero (a zero time would be indistinguishable from "unowned").
+func ValidateRenewUntil(until time.Time) error {
+	if until.IsZero() {
+		return invalid("renew until must not be zero")
+	}
+	return nil
+}
+
+// ValidateShardStatuses checks an AcquireShard status set: at least one status,
+// every entry known.
 func ValidateShardStatuses(statuses []ShardStatus) error {
 	if len(statuses) == 0 {
 		return invalid("at least one shard status is required")
 	}
+	return validateKnownShardStatuses(statuses)
+}
+
+func validateKnownShardStatuses(statuses []ShardStatus) error {
 	for _, s := range statuses {
 		if s > ShardInvalid {
 			return invalid("unknown shard status %d", s)
 		}
 	}
 	return nil
+}
+
+// ValidateListShardsFilter checks a ListShards filter: a non-negative limit (0 means
+// "no limit") and, when present, only known statuses (nil/empty Statuses means "all").
+func ValidateListShardsFilter(f ShardFilter) error {
+	if f.Limit < 0 {
+		return invalid("limit must be >= 0")
+	}
+	return validateKnownShardStatuses(f.Statuses)
 }
 
 // ValidateUpdateStatus checks the status passed to UpdateShard. Invalid is only

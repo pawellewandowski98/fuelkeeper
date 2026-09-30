@@ -125,7 +125,9 @@ func (s ShardStatus) String() string {
 	return "status(" + strconv.Itoa(int(s)) + ")"
 }
 
-// Terminal reports whether the shard can no longer change status.
+// Terminal reports whether no UpdateShard transition leaves this status: UpdateShard
+// cannot change a retired or invalid shard. RetireShard may still invalidate a
+// terminal (retired) shard, moving it to invalid.
 func (s ShardStatus) Terminal() bool { return s == ShardRetired || s == ShardInvalid }
 
 // LockMode says how a fuel output is unlocked.
@@ -172,8 +174,8 @@ type Shard struct {
 	Denomination uint64
 	LockMode     LockMode
 	Status       ShardStatus
-	Owner        string    // "" when unowned
-	LeaseUntil   time.Time // zero when unowned
+	Owner        string    // "" when unowned; Owner == "" iff LeaseUntil is zero
+	LeaseUntil   time.Time // zero when unowned; the lease is held while now < LeaseUntil
 	Version      int64     // starts at 1; bumped by UpdateShard and RetireShard
 	BEEF         []byte    // nil in ListShards results
 	CreatedAt    time.Time
@@ -188,9 +190,11 @@ type ShardHead struct {
 
 // ShardFilter narrows ListShards.
 type ShardFilter struct {
-	Statuses []ShardStatus // nil = all
-	Owner    *string       // nil = any; pointer to "" = unowned only
-	Limit    int           // 0 = no limit
+	Statuses []ShardStatus // nil = all; a listed status must be a known ShardStatus
+	// Owner: nil = any; pointer to "" = unowned only. Matches the stored owner string
+	// regardless of lease expiry (an expired lease still has a non-empty Owner).
+	Owner *string
+	Limit int // 0 = no limit; negative is invalid (ErrInvalidArgument)
 }
 
 // ReserveOp asks to move one row from available to reserved under Token.

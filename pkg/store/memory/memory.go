@@ -32,6 +32,7 @@ type Store struct {
 	now    func() time.Time
 	mu     sync.Mutex
 	shards map[shardKey]*store.Shard
+	byTxID map[chainhash.Hash]string // txid -> owning pool; enforces global txid uniqueness
 	rows   map[store.Outpoint]*store.Row
 	leases map[string]lease
 }
@@ -47,6 +48,7 @@ func New(opts ...Option) *Store {
 	s := &Store{
 		now:    time.Now,
 		shards: map[shardKey]*store.Shard{},
+		byTxID: map[chainhash.Hash]string{},
 		rows:   map[store.Outpoint]*store.Row{},
 		leases: map[string]lease{},
 	}
@@ -117,6 +119,9 @@ func (s *Store) PutShard(_ context.Context, shard store.Shard, rows []store.Row)
 		}
 		return nil
 	}
+	if owner, ok := s.byTxID[shard.TxID]; ok && owner != shard.Pool {
+		return store.ErrShardExists
+	}
 	now := s.now()
 	for i := range rows {
 		r := cloneRow(&rows[i])
@@ -133,11 +138,15 @@ func (s *Store) PutShard(_ context.Context, shard store.Shard, rows []store.Row)
 	sh.Owner, sh.LeaseUntil, sh.Version = "", time.Time{}, 1
 	sh.CreatedAt, sh.UpdatedAt = now, now
 	s.shards[k] = &sh
+	s.byTxID[shard.TxID] = shard.Pool
 	return nil
 }
 
 // GetShard implements store.Store.
 func (s *Store) GetShard(_ context.Context, pool string, txid chainhash.Hash) (*store.Shard, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sh, ok := s.shards[shardKey{pool, txid}]
@@ -150,6 +159,9 @@ func (s *Store) GetShard(_ context.Context, pool string, txid chainhash.Hash) (*
 
 // UpdateShard implements store.Store.
 func (s *Store) UpdateShard(_ context.Context, pool string, txid chainhash.Hash, status store.ShardStatus, beef []byte) error {
+	if err := store.ValidatePool(pool); err != nil {
+		return err
+	}
 	if err := store.ValidateUpdateStatus(status); err != nil {
 		return err
 	}
@@ -173,11 +185,17 @@ func (s *Store) UpdateShard(_ context.Context, pool string, txid chainhash.Hash,
 
 // RetireShard implements store.Store.
 func (s *Store) RetireShard(_ context.Context, pool string, txid chainhash.Hash) (int, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return 0, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sh, ok := s.shards[shardKey{pool, txid}]
 	if !ok {
 		return 0, store.ErrNotFound
+	}
+	if sh.Status == store.ShardInvalid {
+		return 0, nil
 	}
 	now := s.now()
 	sh.Status = store.ShardInvalid
@@ -206,6 +224,9 @@ func (s *Store) AcquireShard(_ context.Context, pool, holder string, now, until 
 	if err := store.ValidateShardStatuses(statuses); err != nil {
 		return nil, err
 	}
+	if err := store.ValidateAcquireUntil(until, now); err != nil {
+		return nil, err
+	}
 	want := map[store.ShardStatus]bool{}
 	for _, st := range statuses {
 		want[st] = true
@@ -221,7 +242,7 @@ func (s *Store) AcquireShard(_ context.Context, pool, holder string, now, until 
 		if k.pool != pool || !want[sh.Status] || skip[sh.TxID] {
 			continue
 		}
-		if sh.Owner != "" && !sh.LeaseUntil.IsZero() && !sh.LeaseUntil.Before(now) {
+		if sh.Owner != "" && sh.LeaseUntil.After(now) {
 			continue
 		}
 		if best == nil || lessShard(sh, best) {
@@ -233,14 +254,20 @@ func (s *Store) AcquireShard(_ context.Context, pool, holder string, now, until 
 	}
 	best.Owner = holder
 	best.LeaseUntil = until
-	best.UpdatedAt = now
+	best.UpdatedAt = s.now()
 	c := cloneShard(best, true)
 	return &c, nil
 }
 
 // RenewShard implements store.Store.
 func (s *Store) RenewShard(_ context.Context, pool string, txid chainhash.Hash, holder string, until time.Time) (store.ShardHead, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return store.ShardHead{}, err
+	}
 	if err := store.ValidateHolder(holder); err != nil {
+		return store.ShardHead{}, err
+	}
+	if err := store.ValidateRenewUntil(until); err != nil {
 		return store.ShardHead{}, err
 	}
 	s.mu.Lock()
@@ -258,6 +285,12 @@ func (s *Store) RenewShard(_ context.Context, pool string, txid chainhash.Hash, 
 
 // ReleaseShard implements store.Store.
 func (s *Store) ReleaseShard(_ context.Context, pool string, txid chainhash.Hash, holder string) error {
+	if err := store.ValidatePool(pool); err != nil {
+		return err
+	}
+	if err := store.ValidateHolder(holder); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sh, ok := s.shards[shardKey{pool, txid}]
@@ -273,6 +306,12 @@ func (s *Store) ReleaseShard(_ context.Context, pool string, txid chainhash.Hash
 
 // ListShards implements store.Store.
 func (s *Store) ListShards(_ context.Context, pool string, f store.ShardFilter) ([]store.Shard, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return nil, err
+	}
+	if err := store.ValidateListShardsFilter(f); err != nil {
+		return nil, err
+	}
 	want := map[store.ShardStatus]bool{}
 	for _, st := range f.Statuses {
 		want[st] = true
@@ -306,47 +345,74 @@ func (s *Store) ListShards(_ context.Context, pool string, f store.ShardFilter) 
 // ---- rows (implemented in Task 5) ----
 
 // ListAvailable is implemented in Task 5.
-func (s *Store) ListAvailable(context.Context, string, chainhash.Hash, uint32, int) ([]store.Row, error) {
+func (s *Store) ListAvailable(_ context.Context, pool string, _ chainhash.Hash, _ uint32, _ int) ([]store.Row, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return nil, err
+	}
 	return nil, errNotImplemented
 }
 
 // GetRows is implemented in Task 5.
-func (s *Store) GetRows(context.Context, string, []store.Outpoint) ([]store.Row, error) {
+func (s *Store) GetRows(_ context.Context, pool string, _ []store.Outpoint) ([]store.Row, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return nil, err
+	}
 	return nil, errNotImplemented
 }
 
 // Reserve is implemented in Task 5.
-func (s *Store) Reserve(context.Context, string, []store.ReserveOp) ([]store.ReserveOp, error) {
+func (s *Store) Reserve(_ context.Context, pool string, _ []store.ReserveOp) ([]store.ReserveOp, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return nil, err
+	}
 	return nil, errNotImplemented
 }
 
 // Release is implemented in Task 5.
-func (s *Store) Release(context.Context, string, store.Token, []store.Outpoint) (int, error) {
+func (s *Store) Release(_ context.Context, pool string, _ store.Token, _ []store.Outpoint) (int, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return 0, err
+	}
 	return 0, errNotImplemented
 }
 
 // Spend is implemented in Task 5.
-func (s *Store) Spend(context.Context, string, store.Token, []store.Outpoint, chainhash.Hash, bool) (int, error) {
+func (s *Store) Spend(_ context.Context, pool string, _ store.Token, _ []store.Outpoint, _ chainhash.Hash, _ bool) (int, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return 0, err
+	}
 	return 0, errNotImplemented
 }
 
 // Quarantine is implemented in Task 5.
-func (s *Store) Quarantine(context.Context, string, time.Time, int) (int, error) {
+func (s *Store) Quarantine(_ context.Context, pool string, _ time.Time, _ int) (int, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return 0, err
+	}
 	return 0, errNotImplemented
 }
 
 // ListQuarantined is implemented in Task 5.
-func (s *Store) ListQuarantined(context.Context, string, time.Time, int) ([]store.Row, error) {
+func (s *Store) ListQuarantined(_ context.Context, pool string, _ time.Time, _ int) ([]store.Row, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return nil, err
+	}
 	return nil, errNotImplemented
 }
 
 // Resolve is implemented in Task 5.
-func (s *Store) Resolve(context.Context, string, []store.Outpoint, store.State, *chainhash.Hash) (int, error) {
+func (s *Store) Resolve(_ context.Context, pool string, _ []store.Outpoint, _ store.State, _ *chainhash.Hash) (int, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return 0, err
+	}
 	return 0, errNotImplemented
 }
 
 // Stats is implemented in Task 5.
-func (s *Store) Stats(context.Context, string) (store.Stats, error) {
+func (s *Store) Stats(_ context.Context, pool string) (store.Stats, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return store.Stats{}, err
+	}
 	return store.Stats{}, errNotImplemented
 }
 
@@ -371,6 +437,12 @@ func (s *Store) TryAcquireOrRenew(_ context.Context, name, holder string, ttl ti
 
 // ReleaseLease implements store.Leaser.
 func (s *Store) ReleaseLease(_ context.Context, name, holder string) error {
+	if err := store.ValidateLeaseName(name); err != nil {
+		return err
+	}
+	if err := store.ValidateHolder(holder); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if l, ok := s.leases[name]; ok && l.holder == holder {

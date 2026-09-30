@@ -21,6 +21,12 @@ import (
 // rows without contention. The lease is an optimisation only: two instances may
 // race Reserve on the same row and the row CAS decides. Adoption never writes rows.
 //
+// A lease is free when Owner == "" or LeaseUntil <= now; it is held while
+// now < LeaseUntil. Owner == "" if and only if LeaseUntil is the zero time. Only a
+// successful AcquireShard by another holder, or ReleaseShard, clears Owner: an
+// expired lease is adoptable but its Owner/RenewShard rights are untouched until
+// someone actually acquires or releases it.
+//
 // # Idempotency
 //
 // Reserve applies to a row when state == available OR (state == reserved AND
@@ -40,33 +46,50 @@ type Store interface {
 	// Capabilities is constant for the life of the store.
 	Capabilities() Caps
 
-	// PutShard inserts a shard and all its rows (state available). It is idempotent
-	// on (pool, txid): an identical replay returns nil without touching existing
-	// rows; a replay with different size/denomination/lock mode returns
-	// ErrShardExists. Backends without multi-record atomicity write rows first and
-	// the shard record last, so a visible shard implies its rows exist.
+	// PutShard inserts a shard and all its rows (state available). A shard's txid is
+	// globally unique across pools: PutShard with an existing txid under a different
+	// pool returns ErrShardExists. It is idempotent on (pool, txid): an identical
+	// replay returns nil without touching existing rows, keeping Version 1 and the
+	// original BEEF/status even if the replay carries different ones; a replay with a
+	// different size, denomination or lock mode also returns ErrShardExists. Backends
+	// without multi-record atomicity write rows first and the shard record last, so a
+	// visible shard implies its rows exist. pool must be non-empty (ErrInvalidArgument).
 	PutShard(ctx context.Context, shard Shard, rows []Row) error
-	// GetShard returns the full record including BEEF, or ErrNotFound.
+	// GetShard returns the full record including BEEF, or ErrNotFound. pool must be
+	// non-empty (ErrInvalidArgument).
 	GetShard(ctx context.Context, pool string, txid chainhash.Hash) (*Shard, error)
 	// UpdateShard sets status (unmined, mined or retired) and, when beef != nil,
-	// replaces BEEF; it bumps Version. Retired/invalid shards return ErrTerminalShard.
+	// replaces BEEF; it bumps Version. It never touches the shard's lease (Owner,
+	// LeaseUntil). Retired/invalid shards return ErrTerminalShard. pool must be
+	// non-empty (ErrInvalidArgument).
 	UpdateShard(ctx context.Context, pool string, txid chainhash.Hash, status ShardStatus, beef []byte) error
 	// RetireShard marks the shard invalid, clears its lease, bumps Version, and moves
-	// every non-terminal row (available, reserved, quarantined) to invalid. It returns
-	// the number of rows changed and is idempotent. Missing shard: ErrNotFound.
+	// every non-terminal row (available, reserved, quarantined) to invalid, keeping
+	// provenance fields (ReservedBy, SpentHint). It returns the number of rows changed.
+	// A shard already invalid is a no-op: it returns 0 and leaves Version/UpdatedAt
+	// unchanged. A retired shard may still be retired (retired -> invalid). Missing
+	// shard: ErrNotFound. pool must be non-empty (ErrInvalidArgument).
 	RetireShard(ctx context.Context, pool string, txid chainhash.Hash) (int, error)
-	// AcquireShard atomically claims the oldest shard (by created_at, then txid) whose
-	// status is in statuses, whose lease is free (owner == "" or lease_until < now),
-	// and whose txid is not in exclude. It sets Owner = holder, LeaseUntil = until and
-	// returns the full record. (nil, nil) means nothing was adoptable.
+	// AcquireShard atomically claims the oldest shard (by created_at, then txid
+	// compared as its 32 internal bytes, not display hex) whose status is in statuses,
+	// whose lease is free (Owner == "" or LeaseUntil <= now), and whose txid is not in
+	// exclude. until must be strictly after now (ErrInvalidArgument otherwise). It sets
+	// Owner = holder, LeaseUntil = until and returns the full record. (nil, nil) means
+	// nothing was adoptable.
 	AcquireShard(ctx context.Context, pool, holder string, now, until time.Time, statuses []ShardStatus, exclude []chainhash.Hash) (*Shard, error)
-	// RenewShard extends the lease if Owner == holder (even if it had expired) and
-	// returns the current status and version. Otherwise ErrNotOwner; missing: ErrNotFound.
+	// RenewShard extends the lease if Owner == holder (even if it had expired: only a
+	// successful AcquireShard by another holder, or ReleaseShard, clears Owner) and
+	// returns the current status and version. until must be non-zero
+	// (ErrInvalidArgument otherwise). Otherwise ErrNotOwner; missing: ErrNotFound.
 	RenewShard(ctx context.Context, pool string, txid chainhash.Hash, holder string, until time.Time) (ShardHead, error)
-	// ReleaseShard clears the lease if Owner == holder; otherwise it is a no-op.
-	// Missing shard: ErrNotFound.
+	// ReleaseShard clears the lease if Owner == holder, after which the lease is free
+	// and a further RenewShard by the same holder returns ErrNotOwner; otherwise it is
+	// a no-op. Missing shard: ErrNotFound.
 	ReleaseShard(ctx context.Context, pool string, txid chainhash.Hash, holder string) error
-	// ListShards returns shards ordered by (created_at, txid) with BEEF omitted.
+	// ListShards returns shards ordered by (created_at, txid compared as its 32
+	// internal bytes, not display hex) with BEEF omitted. f.Owner matches the stored
+	// owner string regardless of lease expiry. f.Limit must be >= 0 and every status in
+	// f.Statuses must be known (ErrInvalidArgument otherwise).
 	ListShards(ctx context.Context, pool string, f ShardFilter) ([]Shard, error)
 
 	// ListAvailable returns available rows of one shard with vout >= fromVout,
@@ -109,9 +132,9 @@ type Store interface {
 // FuelKeeper is a CAS, so that holds).
 type Leaser interface {
 	// TryAcquireOrRenew grants or extends the named lease for holder until now+ttl
-	// when the lease is free, expired, or already held by holder. It returns the new
-	// expiry, or the zero time when another holder owns an unexpired lease. Errors
-	// are for infrastructure failures only.
+	// when the lease is free (no holder, or its expiry <= now) or already held by
+	// holder. It returns the new expiry, or the zero time when another holder owns an
+	// unexpired lease (now < expiry). Errors are for infrastructure failures only.
 	TryAcquireOrRenew(ctx context.Context, name, holder string, ttl time.Duration) (time.Time, error)
 	// ReleaseLease drops the lease if holder owns it; otherwise it is a no-op.
 	// (Named ReleaseLease because Store.Release is the row operation.)
