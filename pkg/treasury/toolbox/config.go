@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/fuel"
@@ -138,12 +139,14 @@ func (c *Config) Validate(pools []pool.Config) error {
 	if len(pools) == 0 {
 		return errors.New("treasury.toolbox: at least one pool is required")
 	}
+	// The class is compared without a fee rate: two pools share a leaf chunk
+	// value at every rate exactly when their outputs total and their leaf
+	// size are both equal.
 	first := pools[0]
-	want := LeafCost(first, c.FeeSatPerKB)
 	for _, p := range pools[1:] {
-		if got := LeafCost(p, c.FeeSatPerKB); got != want {
-			return fmt.Errorf("treasury.toolbox: pools %q (leaf cost %d) and %q (leaf cost %d) differ: one treasury funds one leaf cost class (run one FuelKeeper per class)",
-				first.Name, want, p.Name, got)
+		if leafOutputs(p) != leafOutputs(first) || LeafSizeBytes(p) != LeafSizeBytes(first) {
+			return fmt.Errorf("treasury.toolbox: pools %q (leaf outputs %d sat, leaf size %d B) and %q (leaf outputs %d sat, leaf size %d B) differ in leaf cost: one treasury funds one leaf cost class (run one FuelKeeper per class)",
+				first.Name, leafOutputs(first), LeafSizeBytes(first), p.Name, leafOutputs(p), LeafSizeBytes(p))
 		}
 	}
 	return nil
@@ -217,21 +220,46 @@ func (k ChunkConfig) validate() error {
 	return nil
 }
 
-// Output sizes in bytes (8-byte value + 1-byte script length + script).
+// Size components in bytes. An output is an 8-byte value, a 1-byte script
+// length and the script.
 const (
 	puzzleOutputSize = 9 + 35 // OP_SHA256 <32B> OP_EQUAL
 	p2pkhOutputSize  = 9 + 25
 	changeOutputSize = 34
-	txOverheadSize   = 10 // version, input/output counts, lockTime
+	txFixedSize      = 8 // version + lockTime
+	leafInputCount   = 1
 )
 
-// LeafSizeBytes estimates a leaf split: one P2PKH input, n outputs, one change output.
+// varIntSize is the size of Bitcoin's CompactSize encoding of n.
+func varIntSize(n uint64) int {
+	switch {
+	case n < 0xfd:
+		return 1
+	case n <= 0xffff:
+		return 3
+	case n <= 0xffffffff:
+		return 5
+	default:
+		return 9
+	}
+}
+
+// LeafSizeBytes estimates a leaf split: one P2PKH input, SplitSize fuel
+// outputs and one change output, including the CompactSize input and output
+// counts (3 bytes once there are 253 or more outputs).
 func LeafSizeBytes(p pool.Config) int {
+	n := max(p.SplitSize, 0)
 	out := puzzleOutputSize
 	if p.LockMode == store.LockP2PKH {
 		out = p2pkhOutputSize
 	}
-	return txOverheadSize + fuel.P2PKHInputSize + p.SplitSize*out + changeOutputSize
+	return txFixedSize + varIntSize(leafInputCount) + varIntSize(uint64(n)+1) + //nolint:gosec // n >= 0
+		fuel.P2PKHInputSize + n*out + changeOutputSize
+}
+
+// leafOutputs is the fuel value one leaf split creates.
+func leafOutputs(p pool.Config) uint64 {
+	return uint64(max(p.SplitSize, 0)) * p.Denomination //nolint:gosec // non-negative
 }
 
 // LeafCost is what one leaf split needs from its funding chunk (outputs + fee);
@@ -240,14 +268,48 @@ func LeafCost(p pool.Config, satPerKB uint64) uint64 {
 	if satPerKB == 0 {
 		satPerKB = defaultLeafFeeSatPerKB
 	}
-	n := p.SplitSize
-	if n < 0 {
-		n = 0
-	}
-	return uint64(n)*p.Denomination + fuel.FeeSats(LeafSizeBytes(p), satPerKB) //nolint:gosec // n >= 0
+	return leafOutputs(p) + fuel.FeeSats(LeafSizeBytes(p), satPerKB)
 }
 
 // ChunkValue is the exact-denomination coin the toolbox keeps ready for leaves.
 func (c *Config) ChunkValue(p pool.Config, satPerKB uint64) uint64 {
 	return LeafCost(p, satPerKB) + c.Chunking.HeadroomSats
+}
+
+// redacted replaces secrets in String, GoString and LogValue output.
+const redacted = "[REDACTED]"
+
+// String renders the config with RootKeyHex and the postgres password
+// redacted, so a config printed with %v or %+v never leaks them.
+func (c Config) String() string {
+	c.RootKeyHex = redactIfSet(c.RootKeyHex)
+	c.Storage.Postgres.Password = redactIfSet(c.Storage.Postgres.Password)
+	type plain Config // no methods: avoids recursing into String
+	return fmt.Sprintf("%+v", plain(c))
+}
+
+// GoString is String for %#v.
+func (c Config) GoString() string { return c.String() }
+
+// LogValue redacts secrets in structured logs.
+func (c Config) LogValue() slog.Value { return slog.StringValue(c.String()) }
+
+// String renders the postgres config with the password redacted.
+func (p PostgresConfig) String() string {
+	p.Password = redactIfSet(p.Password)
+	type plain PostgresConfig
+	return fmt.Sprintf("%+v", plain(p))
+}
+
+// GoString is String for %#v.
+func (p PostgresConfig) GoString() string { return p.String() }
+
+// LogValue redacts the password in structured logs.
+func (p PostgresConfig) LogValue() slog.Value { return slog.StringValue(p.String()) }
+
+func redactIfSet(s string) string {
+	if s == "" {
+		return ""
+	}
+	return redacted
 }

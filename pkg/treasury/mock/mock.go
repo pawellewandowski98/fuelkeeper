@@ -25,6 +25,7 @@ type Treasury struct {
 	mu             sync.Mutex
 	built          map[chainhash.Hash]*treasury.BuiltShard
 	sent           map[chainhash.Hash]int // send count per txid
+	sendBEEF       map[chainhash.Hash][]byte
 	failBuild      error
 	failSend       error
 	failMinedBEEF  error
@@ -47,7 +48,7 @@ func WithOnSend(fn func(txid chainhash.Hash)) Option {
 
 // New returns an empty mock treasury.
 func New(opts ...Option) *Treasury {
-	t := &Treasury{built: map[chainhash.Hash]*treasury.BuiltShard{}, sent: map[chainhash.Hash]int{}}
+	t := &Treasury{built: map[chainhash.Hash]*treasury.BuiltShard{}, sent: map[chainhash.Hash]int{}, sendBEEF: map[chainhash.Hash][]byte{}}
 	for _, opt := range opts {
 		opt(t)
 	}
@@ -197,10 +198,17 @@ func cloneBytes(b []byte) []byte {
 	return out
 }
 
-// Send records a broadcast of a previously built split. On success, the
-// WithOnSend callback (if any) is invoked after the mutex is released, so it
-// may safely call back into the mock (e.g. from a timer) without deadlocking.
-func (t *Treasury) Send(_ context.Context, txid chainhash.Hash) error {
+// Send records a broadcast of a previously built split. beef, when non-nil,
+// must be a BEEF holding txid (the shard's stored BEEF); a malformed one is
+// an error and is not counted. On success, the WithOnSend callback (if any)
+// is invoked after the mutex is released, so it may safely call back into
+// the mock (e.g. from a timer) without deadlocking.
+func (t *Treasury) Send(_ context.Context, txid chainhash.Hash, beef []byte) error {
+	if beef != nil {
+		if _, err := fuel.RawTxFromBEEF(beef, txid); err != nil {
+			return fmt.Errorf("mock: send beef: %w", err)
+		}
+	}
 	t.mu.Lock()
 	if _, ok := t.built[txid]; !ok {
 		t.mu.Unlock()
@@ -212,12 +220,21 @@ func (t *Treasury) Send(_ context.Context, txid chainhash.Hash) error {
 		return err
 	}
 	t.sent[txid]++
+	t.sendBEEF[txid] = cloneBytes(beef)
 	fn := t.onSend
 	t.mu.Unlock()
 	if fn != nil {
 		fn(txid)
 	}
 	return nil
+}
+
+// LastSendBEEF returns the beef passed to the last successful Send of txid
+// (nil if none, or if that Send passed nil).
+func (t *Treasury) LastSendBEEF(txid chainhash.Hash) []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return cloneBytes(t.sendBEEF[txid])
 }
 
 // MinedBEEF returns a synthetic mined BEEF: a marker, the txid, the stored

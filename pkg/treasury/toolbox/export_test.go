@@ -1,26 +1,11 @@
 package toolbox
 
 import (
-	"time"
-
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
-)
 
-// BuiltLen reports how many built splits the core currently remembers.
-func (c *Core) BuiltLen() int { return c.builtLen() }
-
-// SetClock replaces the core's clock.
-func (c *Core) SetClock(now func() time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.now = now
-}
-
-// MaxBuilt and BuiltTTL expose the bounded-memory policy to tests.
-const (
-	MaxBuilt = maxBuilt
-	BuiltTTL = builtTTL
+	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 )
 
 // PoolKey exposes poolKey to tests.
@@ -28,9 +13,15 @@ func PoolKey(kd *sdk.KeyDeriver, poolName string) (*ec.PrivateKey, error) {
 	return poolKey(kd, poolName)
 }
 
-// SetMaxBuilt overrides the built-map cap (tests use a small one).
-func (c *Core) SetMaxBuilt(n int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.maxBuilt = n
+// VerifySplit exposes verifySplit to tests.
+func VerifySplit(raw []byte, txid chainhash.Hash, want []sdk.CreateActionOutput) error {
+	return verifySplit(raw, txid, want)
+}
+
+// SetValidatePutShard replaces the shard validation Build runs and returns a
+// restore func.
+func SetValidatePutShard(fn func(store.Shard, []store.Row) error) (restore func()) {
+	old := validatePutShard
+	validatePutShard = fn
+	return func() { validatePutShard = old }
 }

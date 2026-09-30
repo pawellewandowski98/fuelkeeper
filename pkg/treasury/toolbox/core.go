@@ -8,56 +8,56 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
+	"github.com/bsv-blockchain/go-wallet-toolbox/pkg/brc29"
 	pkgerrors "github.com/bsv-blockchain/go-wallet-toolbox/pkg/errors"
 	"github.com/bsv-blockchain/go-wallet-toolbox/pkg/wdk"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/fuel"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/treasury"
 )
 
-// Bounded-memory policy for the built-split map (see Core.prune).
-const (
-	// builtTTL is how long a sent split stays known for idempotent rebroadcast.
-	builtTTL = time.Hour
-	// maxBuilt caps the map; beyond it the oldest sent splits go first, then
-	// the oldest unsent ones.
-	maxBuilt = 10_000
-)
-
 // maxFundingBEEF caps the atomic BEEF a funding request may carry.
 const maxFundingBEEF = 4 << 20
+
+// abortTimeout bounds a best-effort abort that runs after the caller's
+// context may already be done.
+const abortTimeout = 30 * time.Second
+
+// splitLabel marks every split transaction in the wallet; Reconcile lists by it.
+const splitLabel = "fuel-split"
+
+// reconcilePageSize is the ListActions page size Reconcile uses (the toolbox
+// caps it at 10000).
+const reconcilePageSize = 1000
 
 // errSplitMismatch is returned when the wallet's split does not carry exactly
 // the requested fuel outputs, in order, at its leading vouts.
 var errSplitMismatch = errors.New("treasury: split outputs do not match request")
 
-// builtInfo is what Send needs to know about a split this core built.
-type builtInfo struct {
-	pool    string
-	beef    []byte
-	builtAt time.Time
-	sent    bool
-	sentAt  time.Time
-}
+// errWalletDidNotPost is returned by Send when the wallet reports it did not
+// post the split (it could not claim it, or reports it failed). It is
+// transient: the split must not be posted around the wallet, whose claim gate
+// may be refusing because it released the split's inputs.
+var errWalletDidNotPost = errors.New("treasury: wallet did not post the split")
 
 // Core is the network-free part of the toolbox treasury. It is safe for
-// concurrent use.
+// concurrent use and keeps no per-split state: the wallet remembers every
+// split it built (as a no-send action) across restarts, so Send asks the
+// wallet first every time.
 //
-// Core remembers the splits it built so Send can tell a first send (through
-// the wallet, which owns the no-send transaction) from a rebroadcast (through
-// the Broadcaster). That memory is bounded: a sent split is forgotten
-// builtTTL after its first successful send, and the map never holds more than
-// maxBuilt entries (oldest sent evicted first, then oldest unsent). Send for a
-// forgotten split returns treasury.ErrUnknownTx; the watcher then falls back
-// to rebroadcasting from the shard BEEF held in the store.
+// After a restart, Send for a split recorded in the store goes to the wallet
+// as usual: a no-send split is claimed and posted, a split the wallet already
+// posted comes back "unproven" and is re-posted from the caller's BEEF. A
+// split the store never recorded (a crash between Build and PutShard) is
+// found and aborted by Reconcile, which must run before the minter starts.
 type Core struct {
 	w      WalletAPI
 	bc     Broadcaster
@@ -65,13 +65,11 @@ type Core struct {
 	nonces Nonces
 	kd     *sdk.KeyDeriver
 	cfg    Config
-	feeKB  uint64
 	log    *slog.Logger
 
-	mu       sync.Mutex
-	built    map[chainhash.Hash]*builtInfo
-	now      func() time.Time
-	maxBuilt int
+	// sends collapses concurrent Sends of one txid (the minter and the
+	// watcher can race) into one wallet call; every caller gets its result.
+	sends singleflight.Group
 }
 
 var (
@@ -79,23 +77,24 @@ var (
 	_ treasury.Funder   = (*Core)(nil)
 )
 
-// NewCore returns a treasury core over w. bc (rebroadcasts) and keeper (chunk
-// maintenance) may be nil; log nil discards.
-func NewCore(w WalletAPI, bc Broadcaster, keeper ChunkKeeper, nonces Nonces, kd *sdk.KeyDeriver, cfg Config, feeSatPerKB uint64, log *slog.Logger) *Core {
+// NewCore returns a treasury core over w. bc (re-posts) and keeper (chunk
+// maintenance) may be nil; log nil discards. kd must derive from the wallet's
+// root key: it presigns P2PKH fuel and checks BRC-29 payments.
+func NewCore(w WalletAPI, bc Broadcaster, keeper ChunkKeeper, nonces Nonces, kd *sdk.KeyDeriver, cfg Config, log *slog.Logger) *Core {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Core{
-		w: w, bc: bc, keeper: keeper, nonces: nonces, kd: kd, cfg: cfg, feeKB: feeSatPerKB, log: log,
-		built:    map[chainhash.Hash]*builtInfo{},
-		now:      time.Now,
-		maxBuilt: maxBuilt,
-	}
+	return &Core{w: w, bc: bc, keeper: keeper, nonces: nonces, kd: kd, cfg: cfg, log: log}
 }
 
 // Build creates and signs a split with the wallet (NoSend) and returns its
-// shard and rows. The rows' unlocking scripts are bearer secrets and are never
-// logged.
+// shard and rows. Any failure after the wallet created the split aborts it,
+// so its inputs return to the wallet and it can never be broadcast. The rows'
+// unlocking scripts are bearer secrets and are never logged.
+//
+// The pool name is used verbatim in the "pool:<name>" label; the toolbox
+// does not normalise labels, and pool names are unique, so labels of
+// different pools never collide. The label is informational only.
 func (c *Core) Build(ctx context.Context, req treasury.MintRequest) (*treasury.BuiltShard, error) {
 	if err := req.Validate(); err != nil {
 		return nil, err
@@ -132,7 +131,7 @@ func (c *Core) Build(ctx context.Context, req treasury.MintRequest) (*treasury.B
 	res, err := c.w.CreateAction(ctx, sdk.CreateActionArgs{
 		Description: "fuel split " + req.Pool,
 		Outputs:     outputs,
-		Labels:      []string{"fuelkeeper", "fuel-split", "pool:" + req.Pool},
+		Labels:      []string{"fuelkeeper", splitLabel, "pool:" + req.Pool},
 		Options:     &sdk.CreateActionOptions{NoSend: &yes, RandomizeOutputs: &no, AcceptDelayedBroadcast: &no},
 	}, c.cfg.Originator)
 	if err != nil {
@@ -141,16 +140,23 @@ func (c *Core) Build(ctx context.Context, req treasury.MintRequest) (*treasury.B
 		}
 		return nil, fmt.Errorf("treasury: create split: %w", err)
 	}
-	if res == nil || res.Txid == (chainhash.Hash{}) || len(res.Tx) == 0 {
+	if res == nil || res.Txid == (chainhash.Hash{}) {
 		return nil, errors.New("treasury: create split: wallet returned no transaction")
 	}
 	txid := res.Txid
-	raw, err := fuel.RawTxFromBEEF(res.Tx, txid)
+	fail := func(err error) (*treasury.BuiltShard, error) {
+		c.abort(ctx, txid, err)
+		return nil, err
+	}
+	if len(res.Tx) == 0 {
+		return fail(errors.New("treasury: create split: wallet returned no BEEF"))
+	}
+	beef, raw, err := splitBEEF(res.Tx, txid)
 	if err != nil {
-		return nil, fmt.Errorf("treasury: split beef: %w", err)
+		return fail(err)
 	}
 	if err := verifySplit(raw, txid, outputs); err != nil {
-		return nil, err
+		return fail(err)
 	}
 
 	rows := make([]store.Row, req.Count)
@@ -160,7 +166,7 @@ func (c *Core) Build(ctx context.Context, req treasury.MintRequest) (*treasury.B
 		if req.LockMode == store.LockPuzzle {
 			unlock = fuel.PuzzleUnlock(fuel.Preimage(seed, vout))
 		} else if unlock, err = fuel.P2PKHPresign(key, txid, vout, lock, req.Denomination); err != nil {
-			return nil, fmt.Errorf("treasury: presign vout %d: %w", vout, err)
+			return fail(fmt.Errorf("treasury: presign vout %d: %w", vout, err))
 		}
 		rows[i] = store.Row{
 			Outpoint:        store.Outpoint{TxID: txid, Vout: vout},
@@ -178,18 +184,59 @@ func (c *Core) Build(ctx context.Context, req treasury.MintRequest) (*treasury.B
 		Denomination: req.Denomination,
 		LockMode:     req.LockMode,
 		Status:       store.ShardUnmined,
-		BEEF:         res.Tx,
+		BEEF:         beef,
 	}
-	if err := store.ValidatePutShard(shard, rows); err != nil {
-		return nil, fmt.Errorf("treasury: built shard: %w", err)
+	if err := validatePutShard(shard, rows); err != nil {
+		return fail(fmt.Errorf("treasury: built shard: %w", err))
 	}
-
-	c.mu.Lock()
-	c.built[txid] = &builtInfo{pool: req.Pool, beef: res.Tx, builtAt: c.now()}
-	c.pruneLocked()
-	c.mu.Unlock()
 	c.log.Info("fuel split built", "pool", req.Pool, "txid", txid.String(), "count", req.Count, "lock_mode", req.LockMode.String())
 	return &treasury.BuiltShard{Shard: shard, Rows: rows, RawTx: raw}, nil
+}
+
+// validatePutShard is store.ValidatePutShard, replaceable by tests.
+var validatePutShard = store.ValidatePutShard
+
+// splitBEEF parses the wallet's (atomic) BEEF, requires it to be valid with
+// full ancestry (go-sdk v1.4.1 transaction/beef.go:967 IsValid(false) rejects
+// txid-only entries and inputs that do not trace to a BUMP, :1177-1189), and
+// returns it re-serialised as plain BEEF v2 (the format fuel.MinedBEEF emits,
+// so unmined and mined shards share one wire format) plus txid's raw bytes.
+func splitBEEF(walletBEEF []byte, txid chainhash.Hash) (beef, raw []byte, err error) {
+	b, err := transaction.NewBeefFromBytes(walletBEEF)
+	if err != nil {
+		return nil, nil, fmt.Errorf("treasury: split beef: %w", err)
+	}
+	if !b.IsValid(false) {
+		return nil, nil, errors.New("treasury: split beef is not valid (missing or txid-only ancestry)")
+	}
+	btx := b.FindTransaction(txid.String())
+	if btx == nil {
+		return nil, nil, fmt.Errorf("treasury: split beef: %w", fuel.ErrTxNotInBEEF)
+	}
+	b.Version = transaction.BEEF_V2
+	if beef, err = b.Bytes(); err != nil {
+		return nil, nil, fmt.Errorf("treasury: serialise split beef: %w", err)
+	}
+	return beef, btx.Bytes(), nil
+}
+
+// abort releases a split the wallet created but Build could not complete,
+// best-effort, even if ctx is already done: a split without a shard record
+// must never reach the chain (its puzzle seed lives only in memory), and its
+// inputs should go back to the wallet. The toolbox accepts the hex txid as
+// the reference (storage/internal/actions/abort.go:63-73).
+func (c *Core) abort(ctx context.Context, txid chainhash.Hash, cause error) {
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abortTimeout)
+	defer cancel()
+	res, err := c.w.AbortAction(actx, sdk.AbortActionArgs{Reference: []byte(txid.String())}, c.cfg.Originator)
+	switch {
+	case err != nil:
+		c.log.Error("abort failed split", "txid", txid.String(), "cause", cause, "err", err)
+	case res == nil || !res.Aborted:
+		c.log.Error("abort failed split: wallet did not abort", "txid", txid.String(), "cause", cause)
+	default:
+		c.log.Warn("aborted failed split", "txid", txid.String(), "cause", cause)
+	}
 }
 
 // verifySplit checks that raw is txid and its leading len(want) outputs are
@@ -226,59 +273,107 @@ func isInsufficientFunds(err error) bool {
 	return strings.Contains(msg, "not enough funds") || strings.Contains(msg, "insufficient") || strings.Contains(msg, "contention")
 }
 
-// Send broadcasts a split this core built. The first successful call goes
-// through the wallet (SendWith), which owns the no-send transaction; later
-// calls rebroadcast the stored BEEF through the Broadcaster (nil: no-op). A
-// failed first send is not recorded, so a retry goes through the wallet
-// again. A Broadcaster that knows a rebroadcast was terminally rejected
-// should return an error wrapping treasury.ErrRejected.
-func (c *Core) Send(ctx context.Context, txid chainhash.Hash) error {
-	c.mu.Lock()
-	info, ok := c.built[txid]
-	if !ok {
-		c.mu.Unlock()
-		return treasury.ErrUnknownTx
-	}
-	sent, beef, poolName := info.sent, info.beef, info.pool
-	c.mu.Unlock()
+// Send broadcasts a split. It always asks the wallet first (createAction
+// with SendWith = [txid], not delayed), because the wallet owns the split's
+// broadcast state (go-wallet-toolbox v0.184.16
+// storage/internal/actions/process.go):
+//
+//   - a no-send (or previously failed-to-post) split is claimed and posted
+//     (:547-602); the wallet reports "unproven" once the network took it;
+//   - a split the wallet already posted comes back "unproven" without a post
+//     (:469-477, :654-693); Send then re-posts beef through the Broadcaster,
+//     which is the watcher's rebroadcast;
+//   - "sending", "failed" or no result for txid is transient, and the split
+//     is never posted around the wallet: the claim gate can legitimately
+//     refuse (:558-573), e.g. after an abort released the inputs, and a post
+//     then would be a double spend (internal/storage/repo/known_tx.go:140-148);
+//   - a wallet with no record of txid (:1090, :665) gets beef posted directly
+//     when the caller supplied it, else treasury.ErrUnknownTx.
+//
+// Only a *ProcessActionError whose review for txid is doubleSpend or
+// invalidTx returns treasury.ErrRejected. With a nil beef, Send skips every
+// direct post. Concurrent Sends of one txid share one wallet call (and the
+// first caller's ctx).
+func (c *Core) Send(ctx context.Context, txid chainhash.Hash, beef []byte) error {
+	_, err, _ := c.sends.Do(txid.String(), func() (any, error) {
+		return nil, c.send(ctx, txid, beef)
+	})
+	return err
+}
 
-	if sent {
-		if c.bc == nil {
-			return nil
-		}
-		if err := c.bc.PostBEEF(ctx, beef, txid.String()); err != nil {
-			return fmt.Errorf("treasury: rebroadcast split: %w", err)
-		}
-		return nil
-	}
-
+func (c *Core) send(ctx context.Context, txid chainhash.Hash, beef []byte) error {
 	no := false
-	_, err := c.w.CreateAction(ctx, sdk.CreateActionArgs{
+	res, err := c.w.CreateAction(ctx, sdk.CreateActionArgs{
 		Description: "send fuel split",
 		Options:     &sdk.CreateActionOptions{SendWith: []chainhash.Hash{txid}, AcceptDelayedBroadcast: &no},
 	}, c.cfg.Originator)
 	if err != nil {
+		if unknownToWallet(err, txid) {
+			return c.postUnknown(ctx, txid, beef, err)
+		}
 		return classifySendError(ctx, err, txid)
 	}
-	c.mu.Lock()
-	if info, ok := c.built[txid]; ok && !info.sent {
-		info.sent = true
-		info.sentAt = c.now()
+	status, found := sendWithStatus(res, txid)
+	switch {
+	case found && status == sdk.ActionResultStatusUnproven:
+		if len(beef) > 0 && c.bc != nil {
+			if err := c.bc.PostBEEF(ctx, beef, txid.String()); err != nil {
+				return fmt.Errorf("treasury: rebroadcast split: %w", err)
+			}
+		}
+		c.log.Info("fuel split sent", "txid", txid.String())
+		return nil
+	case found && status == sdk.ActionResultStatusSending:
+		return fmt.Errorf("treasury: send split: wallet still sending %s", txid)
+	case found:
+		return fmt.Errorf("%w: %s reported %q", errWalletDidNotPost, txid, status)
+	default:
+		return fmt.Errorf("%w: no result for %s", errWalletDidNotPost, txid)
 	}
-	c.pruneLocked()
-	c.mu.Unlock()
-	c.log.Info("fuel split sent", "pool", poolName, "txid", txid.String())
+}
+
+// postUnknown posts beef for a split the wallet has no record of.
+func (c *Core) postUnknown(ctx context.Context, txid chainhash.Hash, beef []byte, walletErr error) error {
+	if len(beef) == 0 || c.bc == nil {
+		return fmt.Errorf("%w: wallet has no record of %s: %w", treasury.ErrUnknownTx, txid, walletErr)
+	}
+	if err := c.bc.PostBEEF(ctx, beef, txid.String()); err != nil {
+		return fmt.Errorf("treasury: post split unknown to wallet: %w", err)
+	}
+	c.log.Warn("posted split the wallet has no record of", "txid", txid.String())
 	return nil
 }
 
-// classifySendError maps a SendWith failure: a terminal network rejection of
-// txid wraps treasury.ErrRejected (the minter and watcher then retire the
-// shard); anything else is transient.
-//
-// The toolbox reports every non-successful undelayed broadcast as a
-// *ProcessActionError, including transient service errors. Only its review
-// statuses doubleSpend and invalidTx are terminal; a serviceError (or no
-// review at all) must not retire a shard whose split may still be mined.
+// sendWithStatus finds txid's status in a SendWith result.
+func sendWithStatus(res *sdk.CreateActionResult, txid chainhash.Hash) (sdk.ActionResultStatus, bool) {
+	if res == nil {
+		return "", false
+	}
+	for _, r := range res.SendWithResults {
+		if r.Txid == txid {
+			return r.Status, true
+		}
+	}
+	return "", false
+}
+
+// unknownToWallet reports whether a SendWith error says the wallet has no
+// broadcast record of txid. The toolbox reports it only as text:
+// "known tx status for txID <txid> not found" (process.go:1090) and
+// "transaction status not found for txID <txid>" (process.go:665).
+func unknownToWallet(err error, txid chainhash.Hash) bool {
+	msg := strings.ToLower(err.Error())
+	id := txid.String()
+	return strings.Contains(msg, "known tx status for txid "+id+" not found") ||
+		strings.Contains(msg, "transaction status not found for txid "+id)
+}
+
+// classifySendError maps a SendWith failure: only a *ProcessActionError
+// whose review of txid is doubleSpend or invalidTx is a terminal network
+// rejection (treasury.ErrRejected: the minter and watcher retire the shard).
+// Everything else - service errors, reviews of other transactions,
+// unstructured errors - is transient, because retiring a shard whose split
+// may still be mined strands its fuel.
 func classifySendError(ctx context.Context, err error, txid chainhash.Hash) error {
 	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("treasury: send split: %w", err)
@@ -287,70 +382,98 @@ func classifySendError(ctx context.Context, err error, txid chainhash.Hash) erro
 	if errors.As(err, &perr) {
 		id := txid.String()
 		for _, r := range perr.ReviewResults {
-			if r.TxID != "" && string(r.TxID) != id {
+			if string(r.TxID) != id {
 				continue
 			}
 			if r.Status == wdk.ReviewActionResultStatusDoubleSpend || r.Status == wdk.ReviewActionResultStatusInvalidTx {
 				return fmt.Errorf("%w: %w", treasury.ErrRejected, err)
 			}
 		}
-		return fmt.Errorf("treasury: send split: %w", err)
-	}
-	msg := strings.ToLower(err.Error())
-	for _, s := range rejectionPhrases {
-		if strings.Contains(msg, s) {
-			return fmt.Errorf("%w: %w", treasury.ErrRejected, err)
-		}
 	}
 	return fmt.Errorf("treasury: send split: %w", err)
 }
 
-// rejectionPhrases identify a terminal rejection in an unstructured error.
-// "invalid" alone is deliberately absent: the toolbox also says "invalid" for
-// argument validation, which is not a network verdict on the split.
-var rejectionPhrases = []string{
-	"double spend", "double-spend", "doublespend",
-	"rejected", "malformed",
-	"invalid tx", "invalid transaction", "invalidtx",
+// ReconcileReport is what Reconcile did.
+type ReconcileReport struct {
+	// Resent are no-send splits the store knows, handed to Send.
+	Resent []chainhash.Hash
+	// Aborted are no-send splits the store does not know, aborted.
+	Aborted []chainhash.Hash
+	// Errors holds the per-split failures (the split is in neither list).
+	Errors map[chainhash.Hash]error
 }
 
-// pruneLocked applies the bounded-memory policy. c.mu must be held.
-func (c *Core) pruneLocked() {
-	now := c.now()
-	for id, b := range c.built {
-		if b.sent && now.Sub(b.sentAt) > builtTTL {
-			delete(c.built, id)
+// Reconcile finds splits the wallet holds as no-send (built but never sent:
+// a crash between Build, PutShard and Send) and settles each one. A split
+// known to the store (known(txid)) is sent with Send(ctx, txid, nil): a
+// no-send split is claimed and posted by the wallet itself, so no BEEF is
+// needed. An unknown split is aborted: its puzzle seed lived only in the
+// crashed process's memory, so it must never reach the chain.
+//
+// Reconcile must run before the minter starts: a split built concurrently is
+// no-send and unknown to the store until its PutShard, and would be aborted.
+// Per-split failures are collected in the report; only a listing failure
+// returns an error.
+func (c *Core) Reconcile(ctx context.Context, known func(chainhash.Hash) bool) (ReconcileReport, error) {
+	rep := ReconcileReport{Errors: map[chainhash.Hash]error{}}
+	pending, err := c.noSendSplits(ctx)
+	if err != nil {
+		return rep, err
+	}
+	for _, txid := range pending {
+		if known(txid) {
+			if err := c.Send(ctx, txid, nil); err != nil {
+				rep.Errors[txid] = err
+				continue
+			}
+			rep.Resent = append(rep.Resent, txid)
+			continue
+		}
+		res, err := c.w.AbortAction(ctx, sdk.AbortActionArgs{Reference: []byte(txid.String())}, c.cfg.Originator)
+		switch {
+		case err != nil:
+			rep.Errors[txid] = fmt.Errorf("treasury: abort unrecorded split: %w", err)
+		case res == nil || !res.Aborted:
+			rep.Errors[txid] = errors.New("treasury: abort unrecorded split: wallet did not abort")
+		default:
+			rep.Aborted = append(rep.Aborted, txid)
 		}
 	}
-	for len(c.built) > c.maxBuilt {
-		var (
-			victim    chainhash.Hash
-			found     bool
-			vSent     bool
-			vAt       time.Time
-			candidate = func(id chainhash.Hash, sent bool, at time.Time) {
-				switch {
-				case !found, sent && !vSent, sent == vSent && at.Before(vAt):
-					victim, found, vSent, vAt = id, true, sent, at
-				}
-			}
-		)
-		for id, b := range c.built {
-			if b.sent {
-				candidate(id, true, b.sentAt)
-			} else {
-				candidate(id, false, b.builtAt)
-			}
-		}
-		delete(c.built, victim)
-	}
+	c.log.Info("treasury reconciled", "resent", len(rep.Resent), "aborted", len(rep.Aborted), "errors", len(rep.Errors))
+	return rep, nil
 }
 
-// builtLen reports how many splits the core remembers.
-func (c *Core) builtLen() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.built)
+// noSendSplits lists every split action in status nosend. The whole listing
+// is collected before anything is acted on, so aborts cannot shift the pages.
+// The toolbox's ListActions includes nosend actions
+// (storage/internal/actions/list_actions_mapping.go:42-45).
+func (c *Core) noSendSplits(ctx context.Context) ([]chainhash.Hash, error) {
+	var out []chainhash.Hash
+	limit := uint32(reconcilePageSize)
+	for offset := uint32(0); ; {
+		off := offset
+		res, err := c.w.ListActions(ctx, sdk.ListActionsArgs{
+			Labels:         []string{splitLabel},
+			LabelQueryMode: sdk.QueryModeAny,
+			Limit:          &limit,
+			Offset:         &off,
+		}, c.cfg.Originator)
+		if err != nil {
+			return nil, fmt.Errorf("treasury: list splits: %w", err)
+		}
+		if res == nil {
+			return nil, errors.New("treasury: list splits: wallet returned nothing")
+		}
+		for _, a := range res.Actions {
+			if a.Status == sdk.ActionStatusNoSend {
+				out = append(out, a.Txid)
+			}
+		}
+		offset += uint32(len(res.Actions)) //nolint:gosec // a page is at most limit entries
+		if len(res.Actions) == 0 || offset >= res.TotalActions {
+			return out, nil
+		}
+	}
 }
 
 // MinedBEEF converts a shard's unmined BEEF and the oracle's BUMP into the
@@ -388,9 +511,11 @@ func badFunding(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", treasury.ErrBadFunding, fmt.Sprintf(format, args...))
 }
 
-// Internalize accepts a BRC-29 payment into the treasury wallet. Malformed or
-// unverifiable requests return treasury.ErrBadFunding; a wallet failure does
-// not (it is the server's problem, not the payer's).
+// Internalize accepts a BRC-29 payment into the treasury wallet. Everything
+// the payer controls is checked first and returns treasury.ErrBadFunding
+// (including an output that does not pay the treasury's BRC-29 script for the
+// given prefix, suffix and sender); a wallet failure or an unavailable nonce
+// check does not (it is the server's problem, not the payer's).
 func (c *Core) Internalize(ctx context.Context, req treasury.FundRequest) (treasury.FundResult, error) {
 	if len(req.AtomicBEEF) > maxFundingBEEF {
 		return treasury.FundResult{}, badFunding("atomic BEEF is %d bytes, max %d", len(req.AtomicBEEF), maxFundingBEEF)
@@ -401,20 +526,20 @@ func (c *Core) Internalize(ctx context.Context, req treasury.FundRequest) (treas
 	if req.OutputIndex < 0 {
 		return treasury.FundResult{}, badFunding("output index %d is negative", req.OutputIndex)
 	}
+	prefix, err := base64.StdEncoding.DecodeString(req.DerivationPrefixB64)
+	if err != nil || len(prefix) == 0 {
+		return treasury.FundResult{}, badFunding("derivation prefix must be non-empty standard base64")
+	}
 	ok, err := c.nonces.Verify(ctx, req.DerivationPrefixB64)
 	if err != nil {
-		return treasury.FundResult{}, fmt.Errorf("%w: verify derivation prefix: %w", treasury.ErrBadFunding, err)
+		return treasury.FundResult{}, fmt.Errorf("treasury: verify derivation prefix: %w", err)
 	}
 	if !ok {
 		return treasury.FundResult{}, badFunding("unknown derivation prefix")
 	}
-	prefix, err := base64.StdEncoding.DecodeString(req.DerivationPrefixB64)
-	if err != nil || len(prefix) == 0 {
-		return treasury.FundResult{}, badFunding("derivation prefix is not base64")
-	}
 	suffix, err := base64.StdEncoding.DecodeString(req.DerivationSuffixB64)
 	if err != nil || len(suffix) == 0 {
-		return treasury.FundResult{}, badFunding("derivation suffix must be non-empty base64")
+		return treasury.FundResult{}, badFunding("derivation suffix must be non-empty standard base64")
 	}
 	sender, err := ec.PublicKeyFromString(req.SenderIdentityKeyHex)
 	if err != nil {
@@ -435,6 +560,21 @@ func (c *Core) Internalize(ctx context.Context, req treasury.FundRequest) (treas
 	if req.OutputIndex >= len(tx.Outputs) {
 		return treasury.FundResult{}, badFunding("output index %d out of range (tx has %d outputs)", req.OutputIndex, len(tx.Outputs))
 	}
+	out := tx.Outputs[req.OutputIndex]
+	// The same check the wallet makes (go-wallet-toolbox v0.184.16
+	// pkg/internal/validate/validate_internalize_action_args.go:76-93), with
+	// the same key id: the std-base64 prefix and suffix
+	// (pkg/wallet/internal/mapping/mapping_internalize_action.go:54,60-63).
+	want, err := brc29.LockForSelf(sender, brc29.KeyID{
+		DerivationPrefix: base64.StdEncoding.EncodeToString(prefix),
+		DerivationSuffix: base64.StdEncoding.EncodeToString(suffix),
+	}, c.kd)
+	if err != nil {
+		return treasury.FundResult{}, fmt.Errorf("treasury: expected payment script: %w", err)
+	}
+	if out.LockingScript == nil || !bytes.Equal(*out.LockingScript, *want) {
+		return treasury.FundResult{}, badFunding("output %d does not pay the treasury's BRC-29 script for this prefix, suffix and sender", req.OutputIndex)
+	}
 	res, err := c.w.InternalizeAction(ctx, sdk.InternalizeActionArgs{
 		Tx:          req.AtomicBEEF,
 		Description: "fuelkeeper funding",
@@ -451,7 +591,6 @@ func (c *Core) Internalize(ctx context.Context, req treasury.FundRequest) (treas
 	if res == nil || !res.Accepted {
 		return treasury.FundResult{}, errors.New("treasury: internalize: wallet did not accept the payment")
 	}
-	sats := tx.Outputs[req.OutputIndex].Satoshis
-	c.log.Info("treasury funded", "txid", txid.String(), "vout", req.OutputIndex, "satoshis", sats)
-	return treasury.FundResult{TxID: txid.String(), Satoshis: sats}, nil
+	c.log.Info("treasury funded", "txid", txid.String(), "vout", req.OutputIndex, "satoshis", out.Satoshis)
+	return treasury.FundResult{TxID: txid.String(), Satoshis: out.Satoshis}, nil
 }

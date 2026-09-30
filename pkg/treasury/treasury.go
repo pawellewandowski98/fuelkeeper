@@ -65,9 +65,13 @@ type BuiltShard struct {
 type Treasury interface {
 	// Build creates and signs a split without broadcasting it.
 	Build(ctx context.Context, req MintRequest) (*BuiltShard, error)
-	// Send broadcasts a previously built split. It is idempotent; a terminal
-	// network rejection returns ErrRejected.
-	Send(ctx context.Context, txid chainhash.Hash) error
+	// Send broadcasts a previously built split. beef is the shard's stored
+	// BEEF (store.Shard.BEEF) and may be nil when the caller does not have it;
+	// a treasury uses it only to re-post a split its wallet no longer
+	// broadcasts itself. Send is idempotent and safe to call again after a
+	// restart; a terminal network rejection returns ErrRejected, and a split
+	// the treasury has no record of returns ErrUnknownTx.
+	Send(ctx context.Context, txid chainhash.Hash, beef []byte) error
 	// MinedBEEF converts a shard's stored unmined BEEF plus the BUMP reported by
 	// the oracle into the compact mined BEEF (split tx + BUMP).
 	MinedBEEF(ctx context.Context, txid chainhash.Hash, unminedBEEF, merklePath []byte) ([]byte, error)

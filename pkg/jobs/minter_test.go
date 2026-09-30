@@ -90,6 +90,9 @@ func TestMinterFillsToTargetAndStops(t *testing.T) {
 	require.Len(t, all, 5)
 	for _, sh := range all {
 		assert.True(t, tr.Sent(sh.TxID), "every recorded shard was sent")
+		full, err := st.GetShard(ctx, "main", sh.TxID)
+		require.NoError(t, err)
+		assert.Equal(t, full.BEEF, tr.LastSendBEEF(sh.TxID), "the minter sends with the recorded shard's BEEF")
 	}
 }
 
