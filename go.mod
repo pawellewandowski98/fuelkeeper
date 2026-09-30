@@ -3,13 +3,16 @@ module github.com/bsv-blockchain/fuelkeeper
 go 1.26.3
 
 require (
+	github.com/HdrHistogram/hdrhistogram-go v1.3.0
 	github.com/bsv-blockchain/go-chaintracks v1.2.11
 	github.com/bsv-blockchain/go-sdk v1.4.1
 	github.com/bsv-blockchain/go-wallet-toolbox v0.184.16
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/sync v0.22.0
+	golang.org/x/time v0.15.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.59.0
 )
@@ -191,7 +194,6 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/polydawn/refmt v0.90.0 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
@@ -252,7 +254,6 @@ require (
 	golang.org/x/telemetry v0.0.0-20260819180204-f79da969f323 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
-	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.49.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect
