@@ -163,3 +163,27 @@ func TestMockOracleTxStatusInputsAreCopied(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, got.Inputs, "nil Inputs stays nil")
 }
+
+// TestMockOracleTxStatusRejectReasonRoundTrips pins that RejectReason, a
+// scalar field on TxStatus, survives SetTx/Tx unchanged for every value,
+// including the zero value (RejectReasonUnknown) on a rejected verdict.
+func TestMockOracleTxStatusRejectReasonRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	m := oracle.NewMock()
+
+	tests := []oracle.RejectReason{
+		oracle.RejectReasonUnknown,
+		oracle.RejectReasonTxInvalid,
+		oracle.RejectReasonInputsSpent,
+	}
+	for _, reason := range tests {
+		t.Run(reason.String(), func(t *testing.T) {
+			txid := storetest.NewTxID()
+			m.SetTx(txid, oracle.TxStatus{Known: true, Rejected: true, RejectReason: reason})
+			got, err := m.Tx(ctx, txid)
+			require.NoError(t, err)
+			assert.True(t, got.Rejected)
+			assert.Equal(t, reason, got.RejectReason)
+		})
+	}
+}

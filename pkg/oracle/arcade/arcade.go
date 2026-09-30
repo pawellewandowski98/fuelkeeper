@@ -53,12 +53,114 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 		Known:        true,
 		Mined:        st.Mined(),
 		Rejected:     st.Rejected(),
+		RejectReason: rejectReasonForCode(st.Status),
 		Status:       st.TxStatus,
 		BlockHeight:  st.BlockHeight,
 		MerklePath:   st.MerklePathBytes(),
 		CompetingTxs: st.CompetingTxs,
 		Inputs:       nil,
 	}, nil
+}
+
+// rejectReasonForCode maps arcadeclient.TxStatus.Status — the numeric ARC
+// error code (460-476 taxonomy) arcade records with a REJECTED verdict when
+// the failure is classifiable — to an oracle.RejectReason. It is meaningful
+// only when the verdict is Rejected; DOUBLE_SPEND_ATTEMPTED is a distinct,
+// non-Rejected txStatus. Tx still populates CompetingTxs for it, but
+// Status/RejectReason carry no meaning there; the reaper is expected to
+// check CompetingTxs first.
+//
+// The table (and the titles/details quoted below) is arcade's own taxonomy:
+// /git/arcade/errors/errors.go NewErrorFields, cross-checked against how
+// arcade's validator and propagator actually assign each code.
+//
+//	460 StatusTxFormat            "Not extended format" / "Missing input
+//	                              scripts: Transaction could not be
+//	                              transformed to extended format" — a
+//	                              format problem with the bytes, not the
+//	                              inputs' spend state.            → TxInvalid
+//	461 StatusUnlockingScripts    "Malformed transaction" / "Transaction
+//	                              unlocking scripts are invalid" — script
+//	                              failure.                        → TxInvalid
+//	462 StatusInputs              "Invalid inputs" / "Transaction is
+//	                              invalid because the inputs are
+//	                              non-existent or spent" — exactly the
+//	                              missing/already-spent-input case.
+//	                              (validator/errmap.go:58 maps coinbase and
+//	                              "bad-txns-inputs-too-large" errors here.)
+//	                                                               → InputsSpent
+//	463 StatusMalformed           "Malformed transaction" / "Transaction is
+//	                              malformed and cannot be processed".
+//	                                                               → TxInvalid
+//	464 StatusOutputs             "Invalid outputs" / "Transaction is
+//	                              invalid because the outputs are
+//	                              non-existent or invalid" — the outputs,
+//	                              not the spent-ness of the inputs.
+//	                                                               → TxInvalid
+//	465 StatusFees                "Fee too low" / "Transaction fee is too
+//	                              low".                            → TxInvalid
+//	466 StatusConflict            "Conflicting tx found" / "Transaction is
+//	                              valid, but there is a conflicting tx in
+//	                              the block template" — a double-spend: the
+//	                              input is owned by a competing/confirmed
+//	                              tx. propagator.go:1812 confirms this is
+//	                              the double-spend-attempted / input-
+//	                              already-spent classification.
+//	                                                               → InputsSpent
+//	467 StatusGeneric             "Generic error" / "Transaction could not
+//	                              be processed" — propagator.go:1818
+//	                              documents this as TX_INVALID wrapping
+//	                              fee/script/policy failures (the name
+//	                              alone can't recover which), never a
+//	                              spent-input verdict.             → TxInvalid
+//	468 StatusBeefInvalid         "Invalid BEEF" / "BEEF validation failed:
+//	                              BEEF invalid" — envelope format.
+//	                                                               → TxInvalid
+//	469 StatusMerkleRoots         "Merkle Roots validation failed" / "BEEF
+//	                              validation failed: couldn't verify Merkle
+//	                              Roots" — envelope format.        → TxInvalid
+//	470 (unassigned)              Not in arcade's StatusCode const block
+//	                              (errors.go jumps 469 -> 471); no meaning
+//	                              to classify.                     → Unknown
+//	471 StatusFrozenPolicy        "Input Frozen" / "Input Frozen (blacklist
+//	                              manager policy blacklisted)" — the output
+//	                              itself is untouched (not spent), merely
+//	                              refused by this instance's policy.
+//	                                                               → TxInvalid
+//	472 StatusFrozenConsensus     "Input Frozen" / "Input Frozen (blacklist
+//	                              manager consensus blacklisted)" — same
+//	                              reasoning as 471.                → TxInvalid
+//	473 StatusCumulativeFees      "Cumulative fee validation failed".
+//	                                                               → TxInvalid
+//	474 StatusTxSize              "Transaction size validation failed".
+//	                                                               → TxInvalid
+//	475 StatusMinedAncestorsNotInBUMP "Mined ancestors not found in BUMPs"
+//	                              / "BEEF validation failed: couldn't find
+//	                              mined ancestor of the transaction in
+//	                              provided BUMPs" — envelope format.
+//	                                                               → TxInvalid
+//	476 StatusNotFinal            "Transaction not final" / "Transaction
+//	                              nLockTime is in the future and input
+//	                              sequence numbers are not final" — the
+//	                              inputs are untouched; resubmit once the
+//	                              locktime expires. (POST /tx itself does
+//	                              not persist a verdict for this case —
+//	                              arcade.openapi.yaml:279 — but GET
+//	                              /tx/{txid} still carries the code when a
+//	                              REJECTED row does report it.) → TxInvalid
+//
+// Any code this table does not list, including 0 ("zero/unclassified" per
+// arcade.openapi.yaml:1221), falls to Unknown — never TxInvalid: an
+// unrecognized code is not evidence the inputs are untouched.
+func rejectReasonForCode(code int) oracle.RejectReason {
+	switch code {
+	case 462, 466:
+		return oracle.RejectReasonInputsSpent
+	case 460, 461, 463, 464, 465, 467, 468, 469, 471, 472, 473, 474, 475, 476:
+		return oracle.RejectReasonTxInvalid
+	default:
+		return oracle.RejectReasonUnknown
+	}
 }
 
 // Outpoints reports StatusUnknown for every outpoint: arcade has no UTXO

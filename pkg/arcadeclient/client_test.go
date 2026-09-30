@@ -140,6 +140,81 @@ func TestClient(t *testing.T) {
 	assert.Equal(t, uint64(100), pol.SatPerKB())
 }
 
+// TestPostTxDoubleSpendAttemptedBody covers a 202 SubmitResponse that
+// already knows of a competitor at submission time: txStatus
+// DOUBLE_SPEND_ATTEMPTED alongside competingTxs, per the arcade contract
+// (arcade.openapi.yaml SubmitResponse/TransactionStatus schemas).
+func TestPostTxDoubleSpendAttemptedBody(t *testing.T) {
+	competitor := strings.Repeat("c", 64)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tx", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"txid": txidSubmitted, "status": 202, "txStatus": "DOUBLE_SPEND_ATTEMPTED",
+			"competingTxs": []string{competitor}, "extraInfo": "double spend",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c, err := arcadeclient.New(srv.URL + "/v1")
+	require.NoError(t, err)
+
+	sub, err := c.PostTx(context.Background(), []byte("tx"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{competitor}, sub.CompetingTxs)
+	assert.Equal(t, "double spend", sub.ExtraInfo)
+	assert.True(t, sub.DoubleSpend())
+}
+
+// TestRejectErrorCarriesCompetingTxs covers a 4xx RejectError body that
+// names competing transactions (e.g. ARC code 466, conflicting tx found).
+func TestRejectErrorCarriesCompetingTxs(t *testing.T) {
+	competitor := strings.Repeat("c", 64)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tx", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": 466, "title": "Conflicting tx found", "detail": "conflict",
+			"txid": txidRejectSub, "competingTxs": []string{competitor}, "extraInfo": "already spent",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c, err := arcadeclient.New(srv.URL + "/v1")
+	require.NoError(t, err)
+
+	_, err = c.PostTx(context.Background(), []byte("tx"))
+	var rej *arcadeclient.RejectError
+	require.ErrorAs(t, err, &rej)
+	assert.Equal(t, 466, rej.Status)
+	assert.Equal(t, []string{competitor}, rej.CompetingTxs)
+	assert.Equal(t, "already spent", rej.ExtraInfo)
+	assert.True(t, rej.DoubleSpend())
+}
+
+// TestCompetingTxsAbsentLeavesNil pins that SubmitResponse.CompetingTxs and
+// RejectError.CompetingTxs stay nil (not an empty non-nil slice) when the
+// response body carries no competingTxs field, so DoubleSpend() and a
+// simple len()/nil check agree.
+func TestCompetingTxsAbsentLeavesNil(t *testing.T) {
+	ctx := context.Background()
+	srv := fakeArcade(t)
+	defer srv.Close()
+	c, err := arcadeclient.New(srv.URL+"/v1", arcadeclient.WithCallbackToken("tok"))
+	require.NoError(t, err)
+
+	sub, err := c.PostTx(ctx, []byte("rawtx")) // fakeArcade's default RECEIVED response
+	require.NoError(t, err)
+	assert.Nil(t, sub.CompetingTxs)
+	assert.False(t, sub.DoubleSpend())
+
+	_, err = c.PostTx(ctx, []byte("reject")) // fakeArcade's reject response, no competingTxs
+	var rej *arcadeclient.RejectError
+	require.ErrorAs(t, err, &rej)
+	assert.Nil(t, rej.CompetingTxs)
+	assert.False(t, rej.DoubleSpend())
+}
+
 func TestNew(t *testing.T) {
 	tests := []struct {
 		name string

@@ -45,6 +45,39 @@ func (s Status) String() string {
 	return "unknown"
 }
 
+// RejectReason classifies a Rejected verdict for the reaper: whether the
+// fuel output a client's spend hint names is gone (an input was already
+// spent) or untouched (the transaction itself was invalid), or the oracle
+// could not tell. Meaningful only when TxStatus.Rejected is true.
+type RejectReason int
+
+// RejectReason values. RejectReasonUnknown means the oracle could not
+// classify the rejection; the reaper must hold the row rather than guess.
+const (
+	// RejectReasonUnknown means the rejection could not be classified: hold.
+	RejectReasonUnknown RejectReason = iota
+	// RejectReasonTxInvalid means the transaction itself was invalid (bad
+	// format, script, fee, size, or similar policy failure); its inputs are
+	// untouched and the row may be requeued.
+	RejectReasonTxInvalid
+	// RejectReasonInputsSpent means an input was already spent — missing,
+	// non-existent, or conflicting with another transaction; the fuel
+	// output this row names is gone.
+	RejectReasonInputsSpent
+)
+
+// String returns a lower-case name for r, or "unknown" for any unrecognized
+// value.
+func (r RejectReason) String() string {
+	switch r {
+	case RejectReasonTxInvalid:
+		return "tx_invalid"
+	case RejectReasonInputsSpent:
+		return "inputs_spent"
+	}
+	return "unknown"
+}
+
 // Result is the verdict for one outpoint.
 type Result struct {
 	// Outpoint is the outpoint this verdict is about.
@@ -65,6 +98,9 @@ type TxStatus struct {
 	// Rejected reports whether the transaction was terminally rejected
 	// (invalid or lost a double-spend).
 	Rejected bool
+	// RejectReason classifies the rejection. Meaningful only when Rejected
+	// is true; RejectReasonUnknown otherwise.
+	RejectReason RejectReason
 	// Status is the backend status string, for logs/metrics.
 	Status string
 	// BlockHeight is the height of the block the transaction was mined in,

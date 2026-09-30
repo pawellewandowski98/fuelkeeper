@@ -64,12 +64,22 @@ type RejectError struct {
 	Detail string `json:"detail"`
 	// TxID is the offending transaction id, when arcade identified one.
 	TxID string `json:"txid"`
+	// CompetingTxs lists txids double-spending the rejected transaction,
+	// when arcade identified any (a best-effort decode: absent when the
+	// body carries none).
+	CompetingTxs []string `json:"competingTxs"`
+	// ExtraInfo is free-form detail, e.g. a rejection reason, when present.
+	ExtraInfo string `json:"extraInfo"`
 }
 
 // Error implements the error interface.
 func (e *RejectError) Error() string {
 	return fmt.Sprintf("arcadeclient: arcade rejected tx %s: %d %s: %s", e.TxID, e.Status, e.Title, e.Detail)
 }
+
+// DoubleSpend reports whether arcade identified at least one competing
+// transaction for this rejection.
+func (e *RejectError) DoubleSpend() bool { return len(e.CompetingTxs) > 0 }
 
 // BackpressureError reports that arcade's broker is under backpressure
 // (HTTP 503, or 429 from an intermediary): the transaction was not queued,
@@ -141,8 +151,24 @@ type SubmitResponse struct {
 	TxID string `json:"txid"`
 	// Status is the integer HTTP status code (202).
 	Status int `json:"status"`
-	// TxStatus is the transaction's lifecycle state at submission time.
+	// TxStatus is the transaction's lifecycle state at submission time. A
+	// 2xx body can carry txStatus DOUBLE_SPEND_ATTEMPTED alongside
+	// CompetingTxs when arcade already knows of a competitor at submit
+	// time.
 	TxStatus string `json:"txStatus"`
+	// CompetingTxs lists txids double-spending this one, when known at
+	// submission time.
+	CompetingTxs []string `json:"competingTxs"`
+	// ExtraInfo is free-form detail, when present.
+	ExtraInfo string `json:"extraInfo"`
+}
+
+// DoubleSpend reports whether this submission response indicates a
+// double-spend attempt: either the lifecycle state is
+// DOUBLE_SPEND_ATTEMPTED, or arcade already named at least one competing
+// transaction.
+func (s *SubmitResponse) DoubleSpend() bool {
+	return s.TxStatus == "DOUBLE_SPEND_ATTEMPTED" || len(s.CompetingTxs) > 0
 }
 
 // BatchSubmitResponse is the 202 body of POST /txs: arcade's

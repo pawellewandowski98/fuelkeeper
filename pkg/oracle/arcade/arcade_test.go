@@ -3,6 +3,7 @@ package arcade_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -69,7 +70,7 @@ func TestTxRejectedWithCompetingTxs(t *testing.T) {
 	competitor := storetest.NewTxID().String()
 	srv := fakeArcade(t, map[string]any{
 		txid: map[string]any{
-			"txid": txid, "txStatus": "REJECTED", "competingTxs": []string{competitor},
+			"txid": txid, "txStatus": "REJECTED", "status": 466, "competingTxs": []string{competitor},
 		},
 	}, "")
 	defer srv.Close()
@@ -84,6 +85,56 @@ func TestTxRejectedWithCompetingTxs(t *testing.T) {
 	assert.True(t, st.Rejected)
 	assert.False(t, st.Mined)
 	assert.Equal(t, []string{competitor}, st.CompetingTxs)
+	assert.Equal(t, oracle.RejectReasonInputsSpent, st.RejectReason, "466 conflicting tx: inputs already spent")
+}
+
+// TestTxRejectReasonByCode is a table test over every ARC numeric code the
+// arcade oracle classifies, plus an unmapped code, pinning the mapping
+// documented on rejectReasonForCode in pkg/oracle/arcade/arcade.go.
+func TestTxRejectReasonByCode(t *testing.T) {
+	tests := []struct {
+		code int
+		want oracle.RejectReason
+	}{
+		{462, oracle.RejectReasonInputsSpent}, // invalid inputs: non-existent or spent
+		{466, oracle.RejectReasonInputsSpent}, // conflicting tx found
+		{460, oracle.RejectReasonTxInvalid},   // not extended format
+		{461, oracle.RejectReasonTxInvalid},   // malformed unlocking scripts
+		{463, oracle.RejectReasonTxInvalid},   // malformed transaction
+		{464, oracle.RejectReasonTxInvalid},   // invalid outputs
+		{465, oracle.RejectReasonTxInvalid},   // fee too low
+		{467, oracle.RejectReasonTxInvalid},   // generic (wraps fee/script/policy)
+		{468, oracle.RejectReasonTxInvalid},   // invalid BEEF
+		{469, oracle.RejectReasonTxInvalid},   // merkle roots validation failed
+		{471, oracle.RejectReasonTxInvalid},   // input frozen (policy)
+		{472, oracle.RejectReasonTxInvalid},   // input frozen (consensus)
+		{473, oracle.RejectReasonTxInvalid},   // cumulative fee validation failed
+		{474, oracle.RejectReasonTxInvalid},   // transaction size validation failed
+		{475, oracle.RejectReasonTxInvalid},   // mined ancestors not found in BUMPs
+		{476, oracle.RejectReasonTxInvalid},   // not final
+		{0, oracle.RejectReasonUnknown},       // zero/unclassified
+		{470, oracle.RejectReasonUnknown},     // unassigned in arcade's taxonomy
+		{999, oracle.RejectReasonUnknown},     // unrecognized code
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("code_%d", tt.code), func(t *testing.T) {
+			hash := storetest.NewTxID()
+			txid := hash.String()
+			srv := fakeArcade(t, map[string]any{
+				txid: map[string]any{"txid": txid, "txStatus": "REJECTED", "status": tt.code},
+			}, "")
+			defer srv.Close()
+
+			c, err := arcadeclient.New(srv.URL + "/v1")
+			require.NoError(t, err)
+			o := arcade.New(c)
+
+			st, err := o.Tx(context.Background(), hash)
+			require.NoError(t, err)
+			require.True(t, st.Rejected)
+			assert.Equal(t, tt.want, st.RejectReason)
+		})
+	}
 }
 
 func TestTxDoubleSpendAttempted(t *testing.T) {
