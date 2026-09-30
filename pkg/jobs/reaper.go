@@ -243,7 +243,12 @@ func (c ReaperConfig) Validate() error {
 // "unknown_aged") once now - QuarantinedAt >= UnknownRequeueAge, provided
 // the pool's expiry_policy is requeue and UnknownRequeueAge > 0; under
 // expiry_policy hold, or with UnknownRequeueAge 0, it stays quarantined for
-// an operator. Pool capacity therefore never leaks by default. The age is
+// an operator. An unhinted row's capacity is therefore not stranded by
+// default (under expiry_policy: requeue). This says nothing about rows that
+// never reach quarantine: under spend_policy: trust (the default with an
+// arcade-only oracle) a client's spend retires the row at once, unverified;
+// see "The spend_policy: trust blind spot with arcade-only" in
+// docs/OPERATIONS.md. The age is
 // measured from QuarantinedAt alone, and the rule is applied only to a row
 // the outpoint oracle actually answered Unknown for this tick: an outpoint
 // oracle error (or malformed answer) leaves every remaining row untouched,

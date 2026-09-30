@@ -668,3 +668,33 @@ func TestReaperArcadeUTXOSpentShapeResolvesInOneTick(t *testing.T) {
 		}
 	}
 }
+
+// TestReaperNamedSpentInputsHintWhoseInputsExcludeOutputHolds pins rule 3a
+// ahead of 3b: with an inputs-capable oracle, a hint rejected as
+// inputs-spent whose own Inputs do not include the fuel output says nothing
+// about it, even when the gateway's SpentInputs (also excluding it) would
+// otherwise requeue the row as untouched.
+func TestReaperNamedSpentInputsHintWhoseInputsExcludeOutputHolds(t *testing.T) {
+	e := newHintEnv(t, "hint-named-spent-3a", jobs.DefaultReaperConfig(), nil)
+	hint := storetest.NewTxID()
+	rows := e.hinted(t, 1, hint)
+	other := store.Outpoint{TxID: storetest.NewTxID(), Vout: 0}
+	ts := rejected(oracle.RejectReasonInputsSpent)
+	ts.Inputs = []store.Outpoint{other}
+	ts.SpentInputs = []store.Outpoint{other}
+	e.orc.SetTx(hint, ts)
+	beforeMismatch := testutil.ToFloat64(jobs.ReaperInputMismatch.WithLabelValues(e.p, "hint"))
+	beforeRejected := e.requeued("rejected")
+
+	e.clk.Advance(e.cfg.QuarantineMinAge + time.Second)
+	e.tick(t)
+	assert.Equal(t, store.StateQuarantined, statesIn(t, e.st, e.p, rows)[0])
+	assert.InDelta(t, 1, e.held("hint_pending"), 0)
+	assert.InDelta(t, 0, e.held("rejected_fresh"), 0)
+	assert.InDelta(t, beforeMismatch+1, testutil.ToFloat64(jobs.ReaperInputMismatch.WithLabelValues(e.p, "hint")), 0)
+
+	e.clk.Advance(e.cfg.HintPatience)
+	e.tick(t)
+	assert.Equal(t, store.StateQuarantined, statesIn(t, e.st, e.p, rows)[0], "not requeued as untouched after hint_patience")
+	assert.InDelta(t, beforeRejected, e.requeued("rejected"), 0)
+}
