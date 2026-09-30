@@ -26,6 +26,9 @@ info:
     **Errors.** Every non-2xx response is `{"code","message","retry_after"?}`. `503` and
     `409` carry `Retry-After`; clients should back off and retry.
 
+    **HTTP Methods.** All paths support `OPTIONS` to list allowed methods via the `Allow` header.
+    Unsupported methods return 405 `method_not_allowed` with an `Allow` header.
+
     **Times.** All timestamps are UTC RFC 3339 format.
 servers:
   - url: http://localhost:8080
@@ -95,14 +98,6 @@ paths:
           content:
             application/yaml: {schema: {type: string}}
   /v1/pools:
-    options:
-      tags: [pools]
-      summary: Allowed methods for /v1/pools
-      responses:
-        "204":
-          description: allowed methods
-          headers:
-            Allow: {schema: {type: string}, description: "comma-separated list of allowed methods"}
     get:
       tags: [pools]
       summary: List pools with stats
@@ -118,15 +113,6 @@ paths:
         "500": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/ErrorRetry"}
   /v1/pools/{pool}:
-    options:
-      tags: [pools]
-      parameters: [{$ref: "#/components/parameters/pool"}]
-      summary: Allowed methods for /v1/pools/{pool}
-      responses:
-        "204":
-          description: allowed methods
-          headers:
-            Allow: {schema: {type: string}}
     get:
       tags: [pools]
       summary: Describe one pool
@@ -142,15 +128,6 @@ paths:
         "500": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/ErrorRetry"}
   /v1/pools/{pool}/reserve:
-    options:
-      tags: [fuel]
-      parameters: [{$ref: "#/components/parameters/pool"}]
-      summary: Allowed methods for /v1/pools/{pool}/reserve
-      responses:
-        "204":
-          description: allowed methods
-          headers:
-            Allow: {schema: {type: string}}
     post:
       tags: [fuel]
       summary: Reserve fuel outputs
@@ -178,15 +155,6 @@ paths:
         "500": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/ErrorRetry"}
   /v1/pools/{pool}/release:
-    options:
-      tags: [fuel]
-      parameters: [{$ref: "#/components/parameters/pool"}]
-      summary: Allowed methods for /v1/pools/{pool}/release
-      responses:
-        "204":
-          description: allowed methods
-          headers:
-            Allow: {schema: {type: string}}
     post:
       tags: [fuel]
       summary: Return unused outputs to the pool
@@ -209,15 +177,6 @@ paths:
         "500": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/ErrorRetry"}
   /v1/pools/{pool}/spend:
-    options:
-      tags: [fuel]
-      parameters: [{$ref: "#/components/parameters/pool"}]
-      summary: Allowed methods for /v1/pools/{pool}/spend
-      responses:
-        "204":
-          description: allowed methods
-          headers:
-            Allow: {schema: {type: string}}
     post:
       tags: [fuel]
       summary: Report that a transaction spent these outputs
@@ -244,17 +203,6 @@ paths:
         "500": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/ErrorRetry"}
   /v1/pools/{pool}/beef/{txid}:
-    options:
-      tags: [fuel]
-      parameters:
-        - {$ref: "#/components/parameters/pool"}
-        - {name: txid, in: path, required: true, schema: {type: string, pattern: "^[0-9a-f]{64}$"}}
-      summary: Allowed methods for /v1/pools/{pool}/beef/{txid}
-      responses:
-        "204":
-          description: allowed methods
-          headers:
-            Allow: {schema: {type: string}}
     get:
       tags: [fuel]
       summary: BEEF for a shard (split transaction)
@@ -280,6 +228,7 @@ paths:
           headers:
             ETag: {schema: {type: string}}
             Cache-Control: {schema: {type: string}}
+            X-Shard-Status: {schema: {type: string, enum: [unmined, mined, retired, invalid]}}
         "400": {$ref: "#/components/responses/Error"}
         "401": {$ref: "#/components/responses/Error"}
         "404": {$ref: "#/components/responses/Error"}
@@ -287,15 +236,6 @@ paths:
         "500": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/ErrorRetry"}
   /v1/pools/{pool}/shards:
-    options:
-      tags: [admin]
-      parameters: [{$ref: "#/components/parameters/pool"}]
-      summary: Allowed methods for /v1/pools/{pool}/shards
-      responses:
-        "204":
-          description: allowed methods
-          headers:
-            Allow: {schema: {type: string}}
     get:
       tags: [admin]
       summary: List shards
@@ -315,17 +255,6 @@ paths:
         "500": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/ErrorRetry"}
   /v1/pools/{pool}/shards/{txid}/retire:
-    options:
-      tags: [admin]
-      parameters:
-        - {$ref: "#/components/parameters/pool"}
-        - {name: txid, in: path, required: true, schema: {type: string, pattern: "^[0-9a-f]{64}$"}}
-      summary: Allowed methods for /v1/pools/{pool}/shards/{txid}/retire
-      responses:
-        "204":
-          description: allowed methods
-          headers:
-            Allow: {schema: {type: string}}
     post:
       tags: [admin]
       summary: Retire a shard (operator)
@@ -345,15 +274,6 @@ paths:
         "500": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/ErrorRetry"}
   /v1/pools/{pool}/quarantined:
-    options:
-      tags: [admin]
-      parameters: [{$ref: "#/components/parameters/pool"}]
-      summary: Allowed methods for /v1/pools/{pool}/quarantined
-      responses:
-        "204":
-          description: allowed methods
-          headers:
-            Allow: {schema: {type: string}}
     get:
       tags: [admin]
       summary: List quarantined rows
@@ -372,15 +292,6 @@ paths:
         "500": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/ErrorRetry"}
   /v1/pools/{pool}/quarantined/requeue:
-    options:
-      tags: [admin]
-      parameters: [{$ref: "#/components/parameters/pool"}]
-      summary: Allowed methods for /v1/pools/{pool}/quarantined/requeue
-      responses:
-        "204":
-          description: allowed methods
-          headers:
-            Allow: {schema: {type: string}}
     post:
       tags: [admin]
       summary: Return quarantined rows to the pool (operator)

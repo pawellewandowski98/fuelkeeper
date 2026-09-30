@@ -61,7 +61,7 @@ Two modes of operation are supported:
 | Mode | Unlocking Script | Constraints | Size | Use Case |
 |------|------------------|-------------|------|----------|
 | **puzzle** | 33-byte preimage push (no signing) | None | 74 B | Stateless, open pools |
-| **p2pkh** | Presigned `<sig><pubkey>` with SIGHASH_NONE\|ANYONECANPAY\|FORKID | `tx_version=1`, `lock_time=0`, `input_sequence=0xffffffff` | 148 B | High-security, controlled signings |
+| **p2pkh** | Presigned `<sig><pubkey>` with SIGHASH_NONE\|ANYONECANPAY\|FORKID | `tx_version=1`, `lock_time=0`, `sequence=0xffffffff` | 148 B | High-security, controlled signings |
 
 For P2PKH pools, the response includes a `constraints` object; your transaction must match those fields exactly or the presigned signature will not validate.
 
@@ -94,9 +94,9 @@ Health checks (`/healthz`, `/readyz`, `/metrics`, `/openapi.yaml`) are unauthent
 
 The four admin operations require authentication (admin key when configured, else fuel key):
 
-- **List shards**: `GET /v1/pools/{pool}/shards[?status=unmined|mined|retired|invalid][&limit=N]` → array of `ShardInfo` (txid, size, status, lease_until, version, created_at)
+- **List shards**: `GET /v1/pools/{pool}/shards[?status=unmined|mined|retired|invalid][&limit=N]` → array of `ShardInfo` (txid, size, status, owner, lease_until, version, created_at)
 - **Retire a shard**: `POST /v1/pools/{pool}/shards/{txid}/retire` → `{"retired": N}` (marks shard invalid and invalidates every non-terminal row)
-- **List quarantined rows**: `GET /v1/pools/{pool}/quarantined[?limit=N]` → array of `Row` (outpoint, state, reserved_by, expires_at, quarantined_at, spent_by)
+- **List quarantined rows**: `GET /v1/pools/{pool}/quarantined[?limit=N]` → array of `Row` (outpoint, state, reserved_by, expires_at, quarantined_at, spent_hint, spent_by)
 - **Requeue quarantined rows**: `POST /v1/pools/{pool}/quarantined/requeue` with `{"outpoints": [...]}` → `{"requeued": N}` (returns rows to the pool; use when you know they are unspent)
 
 Use the CLI or Go client (see below) to invoke these.
@@ -111,12 +111,15 @@ package main
 import (
   "context"
   "log"
+  "time"
 
   "github.com/bsv-blockchain/fuelkeeper/pkg/client"
 )
 
 func main() {
-  ctx := context.Background()
+  // ReserveWithRetry without WithMaxAttempts retries until ctx ends
+  ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+  defer cancel()
 
   // Create a client (with an optional API key)
   c, err := client.New("http://localhost:8080", client.WithAPIKey("mykey"))
@@ -159,7 +162,7 @@ func main() {
 - `Release(ctx, pool, token, outpoints)` — return unused fuel
 - `Spend(ctx, pool, token, outpoints, txid)` — report spent fuel
 - `Pools(ctx)`, `Pool(ctx, poolName)` — list pools and their stats
-- `BEEF(ctx, pool, shard)` — fetch one shard's BEEF (cached per version; `304 Not Modified` on cache hit)
+- `BEEF(ctx, pool, shard)` — fetch one shard's BEEF (cached per shard version; immutable once mined)
 - `InputBEEF(ctx, pool, res)` — merge BEEF from all shards in a reservation
 - `CreateActionInputs(res, description)` — convert reservation to go-sdk `wallet.CreateActionInput` values
 - `Surplus(denomination, estimatedTxBytes, satPerKB)` — how much to add to your own outputs instead of creating change
@@ -173,11 +176,11 @@ The client returns errors that can be checked with `errors.Is()`:
 - `client.ErrInsufficient` — 409 insufficient (fewer than `min_count`)
 - `client.ErrUnauthorized` — 401 unauthorized
 - `client.ErrNotFound` — 404 not found
-- `client.ErrBadRequest` — 400 bad request
+- `client.ErrBadRequest` — 400 bad request (also covers 405 method not allowed)
 - `client.ErrBackpressure` — 503 backpressure
-- `client.ErrUnavailable` — 503 unavailable
+- `client.ErrUnavailable` — 503 unavailable (also covers transport failures and 5xx without JSON body)
 
-Check `client.IsRetryable(err)` to determine whether to retry.
+Check `client.IsRetryable(err)` to determine whether to retry. `client_closed_request` (499) from the server has no client sentinel; it is not retryable.
 
 ## TypeScript / HTTP Clients
 
@@ -191,9 +194,15 @@ TypeScript wallets or other HTTP clients use the same endpoints and logic:
 6. `POST /v1/pools/{pool}/spend` with `{"token": "...", "outpoints": [...], "txid": "..."}` to report the spend
 7. On error, `POST /v1/pools/{pool}/release` to return unused outputs
 
+**Note on development mode (nullnet)**: The mock treasury emits synthetic BEEF that the go-sdk cannot parse, so `InputBEEF` and `createAction` only work against a real treasury (Plan 5). Reservation, release, and spend operations work normally in nullnet.
+
+## Probes and Diagnostics
+
+- **Health**: `GET /healthz` returns 200 and `{"status":"ok"}` when the process is running
+- **Readiness**: `GET /readyz` returns 200 and `{"status":"ready","pools":N,"pools_ready":M}` when the store pings and at least one pool is configured. Returns 503 if not ready. `pools_ready` is the number of pools that have adopted shards or queued rows; it may be 0 even when ready, and rises as shards are mined and adopted.
+- **Metrics**: `GET /metrics` (Prometheus format, unauthenticated)
+- **OpenAPI**: `GET /openapi.yaml` (full spec, unauthenticated)
+
 ## Additional Resources
 
-- OpenAPI spec: `/openapi.yaml` (unauthenticated, available at any FuelKeeper server)
-- Health probe: `GET /healthz` (alive) or `GET /readyz` (store reachable and pools ready)
-- Metrics: `GET /metrics` (Prometheus format)
 - Configuration: see `docs/OPERATIONS.md`

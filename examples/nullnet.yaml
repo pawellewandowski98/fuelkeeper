@@ -1,6 +1,9 @@
 # Nullnet configuration: FuelKeeper in development mode with in-memory storage and mocked oracle/treasury.
 # Use this for testing and local development. Never use in production.
 
+instance:
+  rescan_interval: 1s
+
 store:
   backend: memory
 

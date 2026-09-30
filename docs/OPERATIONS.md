@@ -223,17 +223,26 @@ Monitor these Prometheus metrics to stay on top of pool health:
 
 | Metric | Type | Labels | Alert | Notes |
 |--------|------|--------|-------|-------|
-| `fuelkeeper_pool_rows` | gauge | state (available\|reserved\|quarantined\|spent\|invalid) | rows < low_water × 0.5? | Available output count by state |
-| `fuelkeeper_reserve_requests_total` | counter | result (ok\|insufficient\|exhausted\|error) | insufficient rate ↑? | Reserve success and failure counts |
-| `fuelkeeper_cas_missed_total` | counter | pool | > 0? | Concurrent shard ownership (clears quickly) |
-| `fuelkeeper_quarantine_oldest_age_seconds` | gauge | pool | > 5 minutes? | Oldest stuck quarantined row (indicates oracle or manual action needed) |
-| `fuelkeeper_watcher_oldest_unmined_age_seconds` | gauge | pool | > 2 hours? | Oldest unmined shard (may need to retire manually) |
-| `fuelkeeper_watcher_unmined_shards` | gauge | pool | > limit × 0.8? | Current unmined shard count |
-| `fuelkeeper_minter_splits_total` | counter | result (ok\|failed) | failed rate ↑? | Minted splits by outcome |
-| `fuelkeeper_job_lease_held` | gauge | job (reaper\|watcher\|minter) | any ≤ 0 for > 1 min? | Job lease indicator (0 = not held, 1 = held) |
+| `fuelkeeper_pool_rows` | gauge | pool, state (available\|reserved\|quarantined\|spent\|invalid) | available < low_water × 0.5? | Row count by state |
+| `fuelkeeper_pool_shards` | gauge | pool, status (unmined\|mined\|retired\|invalid) | track | Shard count by status |
+| `fuelkeeper_reserve_requests_total` | counter | pool, result (ok\|bad_request\|insufficient\|exhausted\|error\|canceled) | insufficient rate ↑? | Reserve attempts by outcome |
+| `fuelkeeper_reserve_outputs_total` | counter | pool | track | Total outputs handed out (cumulative) |
 | `fuelkeeper_reserve_latency_seconds` | histogram | pool | p99 > 100ms? | Reserve request latency |
-| `fuelkeeper_allocator_available` | gauge | pool | track for trends | Total available rows in allocator (in-memory) |
-| `fuelkeeper_shards_owned` | gauge | pool | track for trends | Shards owned by this instance |
+| `fuelkeeper_cas_missed_total` | counter | pool | > 0? | Concurrent shard ownership (clears within rescan) |
+| `fuelkeeper_release_total` | counter | pool, result | track | Release calls by outcome |
+| `fuelkeeper_spend_total` | counter | pool, result | track | Spend calls by outcome |
+| `fuelkeeper_allocator_available` | gauge | pool | track | Rows queued in memory |
+| `fuelkeeper_shards_owned` | gauge | pool | track | Shards leased by this instance |
+| `fuelkeeper_quarantine_oldest_age_seconds` | gauge | pool | > 5 minutes? | Oldest stuck quarantined row |
+| `fuelkeeper_watcher_unmined_shards` | gauge | pool | > limit × 0.8? | Current unmined shard count |
+| `fuelkeeper_watcher_oldest_unmined_age_seconds` | gauge | pool | > 2 hours? | Age of oldest unmined shard |
+| `fuelkeeper_watcher_transitions_total` | counter | pool, result | track | Shard state changes by outcome |
+| `fuelkeeper_minter_splits_total` | counter | pool, result (ok\|build_failed\|record_failed\|rejected\|send_failed) | failed rate ↑? | Minted splits by outcome |
+| `fuelkeeper_minter_last_success_timestamp` | gauge | pool | track | Unix time of last successful split |
+| `fuelkeeper_reaper_quarantined_total` | counter | pool | track | Rows moved to quarantine |
+| `fuelkeeper_reaper_resolved_total` | counter | pool, result | track | Quarantined rows resolved by state |
+| `fuelkeeper_oracle_requests_total` | counter | kind, result | track | Oracle calls by type and outcome |
+| `fuelkeeper_job_lease_held` | gauge | job (reaper\|watcher\|minter) | max by (job) < 1 for > 1 min? | 1 if this instance holds the job lease, 0 otherwise |
 
 ## Runbook
 
@@ -267,7 +276,7 @@ Monitor these Prometheus metrics to stay on top of pool health:
 
 - If truly unspent, requeue with `fuelkeeper quarantine requeue --url ... --pool main --outpoints a:0,b:1 --key <key>`
 - If spent (expected), no action needed; they will age out when `min_unspent_age` expires
-- If oracle is down, set `oracle.kind: mock` temporarily and requeue
+- Verify on-chain before requeuing; do not requeue spent rows
 
 ### Dead Split (Known-Unminable Shard)
 
@@ -281,13 +290,15 @@ Monitor these Prometheus metrics to stay on top of pool health:
 
 ### Graceful Restart
 
-FuelKeeper handles SIGTERM gracefully:
+FuelKeeper handles SIGTERM gracefully with a fixed 10-second shutdown timeout:
 
-1. Stops accepting new `/v1/` requests
-2. Waits for in-flight reserves to complete (up to `instance.reserve_timeout`)
-3. Releases shard leases (shard adoption can restart on another instance)
-4. Releases job leases (jobs can resume on another instance)
-5. Closes the store
+1. Stops accepting new `/v1/` requests (logs: "shutting down")
+2. Drains in-flight reserves (waits up to 10 seconds)
+3. Stops pools, releasing shard leases (logs: "http drained", "pools stopped")
+4. Stops jobs, releasing job leases (logs: "jobs stopped")
+5. Closes the store (logs: "store closed")
+
+A second SIGINT/SIGTERM forces exit immediately.
 
 In-flight reservations live in the store and survive the restart.
 
@@ -297,8 +308,8 @@ To restart:
 # Gracefully shut down
 kill -TERM <pid>
 
-# Wait for shutdown to complete (logs: "... signaled to shut down")
-sleep 5
+# Wait for shutdown to complete (logs should show "store closed")
+sleep 12
 
 # Restart
 fuelkeeper serve --config fuelkeeper.yaml &
@@ -341,6 +352,18 @@ Check:
 
 **SQLite**: Check file permissions, disk space, and ensure only one process is writing.
 
-### "verify policies without an oracle" Error
+### Verify Policies Without Oracle
 
-Pools with `spend_policy: verify` or `release_policy: verify` need an oracle. Set `oracle.kind` to something other than "none" or change the policies to "trust".
+Pools with `spend_policy: verify` need an oracle that is not "none"; FuelKeeper will refuse to start with error `"spend_policy=verify requires an oracle"`.
+
+Similarly, `release_policy: verify` requires an oracle with error `"release_policy=verify requires an oracle"`.
+
+Remedy: either set `oracle.kind` to teranode, arcade, composite, or mock (with assume_unspent: true for nullnet), or change the policies to "trust".
+
+### Configuration Validation Errors
+
+- **Pool name validation**: pool names must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$` (alphanumeric start, then alphanumeric/underscore/dot/dash, max 64 chars)
+- **Empty API keys rejected**: an empty `api_keys` list is not allowed; use `insecure: true` for open dev access
+- **Non-loopback requires insecure**: if `api.listen` is not loopback (127.0.0.1 or ::1), you must set `api.insecure: true` to run without API keys
+- **SQLite/Postgres DSN required**: `store.sqlite.path` or `store.postgres.dsn` must be set when using those backends
+- **Postgres synchronous_commit**: Postgres checks `synchronous_commit` at connect time and rejects `off` with an error

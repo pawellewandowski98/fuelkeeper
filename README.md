@@ -41,7 +41,7 @@ In another terminal, verify the server is ready and make a test request:
     curl -s -XPOST localhost:8080/v1/pools/main/reserve -H 'Content-Type: application/json' \
       -d '{"count":2}' | head -c 300
 
-The response includes a reservation token, fuel outputs, and shard references to fetch BEEF from. See `docs/API.md` for the full API guide and `docs/OPERATIONS.md` for configuration, deployment topologies, and troubleshooting.
+`/readyz` returns 200 as soon as the store pings and pools are configured; `pools_ready` shows which pools have adopted shards (initially 0, rises as fuel is minted and mined). The reserve response includes a reservation token, fuel outputs with complete unlocking scripts, and shard references to fetch BEEF from. See `docs/API.md` for the full API guide and `docs/OPERATIONS.md` for configuration, deployment topologies, and troubleshooting.
 
 ## Operations
 
