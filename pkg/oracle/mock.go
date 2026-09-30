@@ -2,6 +2,7 @@ package oracle
 
 import (
 	"context"
+	"slices"
 	"sync"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -125,12 +126,18 @@ func (m *Mock) Tx(_ context.Context, txid chainhash.Hash) (TxStatus, error) {
 
 // copyTxStatus returns a copy of st whose slice fields do not alias st's,
 // so a caller mutating a returned/stored slice cannot change later answers.
+// Inputs is cloned with slices.Clone rather than append-to-nil because an
+// empty non-nil Inputs ("verified: spends nothing") must not become nil
+// ("unknown, trust the txid"): see TxStatus.Inputs.
 func copyTxStatus(st TxStatus) TxStatus {
 	if st.MerklePath != nil {
 		st.MerklePath = append([]byte(nil), st.MerklePath...)
 	}
 	if st.CompetingTxs != nil {
 		st.CompetingTxs = append([]string(nil), st.CompetingTxs...)
+	}
+	if st.Inputs != nil {
+		st.Inputs = slices.Clone(st.Inputs)
 	}
 	return st
 }

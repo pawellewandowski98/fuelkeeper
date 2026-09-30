@@ -126,3 +126,40 @@ func TestMockOracleAssumeUnspent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, oracle.StatusUnknown, res[0].Status, "turning it back off restores unknown")
 }
+
+// TestMockOracleTxStatusInputsAreCopied pins two properties of the mock's
+// TxStatus handling that the reaper relies on: Inputs is never shared with
+// the caller's slice, and an empty non-nil Inputs stays non-nil (nil means
+// "unknown", empty means "verified: spends nothing").
+func TestMockOracleTxStatusInputsAreCopied(t *testing.T) {
+	ctx := context.Background()
+	m := oracle.NewMock()
+	txid := storetest.NewTxID()
+	a, b := storetest.NewTxID(), storetest.NewTxID()
+
+	src := []store.Outpoint{{TxID: a, Vout: 1}}
+	m.SetTx(txid, oracle.TxStatus{Known: true, Mined: true, Inputs: src})
+	src[0] = store.Outpoint{TxID: b, Vout: 9} // caller mutates its own slice after SetTx
+
+	got, err := m.Tx(ctx, txid)
+	require.NoError(t, err)
+	require.Len(t, got.Inputs, 1)
+	assert.Equal(t, store.Outpoint{TxID: a, Vout: 1}, got.Inputs[0], "SetTx must copy Inputs")
+	got.Inputs[0] = store.Outpoint{TxID: b, Vout: 9} // caller mutates the returned slice
+	again, err := m.Tx(ctx, txid)
+	require.NoError(t, err)
+	assert.Equal(t, store.Outpoint{TxID: a, Vout: 1}, again.Inputs[0], "Tx must return a fresh copy")
+
+	empty := storetest.NewTxID()
+	m.SetTx(empty, oracle.TxStatus{Known: true, Mined: true, Inputs: []store.Outpoint{}})
+	got, err = m.Tx(ctx, empty)
+	require.NoError(t, err)
+	assert.NotNil(t, got.Inputs, "an empty non-nil Inputs must stay non-nil")
+	assert.Empty(t, got.Inputs)
+
+	unset := storetest.NewTxID()
+	m.SetTx(unset, oracle.TxStatus{Known: true})
+	got, err = m.Tx(ctx, unset)
+	require.NoError(t, err)
+	assert.Nil(t, got.Inputs, "nil Inputs stays nil")
+}
