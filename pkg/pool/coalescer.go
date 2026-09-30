@@ -98,6 +98,7 @@ type Coalescer struct {
 	kick       chan struct{}
 	slots      chan struct{}
 	stopped    atomic.Bool
+	flushes    sync.WaitGroup // every dispatched flush goroutine; Run waits on this before returning
 }
 
 // NewCoalescer creates a coalescer for one pool.
@@ -233,23 +234,30 @@ func (c *Coalescer) hasPending() bool {
 }
 
 // Run dispatches flushes until ctx is done, then fails queued requests as
-// Unflushed. In-flight flushes settle on their own context, detached from ctx
-// once and for all here, so they are unaffected by ctx being cancelled later.
+// Unflushed and waits for every dispatched flush goroutine to finish before
+// returning: each flush (including its retries and, on failure, its
+// compensating release) runs on its own context detached from ctx, so it is
+// unaffected by ctx being cancelled, but Run does not return while one is
+// still writing to the store. That wait is bounded by the flush's own
+// budgets, never open-ended: at most Retries+1 attempts of up to FlushTimeout
+// each, plus retry backoff, plus CompensateTime for a final compensating
+// release. With the package defaults (FlushTimeout=5s, Retries=2,
+// RetryBackoff=20ms doubling, CompensateTime=2s) that is about
+// 3*5s + 60ms + 2s =~ 17s worst case. A caller that tears down the store
+// after Run returns can rely on this: no flush goroutine is still using it.
 func (c *Coalescer) Run(ctx context.Context) error {
 	base := context.WithoutCancel(ctx)
 	for {
 		select {
 		case <-ctx.Done():
-			c.drain(ctx.Err())
-			return nil
+			return c.shutdown(ctx.Err())
 		case <-c.kick:
 		}
 		for c.hasPending() {
 			select {
 			case c.slots <- struct{}{}:
 			case <-ctx.Done():
-				c.drain(ctx.Err())
-				return nil
+				return c.shutdown(ctx.Err())
 			}
 			// Skip the accumulation window once a batch is already full size:
 			// waiting can only delay a flush that has nothing left to gain from it.
@@ -266,17 +274,27 @@ func (c *Coalescer) Run(ctx context.Context) error {
 				// slot-acquisition against ctx.Done and happened to pick the slot):
 				// give the slot back and shut down without dispatching a new flush.
 				<-c.slots
-				c.drain(cerr)
-				return nil //nolint:nilerr // Run's contract is to always return nil; drain delivers cerr to callers
+				return c.shutdown(cerr)
 			}
 			batch := c.takeBatch()
 			if len(batch) == 0 {
 				<-c.slots
 				continue
 			}
+			c.flushes.Add(1)
 			go c.flush(base, batch)
 		}
 	}
+}
+
+// shutdown drains queued requests as Unflushed, then blocks until every
+// flush goroutine dispatched so far has finished (see Run's doc comment for
+// the bound), so Run never returns while one might still be writing to the
+// store.
+func (c *Coalescer) shutdown(err error) error {
+	c.drain(err)
+	c.flushes.Wait()
+	return nil
 }
 
 func (c *Coalescer) drain(err error) {
@@ -307,6 +325,7 @@ func (c *Coalescer) drain(err error) {
 // ever reaching the store, so at most one request can ever believe it owns a
 // given outpoint out of a single flush.
 func (c *Coalescer) flush(base context.Context, batch []*request) {
+	defer c.flushes.Done()
 	defer func() {
 		<-c.slots
 		select {

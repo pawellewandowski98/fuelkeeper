@@ -388,6 +388,59 @@ func TestCoalescerDuplicateAcrossRequests(t *testing.T) {
 	assert.Equal(t, tokA, got[shared].ReservedBy)
 }
 
+// TestCoalescerRunWaitsForInflightFlushes is a regression test for Run
+// returning while a detached flush goroutine might still be writing to the
+// store: Run must block until every dispatched flush has finished, even
+// after its own ctx is cancelled.
+func TestCoalescerRunWaitsForInflightFlushes(t *testing.T) {
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	_, rows := storetest.MintShard(t, st, "main", 4, store.ShardMined)
+	f := storetest.NewFaulty(st)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	f.BeforeReserve = func([]store.ReserveOp) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+	}
+	c := pool.NewCoalescer(f, "main", pool.CoalescerConfig{Slots: 1, MaxBatch: 64})
+	runCtx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); _ = c.Run(runCtx) }()
+
+	tok := store.NewToken()
+	var res pool.Result
+	subDone := make(chan struct{})
+	go func() {
+		defer close(subDone)
+		res = c.Submit(context.Background(), storetest.ReserveOps(rows[:2], tok, clk.Now().Add(time.Minute)))
+	}()
+	<-entered // the flush has started and is held inside BeforeReserve
+
+	cancel() // ask Run to shut down while the flush is still in progress
+
+	select {
+	case <-runDone:
+		t.Fatal("Run returned while a flush was still in progress")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release) // let the held flush complete
+
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after the in-flight flush finished")
+	}
+
+	<-subDone
+	require.NoError(t, res.Err)
+	assert.Len(t, res.Applied, 2)
+}
+
 func TestCoalescerStoppedFailsQueuedAsUnflushed(t *testing.T) {
 	clk := storetest.NewClock(storetest.Start)
 	st := memory.New(memory.WithClock(clk.Now))
@@ -421,8 +474,10 @@ func TestCoalescerStoppedFailsQueuedAsUnflushed(t *testing.T) {
 	}()
 	require.Eventually(t, func() bool { return c.PendingOps() == 2 }, time.Second, time.Millisecond)
 	stop() // shut the dispatcher down while r1 is in flight and r2 is queued
-	<-runDone
+	// Run now waits for r1's in-flight flush before returning, so release it
+	// before waiting on runDone (closing it afterwards would deadlock).
 	close(release)
+	<-runDone
 	wg.Wait()
 	require.NoError(t, r1.Err, "in-flight flush settles on its own detached context")
 	assert.Len(t, r1.Applied, 2)
