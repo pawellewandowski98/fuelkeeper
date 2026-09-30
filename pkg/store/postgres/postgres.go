@@ -3,7 +3,7 @@
 // Every batch mutation (Reserve, Release, Spend, Resolve, and RetireShard's
 // row cascade) issues one single-row, primary-key point UPDATE per op,
 // pipelined as one pgx.Batch inside a single transaction, always in ascending
-// (txid, vout) order (see lessOutpoint in rows.go). A combined multi-row
+// (txid, vout) order (see store.LessOutpoint in sort.go). A combined multi-row
 // "UPDATE ... FROM unnest(...)" statement lets Postgres's planner pick
 // whatever row-lock order it likes; two concurrent batches that touch
 // overlapping rows in different orders can then deadlock (each waiting on a
@@ -293,11 +293,11 @@ func outpointArrays(hs []store.Outpoint) ([][]byte, []int32) {
 }
 
 // execBatch sends batch on tx and executes and consumes its n queued
-// statements in the order they were queued (see lessOutpoint in rows.go for
-// why that order matters), returning the sum of RowsAffected across all of
-// them. Every caller queues plain Exec-style statements (no RETURNING);
-// Reserve queues QueryRow-style statements instead, since it needs each row's
-// returned expires_at, so it drives its own batch loop.
+// statements in the order they were queued (see store.LessOutpoint in
+// sort.go for why that order matters), returning the sum of RowsAffected
+// across all of them. Every caller queues plain Exec-style statements (no
+// RETURNING); Reserve queues QueryRow-style statements instead, since it
+// needs each row's returned expires_at, so it drives its own batch loop.
 func execBatch(ctx context.Context, tx pgx.Tx, batch *pgx.Batch, n int) (int, error) {
 	br := tx.SendBatch(ctx, batch)
 	total := 0

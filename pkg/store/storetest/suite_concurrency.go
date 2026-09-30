@@ -648,18 +648,37 @@ func testRetireVsReserveRace(t *testing.T, s store.Store, clk *Clock) {
 // closing -- or, worse, poisoning the connection for every later call. The
 // test only runs for backends that claim AtomicBatch; a backend without it
 // makes no such promise.
+//
+// A 1000-op Reserve on a fast backend can take on the order of tens of
+// milliseconds end to end, so a timeout tier needs to sit near that duration
+// for cancellation to have a real chance of landing during Commit() rather
+// than always firing somewhere in the per-row loop. Rather than hard-code a
+// guess, this dry-runs one uncancelled 1000-op Reserve to measure that
+// backend's actual duration, then derives the tiers from it. Whichever
+// branch a given tier exercises, the all-or-nothing invariant below is
+// checked unconditionally, so the assertions stay deterministic even though
+// timing decides which branch runs. Iteration counts are kept low (this runs
+// per tier, per backend, under -race, and modernc.org/sqlite's measured
+// duration inflates roughly 25x under the race detector) so the whole
+// subtest stays at a few seconds on memory, sqlite and postgres.
 func testReserveAllOrNothingOnCancel(t *testing.T, s store.Store, clk *Clock) {
 	if !s.Capabilities().AtomicBatch {
 		t.Skip("backend does not declare AtomicBatch")
 	}
 	ctx := context.Background()
+
+	_, dryRows := MintShard(t, s, "main", 1000, store.ShardMined)
+	dryStart := time.Now()
+	MustReserve(t, s, "main", dryRows, store.NewToken(), clk.Now().Add(time.Hour))
+	baseline := time.Since(dryStart)
+
 	_, rows := MintShard(t, s, "main", 1000, store.ShardMined)
 	before, err := s.Stats(ctx, "main")
 	require.NoError(t, err)
 
-	timeouts := []time.Duration{time.Microsecond, 20 * time.Microsecond, 200 * time.Microsecond, 2 * time.Millisecond}
+	timeouts := []time.Duration{baseline / 2, baseline * 9 / 10, baseline, baseline * 11 / 10}
 	for _, to := range timeouts {
-		for i := 0; i < 5; i++ {
+		for i := 0; i < 2; i++ {
 			tctx, cancel := context.WithTimeout(ctx, to)
 			tok := store.NewToken()
 			_, _ = s.Reserve(tctx, "main", ReserveOps(rows, tok, clk.Now().Add(time.Hour)))

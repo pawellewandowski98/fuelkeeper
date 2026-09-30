@@ -213,7 +213,7 @@ func (s *Store) RetireShard(ctx context.Context, pool string, txid chainhash.Has
 		// Invalidate this shard's non-terminal rows one at a time, in ascending vout
 		// order (a single txid, so this matches the global (txid, vout) order
 		// Reserve/Release/Spend/Resolve sort their own batches into; see
-		// lessOutpoint in rows.go). A single multi-row UPDATE here is driven by
+		// store.LessOutpoint in sort.go). A single multi-row UPDATE here is driven by
 		// whatever order Postgres's scan of fuel_rows happens to produce, which can
 		// disagree with those callers' sorted order and deadlock against them.
 		rs, err := tx.Query(ctx, `SELECT vout FROM fuel_rows WHERE pool=$1 AND txid=$2 AND state IN (0,1,2) ORDER BY vout`, pool, txid[:])

@@ -59,25 +59,40 @@ func TestWrite_FnCancelsContextThenSubsequentWriteSucceeds(t *testing.T) {
 
 // TestReserve_TightDeadlinesNeverApplyPartially hammers Reserve of a
 // 1000-row batch with contexts whose deadlines are so tight the write's
-// BeginTx/Commit routinely races the deadline, at four deadline scales and 20
-// iterations each. Every attempt must either apply all 1000 ops or none
+// BeginTx/Commit routinely races the deadline, at four deadline scales and a
+// few iterations each. Every attempt must either apply all 1000 ops or none
 // (store.Caps.AtomicBatch is true for this backend): a partial application
 // would mean the write's transaction boundary leaked below the statement
 // level. A final normal Reserve must still succeed, proving the repeated
 // cancellations never poisoned the writer connection.
+//
+// The four deadline scales are derived from a dry-run, uncancelled 1000-op
+// Reserve's measured duration (0.5x, 0.9x, 1.0x, 1.1x of it) rather than
+// fixed microsecond guesses, so cancellation also has a real chance of
+// landing during Commit() and not only in the per-row loop; under -race that
+// duration is roughly 25x its normal cost (modernc.org/sqlite is pure Go and
+// lock-heavy), so iteration counts are kept low to keep this test at a few
+// seconds. The all-or-nothing assertion is checked unconditionally for every
+// attempt, so which branch a given tier exercises is timing-dependent but
+// the expected outcome never is.
 func TestReserve_TightDeadlinesNeverApplyPartially(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(ctx, Config{Path: filepath.Join(t.TempDir(), "cancel-reserve.sqlite")})
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
 
+	_, dryRows := storetest.MintShard(t, s, "main", 1000, store.ShardMined)
+	dryStart := time.Now()
+	storetest.MustReserve(t, s, "main", dryRows, store.NewToken(), time.Now().Add(time.Hour))
+	baseline := time.Since(dryStart)
+
 	_, rows := storetest.MintShard(t, s, "main", 1000, store.ShardMined)
 	before, err := s.Stats(ctx, "main")
 	require.NoError(t, err)
 
-	timeouts := []time.Duration{time.Microsecond, 10 * time.Microsecond, 100 * time.Microsecond, time.Millisecond}
+	timeouts := []time.Duration{baseline / 2, baseline * 9 / 10, baseline, baseline * 11 / 10}
 	for _, to := range timeouts {
-		for i := 0; i < 20; i++ {
+		for i := 0; i < 2; i++ {
 			tctx, cancel := context.WithTimeout(ctx, to)
 			tok := store.NewToken()
 			_, _ = s.Reserve(tctx, "main", storetest.ReserveOps(rows, tok, time.Now().Add(time.Hour)))
