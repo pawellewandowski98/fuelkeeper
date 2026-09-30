@@ -79,7 +79,7 @@ func TestRunnerRunTicksAndReleases(t *testing.T) {
 	st := memory.New(memory.WithClock(clk.Now))
 	r := jobs.NewRunner(st, "inst-a", 10*time.Second, slog.Default())
 	j := &fastJob{name: "reaper", ran: make(chan struct{}, 8)}
-	r.Add(j)
+	require.NoError(t, r.Add(j))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- r.Run(ctx) }()
@@ -105,5 +105,81 @@ func (j *fastJob) RunOnce(context.Context) error {
 	case j.ran <- struct{}{}:
 	default:
 	}
+	return nil
+}
+
+func TestRunnerAddRejectsBadJob(t *testing.T) {
+	st := memory.New()
+	r := jobs.NewRunner(st, "inst-a", time.Minute, slog.Default())
+
+	err := r.Add(&badJob{name: "reaper", interval: 0})
+	require.Error(t, err, "zero interval is rejected")
+
+	err = r.Add(&badJob{name: "reaper", interval: -time.Second})
+	require.Error(t, err, "negative interval is rejected")
+
+	err = r.Add(&badJob{name: "", interval: time.Second})
+	require.Error(t, err, "empty name is rejected")
+
+	err = r.Add(&badJob{name: "reaper", interval: time.Second})
+	require.NoError(t, err, "a well-formed job is accepted")
+}
+
+type badJob struct {
+	name     string
+	interval time.Duration
+}
+
+func (j *badJob) Name() string            { return j.name }
+func (j *badJob) Interval() time.Duration { return j.interval }
+func (j *badJob) RunOnce(context.Context) error {
+	return nil
+}
+
+// TestRunnerPacesFromCompletion checks that a job whose RunOnce runs longer
+// than its interval is never re-run back-to-back: Run waits at least one full
+// interval after RunOnce *returns* before starting it again.
+func TestRunnerPacesFromCompletion(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	j := &slowJob{
+		name:     "reaper",
+		interval: interval,
+		sleep:    3 * interval,
+		starts:   make(chan time.Time, 4),
+		ends:     make(chan time.Time, 4),
+	}
+	st := memory.New()
+	r := jobs.NewRunner(st, "inst-a", time.Minute, slog.Default())
+	require.NoError(t, r.Add(j))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	<-j.starts           // first run starts
+	end1 := <-j.ends     // first run finishes after ~3*interval
+	start2 := <-j.starts // second run starts only after the post-completion wait
+	cancel()
+	<-j.ends // drain the second run so RunOnce doesn't block shutdown
+	require.NoError(t, <-done)
+
+	gap := start2.Sub(end1)
+	assert.GreaterOrEqual(t, gap, interval, "next run must not start before the interval elapses after the previous run's completion")
+}
+
+type slowJob struct {
+	name     string
+	interval time.Duration
+	sleep    time.Duration
+	starts   chan time.Time
+	ends     chan time.Time
+}
+
+func (j *slowJob) Name() string            { return j.name }
+func (j *slowJob) Interval() time.Duration { return j.interval }
+func (j *slowJob) RunOnce(context.Context) error {
+	j.starts <- time.Now()
+	time.Sleep(j.sleep)
+	j.ends <- time.Now()
 	return nil
 }
