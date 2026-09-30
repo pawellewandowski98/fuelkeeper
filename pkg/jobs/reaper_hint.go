@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -197,16 +198,32 @@ func (r *Reaper) applyHintRules(
 		switch ts.RejectReason {
 		case oracle.RejectReasonInputsSpent:
 			// 3. The hint was rejected because one of its inputs is spent
-			// or conflicting; the fuel output is assumed gone. SpentBy
-			// records the attempt (the hint), not the unknown spender.
-			// Held instead when the evidence says the fuel output is not
-			// the spent input: mined competitors that provably spend other
-			// inputs, or hint inputs that exclude it.
-			if otherInputsSpent {
-				return r.hintWait(p, t, row, hint, heldHintPending, v), nil
-			}
+			// or conflicting. In order:
+			//  a. the hint's own known inputs exclude the fuel output: the
+			//     hint says nothing about it, hold (hint_pending);
+			//  b. the gateway named the spent inputs (SpentInputs non-nil):
+			//     if they include the fuel output it is gone (retire, as
+			//     in d); if not, the transaction died on another input and
+			//     the fuel output is unspent (as rule 4). This positive
+			//     evidence takes precedence over c;
+			//  c. mined competitors provably spend only other inputs: hold
+			//     (hint_pending);
+			//  d. otherwise the fuel output is assumed gone: SpentBy is the
+			//     attempt (the hint), not the spender — the spender, when
+			//     named, is in CompetingTxs and rule 2 resolves it once
+			//     mined.
 			if !entry.spends(op) {
 				r.inputMismatch(p, hint, inputMismatchSourceHint, entry)
+				return r.hintWait(p, t, row, hint, heldHintPending, v), nil
+			}
+			if ts.SpentInputs != nil {
+				if slices.Contains(ts.SpentInputs, op) {
+					v.spend(hint, spentSourceInputsSpent, op)
+					return "", nil
+				}
+				return r.untouchedAfterPatience(t, row, v), nil
+			}
+			if otherInputsSpent {
 				return r.hintWait(p, t, row, hint, heldHintPending, v), nil
 			}
 			v.spend(hint, spentSourceInputsSpent, op)
@@ -214,11 +231,7 @@ func (r *Reaper) applyHintRules(
 		case oracle.RejectReasonTxInvalid:
 			// 4. The hint never touched its inputs: requeue after
 			// HintPatience.
-			if t.now.Sub(row.QuarantinedAt) >= r.cfg.HintPatience {
-				v.requeue(requeueRejected, op)
-				return "", nil
-			}
-			return heldRejectedFresh, nil
+			return r.untouchedAfterPatience(t, row, v), nil
 		default:
 			// 5. Unclassified rejection.
 			return r.hintWait(p, t, row, hint, heldRejectedUnknown, v), nil
@@ -228,6 +241,18 @@ func (r *Reaper) applyHintRules(
 		return r.hintWait(p, t, row, hint, heldHintPending, v), nil
 	}
 	return r.hintWait(p, t, row, hint, heldHintUnseen, v), nil
+}
+
+// untouchedAfterPatience handles a hinted row whose rejected transaction
+// provably left the fuel output unspent (rule 4, and rule 3 when the gateway
+// names only other spent inputs): requeue (reason "rejected") once
+// quarantined for HintPatience, held as rejected_fresh before that.
+func (r *Reaper) untouchedAfterPatience(t *tick, row store.Row, v verdicts) string {
+	if t.now.Sub(row.QuarantinedAt) >= r.cfg.HintPatience {
+		v.requeue(requeueRejected, row.Outpoint)
+		return ""
+	}
+	return heldRejectedFresh
 }
 
 // hintWait holds a hinted row with reason until HintMaxWait (when > 0) has

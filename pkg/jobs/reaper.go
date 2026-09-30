@@ -35,7 +35,7 @@ var (
 	}, []string{"pool", "source"})
 	reaperRequeued = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fuelkeeper_reaper_requeued_total",
-		Help: "Quarantined rows returned to available, by reason (unspent: an Unspent verdict; unknown_aged: an unhinted row with no verdict after unknown_requeue_age; rejected: a hint rejected as invalid, after hint_patience; hint_expired: a hint never mined or classified, after hint_max_wait).",
+		Help: "Quarantined rows returned to available, by reason (unspent: an Unspent verdict; unknown_aged: an unhinted row with no verdict after unknown_requeue_age; rejected: a hint rejected as invalid, or for spent inputs that exclude the row's outpoint, after hint_patience; hint_expired: a hint never mined or classified, after hint_max_wait).",
 	}, []string{"pool", "reason"})
 	reaperSpent = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fuelkeeper_reaper_spent_total",
@@ -80,7 +80,8 @@ const (
 	// with expiry_policy requeue, quarantined for at least UnknownRequeueAge.
 	requeueUnknownAged = "unknown_aged"
 	// requeueRejected: a hinted row whose transaction was rejected as
-	// invalid (its inputs untouched), after HintPatience.
+	// invalid, or for gateway-named spent inputs excluding the row's
+	// outpoint (the fuel output untouched), after HintPatience.
 	requeueRejected = "rejected"
 	// requeueHintExpired: a hinted row whose transaction was never mined or
 	// classified, after HintMaxWait.
@@ -118,8 +119,9 @@ const (
 	// heldCompetitorPending: hinted, the hint has competing transactions,
 	// and none of those looked up is mined.
 	heldCompetitorPending = "competitor_pending"
-	// heldRejectedFresh: hinted, the hint was rejected as invalid, and the
-	// row has not yet waited HintPatience.
+	// heldRejectedFresh: hinted, the hint was rejected as invalid (or for
+	// gateway-named spent inputs that exclude the outpoint), and the row
+	// has not yet waited HintPatience.
 	heldRejectedFresh = "rejected_fresh"
 	// heldRejectedUnknown: hinted, the hint was rejected for an
 	// unclassified reason.
@@ -270,16 +272,24 @@ func (c ReaperConfig) Validate() error {
 //     held (competitor_pending) as in rule 5. Only non-spending mined
 //     competitors: fall through to rules 3-5.
 //  3. Rejected, RejectReasonInputsSpent: the hint was rejected because one
-//     of its inputs is spent or conflicting; the fuel output is assumed gone
-//     and the row is retired with SpentBy = the hint (source
-//     "inputs_spent"). SpentBy here records the attempt, not the spender,
-//     which arcade does not name. The assumption is bounded to the client's
-//     own row: an honest wallet whose transaction failed on another input
-//     loses that fuel output, counted under spent{source="inputs_spent"}.
-//     Positive evidence to the contrary holds the row (hint_pending, as in
-//     rule 5) instead: at least one mined competitor with every mined
-//     competitor's known inputs excluding the outpoint, or the hint's own
-//     known inputs excluding it.
+//     of its inputs is spent or conflicting. Checked in this order:
+//     a. the hint's own known Inputs exclude the outpoint: held
+//     (hint_pending, as in rule 5; input mismatch counted);
+//     b. the gateway named the spent inputs (TxStatus.SpentInputs non-nil):
+//     including the outpoint, the row is retired as in d; excluding it
+//     (or empty), the transaction died on another input and the fuel
+//     output is unspent, so it is treated as rule 4 (requeue "rejected"
+//     after HintPatience, rejected_fresh before). This positive evidence
+//     takes precedence over c;
+//     c. at least one mined competitor, and every mined competitor's known
+//     inputs exclude the outpoint: held (hint_pending, as in rule 5);
+//     d. otherwise (SpentInputs nil) the fuel output is assumed gone and
+//     the row is retired with SpentBy = the hint (source "inputs_spent"):
+//     the attempt, not the spender — the spender, when named, is in
+//     CompetingTxs and rule 2 resolves it once mined. The assumption is
+//     bounded to the client's own row: an honest wallet whose transaction
+//     failed on another input, with a gateway that does not name it, loses
+//     that fuel output, counted under spent{source="inputs_spent"}.
 //  4. Rejected, RejectReasonTxInvalid: the fuel output is untouched; the
 //     row is requeued (reason "rejected") once quarantined for HintPatience,
 //     held (rejected_fresh) before that.

@@ -535,3 +535,75 @@ func TestReaperEmptyExpiryPolicyHolds(t *testing.T) {
 	assert.Equal(t, store.StateQuarantined, statesIn(t, st, p, rows)[0])
 	assert.InDelta(t, 1, testutil.ToFloat64(jobs.ReaperHeld.WithLabelValues(p, "expiry_hold")), 0)
 }
+
+// TestReaperInputsSpentUsesGatewayNamedSpentInputs covers rule 3b: when the
+// gateway names the spent inputs, the fuel output is retired only if it is
+// among them; otherwise the transaction died on another input and the row
+// is requeued like an invalid transaction, after HintPatience. nil keeps
+// the assumed-gone retirement (rule 3d).
+func TestReaperInputsSpentUsesGatewayNamedSpentInputs(t *testing.T) {
+	other := store.Outpoint{TxID: storetest.NewTxID(), Vout: 1}
+	cases := []struct {
+		name    string
+		spent   func(op store.Outpoint) []store.Outpoint
+		retired bool
+	}{
+		{"n_includes_outpoint", func(op store.Outpoint) []store.Outpoint { return []store.Outpoint{other, op} }, true},
+		{"o_excludes_outpoint", func(store.Outpoint) []store.Outpoint { return []store.Outpoint{other} }, false},
+		{"p_empty_non_nil", func(store.Outpoint) []store.Outpoint { return []store.Outpoint{} }, false},
+		{"q_nil", func(store.Outpoint) []store.Outpoint { return nil }, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newHintEnv(t, "hint-spent-inputs-"+tc.name, jobs.DefaultReaperConfig(), nil)
+			hint := storetest.NewTxID()
+			rows := e.hinted(t, 1, hint)
+			ts := rejected(oracle.RejectReasonInputsSpent)
+			ts.SpentInputs = tc.spent(rows[0].Outpoint)
+			e.orc.SetTx(hint, ts)
+			beforeSpent, beforeRequeued := e.spent("inputs_spent"), e.requeued("rejected")
+
+			e.clk.Advance(e.cfg.QuarantineMinAge + time.Second)
+			e.tick(t)
+			if tc.retired {
+				assert.Equal(t, []chainhash.Hash{hint}, e.spentBy(t, rows), "SpentBy is the attempt (the hint)")
+				assert.InDelta(t, beforeSpent+1, e.spent("inputs_spent"), 0)
+				return
+			}
+			assert.Equal(t, store.StateQuarantined, statesIn(t, e.st, e.p, rows)[0], "before HintPatience the row is held")
+			assert.InDelta(t, 1, e.held("rejected_fresh"), 0)
+			assert.InDelta(t, beforeSpent, e.spent("inputs_spent"), 0)
+
+			e.clk.Advance(e.cfg.HintPatience)
+			e.tick(t)
+			assert.Equal(t, store.StateAvailable, statesIn(t, e.st, e.p, rows)[0], "a conflict on another input requeues the fuel output")
+			assert.InDelta(t, beforeRequeued+1, e.requeued("rejected"), 0)
+		})
+	}
+}
+
+// TestReaperGatewayNamedSpentInputsOutrankMinedCompetitors pins rule 3's
+// order: SpentInputs excluding the outpoint (3b) wins over mined competitors
+// that spend only other inputs (3c, which would hold hint_pending).
+func TestReaperGatewayNamedSpentInputsOutrankMinedCompetitors(t *testing.T) {
+	var io *inputsOracle
+	e := newHintEnv(t, "hint-spent-inputs-vs-comp", jobs.DefaultReaperConfig(), func(m *oracle.Mock) oracle.Oracle {
+		io = &inputsOracle{Mock: m, inputs: map[chainhash.Hash][]store.Outpoint{}, calls: map[chainhash.Hash]int{}}
+		return io
+	})
+	hint, comp := storetest.NewTxID(), storetest.NewTxID()
+	other := store.Outpoint{TxID: storetest.NewTxID(), Vout: 0}
+	rows := e.hinted(t, 1, hint)
+	ts := rejected(oracle.RejectReasonInputsSpent, comp)
+	ts.SpentInputs = []store.Outpoint{other}
+	e.orc.SetTx(hint, ts)
+	e.orc.SetTx(comp, oracle.TxStatus{Known: true, Mined: true})
+	io.inputs[comp] = []store.Outpoint{other}
+
+	e.clk.Advance(e.cfg.QuarantineMinAge + time.Second)
+	e.tick(t)
+	assert.InDelta(t, 1, e.held("rejected_fresh"), 0)
+	e.clk.Advance(e.cfg.HintPatience)
+	e.tick(t)
+	assert.Equal(t, store.StateAvailable, statesIn(t, e.st, e.p, rows)[0])
+}
