@@ -8,7 +8,9 @@ preimage by default), so no signing service sits on the hot path.
 Status: Plan 3 complete: HTTP API, Go client and `serve` command. Pool core
 (Plan 2): hash-puzzle fuel, sharded per-instance ownership with batched
 (group-commit) reservations, and background jobs (reaper, proof watcher,
-minter) behind leased runners. Design:
+minter) behind leased runners. This branch (`feat/treasury`) adds the
+go-wallet-toolbox treasury and BRC-29 funding: see `docs/TREASURY.md` and
+`docs/FUNDING.md`. Design:
 `docs/superpowers/specs/2026-09-29-fuelkeeper-design.md`.
 
 ## Develop
@@ -42,6 +44,17 @@ In another terminal, verify the server is ready and make a test request:
       -d '{"count":2}' | head -c 300
 
 `/readyz` returns 200 as soon as the store pings and pools are configured; `pools_ready` shows which pools have adopted shards (initially 0, rises as fuel is minted and mined). The reserve response includes a reservation token, fuel outputs with complete unlocking scripts, and shard references to fetch BEEF from. See `docs/API.md` for the full API guide and `docs/OPERATIONS.md` for configuration, deployment topologies, and troubleshooting.
+
+## Fund It
+
+Against a real treasury (not the nullnet/mock treasury above), top up its
+wallet balance with a BRC-29 payment from your own local BRC-100 wallet:
+
+    fuelkeeper fund --sats 100000 [--url http://127.0.0.1:8080] [--key K | FUELKEEPER_API_KEY] [--wallet http://localhost:3321] [--output-index 0]
+
+See `docs/FUNDING.md` for the full flow (including the manual HTTP/wallet
+calls and recovery from a failed submission), and `docs/TREASURY.md` for how
+the treasury turns that balance into fuel.
 
 ## Operations
 
