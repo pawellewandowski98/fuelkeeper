@@ -131,8 +131,17 @@ type wireSpendingData struct {
 }
 
 // wireSpendResponse mirrors teranode's utxo.SpendResponse JSON shape.
+//
+// Status is a pointer, not a plain int, so a response missing the field
+// entirely (or a top-level "null"/"{}") is distinguishable from a genuine
+// status 0 (OK). Teranode's SpendResponse.Status has no `omitempty`
+// (stores/utxo/spendresponse.go:15) and GetUTXOs.go's per-record fan-out
+// (lines 195-215) always yields a non-nil *SpendResponse with a set Status,
+// so a nil Status here means the response is not one teranode would send:
+// treat it as ErrUnavailable rather than guessing StatusUnspent, which would
+// let the reaper wrongly requeue a row that may still be spent.
 type wireSpendResponse struct {
-	Status       int               `json:"status"`
+	Status       *int              `json:"status"`
 	SpendingData *wireSpendingData `json:"spendingData,omitempty"`
 	LockTime     uint32            `json:"lockTime,omitempty"`
 }
@@ -203,7 +212,10 @@ func (o *Oracle) getOutpoint(ctx context.Context, op store.Outpoint) (oracle.Res
 	if err := decodeJSONLimited(resp.Body, &sr); err != nil {
 		return oracle.Result{}, fmt.Errorf("%w: decode utxo response: %w", oracle.ErrUnavailable, err)
 	}
-	return mapSpendResponse(op, sr), nil
+	if sr.Status == nil {
+		return oracle.Result{}, fmt.Errorf("%w: utxo response for %s has no status", oracle.ErrUnavailable, op)
+	}
+	return mapSpendResponse(op, &sr), nil
 }
 
 // outpointsBatch performs one POST /utxos/json for the whole batch.
@@ -235,7 +247,10 @@ func (o *Oracle) outpointsBatch(ctx context.Context, ops []store.Outpoint) ([]or
 		return nil, fmt.Errorf("%w: POST %s: unexpected status %s", oracle.ErrUnavailable, u, resp.Status)
 	}
 
-	var results []wireSpendResponse
+	// []*wireSpendResponse, not []wireSpendResponse: a rogue "null" element
+	// decodes to a nil pointer we can detect and reject, rather than
+	// silently becoming a zero-value record (status 0 / OK).
+	var results []*wireSpendResponse
 	if err := decodeJSONLimited(resp.Body, &results); err != nil {
 		return nil, fmt.Errorf("%w: decode utxos batch response: %w", oracle.ErrUnavailable, err)
 	}
@@ -243,19 +258,40 @@ func (o *Oracle) outpointsBatch(ctx context.Context, ops []store.Outpoint) ([]or
 		return nil, fmt.Errorf("%w: utxos batch response has %d records for %d requested", oracle.ErrUnavailable, len(results), len(ops))
 	}
 
+	// All-or-nothing: a single missing/statusless record invalidates the
+	// whole batch response rather than defaulting that one slot to a
+	// guessed verdict.
 	out := make([]oracle.Result, len(ops))
 	for i, op := range ops {
-		out[i] = mapSpendResponse(op, results[i])
+		sr := results[i]
+		if sr == nil || sr.Status == nil {
+			return nil, fmt.Errorf("%w: utxos batch response record %d (%s) has no status", oracle.ErrUnavailable, i, op)
+		}
+		out[i] = mapSpendResponse(op, sr)
 	}
 	return out, nil
 }
 
 // mapSpendResponse converts one teranode SpendResponse into an oracle.Result
-// for op, per the Status enum in stores/utxo/status.pb.go.
-func mapSpendResponse(op store.Outpoint, sr wireSpendResponse) oracle.Result {
-	switch sr.Status {
-	case statusOK, statusImmature:
+// for op, per the Status enum in stores/utxo/status.pb.go. sr and sr.Status
+// must be non-nil; callers check that before calling.
+func mapSpendResponse(op store.Outpoint, sr *wireSpendResponse) oracle.Result {
+	switch *sr.Status {
+	case statusOK:
+		// OK means unspent, but a non-nil spendingData alongside it is a
+		// contradiction teranode should never send. Never guess which side
+		// is right: report Unknown instead of picking Unspent.
+		if sr.SpendingData != nil {
+			return oracle.Result{Outpoint: op, Status: oracle.StatusUnknown}
+		}
 		return oracle.Result{Outpoint: op, Status: oracle.StatusUnspent}
+	case statusImmature:
+		// IMMATURE means "unspent coinbase not yet past maturity". Fuel
+		// outputs are never coinbase, so IMMATURE on a fuel outpoint means
+		// our assumptions about it are wrong somewhere, not that it is
+		// safe to spend. Never guess: report Unknown so the row stays
+		// quarantined rather than being treated as spendable.
+		return oracle.Result{Outpoint: op, Status: oracle.StatusUnknown}
 	case statusSpent:
 		res := oracle.Result{Outpoint: op, Status: oracle.StatusSpent}
 		if sr.SpendingData != nil && sr.SpendingData.TxID != "" {
@@ -309,27 +345,45 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 		return oracle.TxStatus{}, fmt.Errorf("%w: parsed tx id does not match requested %s", oracle.ErrUnavailable, txid.String())
 	}
 
-	inputs := make([]store.Outpoint, len(tx.Inputs))
-	for i, in := range tx.Inputs {
-		var srcID chainhash.Hash
-		if in.SourceTXID != nil {
-			srcID = *in.SourceTXID
-		}
-		inputs[i] = store.Outpoint{TxID: srcID, Vout: in.SourceTxOutIndex}
+	inputs, err := inputsFromTx(tx, txid)
+	if err != nil {
+		return oracle.TxStatus{}, err
 	}
 
 	return oracle.TxStatus{Known: true, Status: "known", Inputs: inputs}, nil
 }
 
-// decodeJSONLimited decodes one JSON value from body into v, refusing to
-// read past maxResponseBody+1 bytes.
+// inputsFromTx converts tx's inputs to the outpoints they spend, in order.
+// A parsed transaction input is not expected to have a nil SourceTXID (the
+// wire format always carries 32 txid bytes), but if one ever does, this
+// reports ErrUnavailable rather than silently substituting the zero hash,
+// which would fabricate an outpoint no one asked about.
+func inputsFromTx(tx *transaction.Transaction, txid chainhash.Hash) ([]store.Outpoint, error) {
+	inputs := make([]store.Outpoint, len(tx.Inputs))
+	for i, in := range tx.Inputs {
+		if in.SourceTXID == nil {
+			return nil, fmt.Errorf("%w: tx %s input %d has no source txid", oracle.ErrUnavailable, txid.String(), i)
+		}
+		inputs[i] = store.Outpoint{TxID: *in.SourceTXID, Vout: in.SourceTxOutIndex}
+	}
+	return inputs, nil
+}
+
+// decodeJSONLimited decodes exactly one JSON value from body into v,
+// refusing to read past maxResponseBody+1 bytes and rejecting any trailing
+// non-whitespace data after that value (a concatenated second value, or
+// garbage appended to the response).
 func decodeJSONLimited(body io.Reader, v any) error {
 	lr := &io.LimitedReader{R: body, N: maxResponseBody + 1}
-	if err := json.NewDecoder(lr).Decode(v); err != nil {
+	dec := json.NewDecoder(lr)
+	if err := dec.Decode(v); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	if lr.N <= 0 {
 		return fmt.Errorf("response body exceeds %d byte limit", maxResponseBody)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("decode response: unexpected trailing data after JSON value")
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ package composite
 
 import (
 	"context"
+	"slices"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
@@ -24,8 +25,15 @@ var _ oracle.Oracle = (*Oracle)(nil)
 
 // New returns an Oracle that answers Tx from tx and Outpoints from
 // outpoints. outpoints may be nil, in which case Outpoints also falls back
-// to tx. tx must not be nil.
+// to tx: with a tx-only oracle such as arcade and no outpoints oracle,
+// Outpoints then always reports Unknown, so the reaper never resolves a row
+// via a spent verdict and quarantine grows without bound (only the
+// mined-hint path can still move a row forward). tx must not be nil; New
+// panics if it is.
 func New(tx oracle.Oracle, outpoints oracle.Oracle) *Oracle {
+	if tx == nil {
+		panic("composite: tx oracle must not be nil")
+	}
 	return &Oracle{tx: tx, outpoints: outpoints}
 }
 
@@ -53,7 +61,12 @@ func (o *Oracle) Tx(ctx context.Context, txid chainhash.Hash) (oracle.TxStatus, 
 	}
 	if st.Known && st.Inputs == nil && o.outpoints != nil {
 		if sec, secErr := o.outpoints.Tx(ctx, txid); secErr == nil && sec.Inputs != nil {
-			st.Inputs = sec.Inputs
+			// Clone rather than alias: sec.Inputs may be backed by state the
+			// secondary oracle owns, and slices.Clone(nil) never happens here
+			// (sec.Inputs != nil already), so a non-nil-but-empty slice stays
+			// non-nil -- "known, spends nothing we could find" is preserved
+			// rather than collapsing to the nil "unknown" sentinel.
+			st.Inputs = slices.Clone(sec.Inputs)
 		}
 	}
 	return st, nil

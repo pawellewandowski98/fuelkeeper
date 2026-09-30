@@ -6,7 +6,11 @@
 // Outpoints always reports StatusUnknown. It also never supplies Inputs on
 // Tx, since it does not serve raw transactions. Pair this oracle with
 // pkg/oracle/composite and a teranode oracle to get outpoint verdicts and
-// input details alongside arcade's lifecycle verdict.
+// input details alongside arcade's lifecycle verdict. Used alone, or paired
+// via composite with a nil outpoints oracle, no oracle ever confirms an
+// outpoint spent, so the reaper never requeues a row through that path and
+// quarantine grows without bound; only the mined-hint path can still move a
+// row forward.
 package arcade
 
 import (

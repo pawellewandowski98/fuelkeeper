@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -32,10 +33,13 @@ type wireSpendingData struct {
 }
 
 type wireSpendResponse struct {
-	Status       int               `json:"status"`
+	Status       *int              `json:"status"`
 	SpendingData *wireSpendingData `json:"spendingData,omitempty"`
 	LockTime     uint32            `json:"lockTime,omitempty"`
 }
+
+// intPtr builds the *int wireSpendResponse.Status expects.
+func intPtr(i int) *int { return &i }
 
 func TestOutpointsSingleGET(t *testing.T) {
 	spentOp := store.Outpoint{TxID: storetest.NewTxID(), Vout: 0}
@@ -51,13 +55,13 @@ func TestOutpointsSingleGET(t *testing.T) {
 		switch {
 		case txid == spentOp.TxID.String() && vout == "0":
 			_ = json.NewEncoder(w).Encode(wireSpendResponse{
-				Status:       1,
+				Status:       intPtr(1),
 				SpendingData: &wireSpendingData{TxID: spenderTxID.String(), Vin: 0},
 			})
 		case txid == unspentOp.TxID.String() && vout == "1":
-			_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: 0})
+			_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: intPtr(0)})
 		case txid == frozenOp.TxID.String() && vout == "3":
-			_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: 5})
+			_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: intPtr(5)})
 		default:
 			http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
 		}
@@ -88,11 +92,16 @@ func TestOutpointsSingleGET(t *testing.T) {
 	assert.Equal(t, oracle.StatusConflicting, res[3].Status)
 }
 
-func TestOutpointsImmatureIsUnspent(t *testing.T) {
+// TestOutpointsImmatureIsUnknown: IMMATURE (status 2) means "unspent
+// coinbase not yet past maturity". Fuel outputs are never coinbase, so this
+// status on a fuel outpoint means something is wrong with our assumptions,
+// not that it is safe to spend -- the oracle must never guess, so it reports
+// Unknown rather than Unspent.
+func TestOutpointsImmatureIsUnknown(t *testing.T) {
 	op := store.Outpoint{TxID: storetest.NewTxID(), Vout: 0}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/utxo/{txid}/json", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: 2})
+		_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: intPtr(2)})
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -103,7 +112,7 @@ func TestOutpointsImmatureIsUnspent(t *testing.T) {
 	res, err := o.Outpoints(context.Background(), []store.Outpoint{op})
 	require.NoError(t, err)
 	require.Len(t, res, 1)
-	assert.Equal(t, oracle.StatusUnspent, res[0].Status)
+	assert.Equal(t, oracle.StatusUnknown, res[0].Status)
 }
 
 func TestOutpointsEmpty(t *testing.T) {
@@ -118,7 +127,7 @@ func TestOutpointsEmpty(t *testing.T) {
 func TestOutpointsServerDownIsUnavailable(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/utxo/{txid}/json", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: 0})
+		_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: intPtr(0)})
 	})
 	srv := httptest.NewServer(mux)
 	srv.Close() // closed before use: every request is a transport failure.
@@ -141,7 +150,7 @@ func batchServer(t *testing.T, ops []store.Outpoint, statuses []int) (*httptest.
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/utxo/{txid}/json", func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&getCount, 1)
-		_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: 0})
+		_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: intPtr(0)})
 	})
 	mux.HandleFunc("POST /api/v1/utxos/json", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&postCount, 1)
@@ -166,7 +175,7 @@ func batchServer(t *testing.T, ops []store.Outpoint, statuses []int) (*httptest.
 			vout := binary.LittleEndian.Uint32(rec[32:36])
 			assert.Equal(t, ops[i].TxID, txid, "record %d txid mismatch", i)
 			assert.Equal(t, ops[i].Vout, vout, "record %d vout mismatch", i)
-			results[i] = wireSpendResponse{Status: statuses[i]}
+			results[i] = wireSpendResponse{Status: &statuses[i]}
 		}
 		_ = json.NewEncoder(w).Encode(results)
 	})
@@ -245,7 +254,7 @@ func TestOutpointsBatchLengthMismatchIsUnavailable(t *testing.T) {
 	mux.HandleFunc("POST /api/v1/utxos/json", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
 		// Only one record for a two-op request: length mismatch.
-		_ = json.NewEncoder(w).Encode([]wireSpendResponse{{Status: 0}})
+		_ = json.NewEncoder(w).Encode([]wireSpendResponse{{Status: intPtr(0)}})
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -411,7 +420,7 @@ func TestTxCancelledContext(t *testing.T) {
 func TestOutpointsCancelledContext(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/utxo/{txid}/json", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: 0})
+		_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: intPtr(0)})
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -438,12 +447,256 @@ func TestNewTrimsTrailingSlash(t *testing.T) {
 	op := store.Outpoint{TxID: storetest.NewTxID(), Vout: 0}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/utxo/{txid}/json", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: 0})
+		_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: intPtr(0)})
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
 	o, err := teranode.NewURL(srv.URL + "/api/v1/")
+	require.NoError(t, err)
+
+	res, err := o.Outpoints(context.Background(), []store.Outpoint{op})
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	assert.Equal(t, oracle.StatusUnspent, res[0].Status)
+}
+
+// missingStatusBodies are 200 response bodies that a well-behaved teranode
+// never sends (SpendResponse.Status has no `omitempty`, and GetUTXOs.go's
+// per-record fan-out always yields a SpendResponse with a set Status) but
+// that would silently decode to StatusUnspent if Status were a plain int
+// instead of *int. Each must be rejected as ErrUnavailable rather than
+// guessed as Unspent, since guessing here could make the reaper requeue a
+// row that is still spent.
+var missingStatusBodies = map[string]string{
+	"empty object":          `{}`,
+	"top-level null":        `null`,
+	"unrelated fields only": `{"message":"ok"}`,
+	"explicit null status":  `{"status":null}`,
+}
+
+func TestOutpointsSingleGETMissingStatusIsUnavailable(t *testing.T) {
+	for name, body := range missingStatusBodies {
+		t.Run(name, func(t *testing.T) {
+			op := store.Outpoint{TxID: storetest.NewTxID(), Vout: 0}
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /api/v1/utxo/{txid}/json", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			o, err := teranode.NewURL(srv.URL + "/api/v1")
+			require.NoError(t, err)
+
+			_, err = o.Outpoints(context.Background(), []store.Outpoint{op})
+			require.ErrorIs(t, err, oracle.ErrUnavailable)
+		})
+	}
+}
+
+// missingStatusBatchBodies are POST /utxos/json response bodies with a
+// record that has no status, in the two shapes teranode never sends: a
+// JSON null in place of the record, and an object missing the field.
+var missingStatusBatchBodies = map[string]string{
+	"nil element":       `[{"status":0},null]`,
+	"empty object elem": `[{"status":0},{}]`,
+}
+
+func TestOutpointsBatchMissingStatusIsUnavailable(t *testing.T) {
+	ops := []store.Outpoint{
+		{TxID: storetest.NewTxID(), Vout: 0},
+		{TxID: storetest.NewTxID(), Vout: 1},
+	}
+	for name, body := range missingStatusBatchBodies {
+		t.Run(name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("POST /api/v1/utxos/json", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.ReadAll(r.Body)
+				_, _ = w.Write([]byte(body))
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			o, err := teranode.New(teranode.Config{BaseURL: srv.URL + "/api/v1", BatchThreshold: 1})
+			require.NoError(t, err)
+
+			res, err := o.Outpoints(context.Background(), ops)
+			require.ErrorIs(t, err, oracle.ErrUnavailable)
+			assert.Nil(t, res)
+		})
+	}
+}
+
+// TestOutpointsStatusOKWithSpendingDataIsUnknown covers N4: status OK (0)
+// together with a non-nil spendingData is a contradiction teranode should
+// never send. The oracle must not guess which side is right, so it reports
+// Unknown rather than Unspent.
+func TestOutpointsStatusOKWithSpendingDataIsUnknown(t *testing.T) {
+	op := store.Outpoint{TxID: storetest.NewTxID(), Vout: 0}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/utxo/{txid}/json", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(wireSpendResponse{
+			Status:       intPtr(0),
+			SpendingData: &wireSpendingData{TxID: storetest.NewTxID().String(), Vin: 0},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	o, err := teranode.NewURL(srv.URL + "/api/v1")
+	require.NoError(t, err)
+
+	res, err := o.Outpoints(context.Background(), []store.Outpoint{op})
+	require.NoError(t, err)
+	require.Len(t, res, 1)
+	assert.Equal(t, oracle.StatusUnknown, res[0].Status)
+}
+
+// statusTable pins the exact verdict for every teranode UTXO status code
+// (stores/utxo/status.pb.go) plus an unrecognized one, so a future edit that
+// silently changes a mapping is caught here rather than by chance in some
+// other test.
+var statusTable = []struct {
+	status   int
+	expected oracle.Status
+}{
+	{0, oracle.StatusUnspent},     // OK
+	{1, oracle.StatusSpent},       // SPENT
+	{2, oracle.StatusUnknown},     // IMMATURE: never guess (see TestOutpointsImmatureIsUnknown)
+	{3, oracle.StatusUnknown},     // NOT_FOUND
+	{4, oracle.StatusUnknown},     // ALREADY_EXISTS
+	{5, oracle.StatusConflicting}, // FROZEN
+	{6, oracle.StatusConflicting}, // CONFLICTING
+	{7, oracle.StatusUnknown},     // LOCKED
+	{99, oracle.StatusUnknown},    // unrecognized
+}
+
+func TestOutpointsAllStatusesSingleGET(t *testing.T) {
+	ops := make([]store.Outpoint, len(statusTable))
+	txid := storetest.NewTxID()
+	for i := range ops {
+		ops[i] = store.Outpoint{TxID: txid, Vout: uint32(i)}
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/utxo/{txid}/json", func(w http.ResponseWriter, r *http.Request) {
+		vout, err := strconv.Atoi(r.URL.Query().Get("vout"))
+		if !assert.NoError(t, err) {
+			return
+		}
+		_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: intPtr(statusTable[vout].status)})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// Never batch: this table exercises the single-GET mapping specifically.
+	o, err := teranode.New(teranode.Config{BaseURL: srv.URL + "/api/v1", BatchThreshold: -1})
+	require.NoError(t, err)
+
+	res, err := o.Outpoints(context.Background(), ops)
+	require.NoError(t, err)
+	require.Len(t, res, len(statusTable))
+	for i, tc := range statusTable {
+		assert.Equalf(t, tc.expected, res[i].Status, "status %d", tc.status)
+	}
+}
+
+func TestOutpointsAllStatusesBatch(t *testing.T) {
+	ops := make([]store.Outpoint, len(statusTable))
+	for i := range ops {
+		ops[i] = store.Outpoint{TxID: storetest.NewTxID(), Vout: uint32(i)}
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/utxos/json", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		results := make([]wireSpendResponse, len(statusTable))
+		for i, tc := range statusTable {
+			results[i] = wireSpendResponse{Status: intPtr(tc.status)}
+		}
+		_ = json.NewEncoder(w).Encode(results)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// A low threshold forces the batch path regardless of table size.
+	o, err := teranode.New(teranode.Config{BaseURL: srv.URL + "/api/v1", BatchThreshold: 1})
+	require.NoError(t, err)
+
+	res, err := o.Outpoints(context.Background(), ops)
+	require.NoError(t, err)
+	require.Len(t, res, len(statusTable))
+	for i, tc := range statusTable {
+		assert.Equalf(t, tc.expected, res[i].Status, "status %d", tc.status)
+	}
+}
+
+// TestOutpointsSingleGETOneFailureIsAllOrNothing covers I3: of 8 GETs, one
+// fails (500, and separately 429); the whole call must return nil results
+// and ErrUnavailable rather than 7 good verdicts and one gap.
+func TestOutpointsSingleGETOneFailureIsAllOrNothing(t *testing.T) {
+	for _, code := range []int{http.StatusInternalServerError, http.StatusTooManyRequests} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			const failVout = "3"
+			ops := make([]store.Outpoint, 8)
+			for i := range ops {
+				ops[i] = store.Outpoint{TxID: storetest.NewTxID(), Vout: uint32(i)}
+			}
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /api/v1/utxo/{txid}/json", func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("vout") == failVout {
+					w.WriteHeader(code)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(wireSpendResponse{Status: intPtr(0)})
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			// len(ops) == default BatchThreshold (8): stays on the single-GET path.
+			o, err := teranode.NewURL(srv.URL + "/api/v1")
+			require.NoError(t, err)
+
+			res, err := o.Outpoints(context.Background(), ops)
+			require.ErrorIs(t, err, oracle.ErrUnavailable)
+			assert.Nil(t, res)
+		})
+	}
+}
+
+// TestDecodeJSONLimitedRejectsTrailingData covers N3: a 200 body with valid
+// JSON followed by trailing garbage must not be accepted -- a truncated or
+// concatenated response could otherwise decode "successfully" from just its
+// leading bytes.
+func TestDecodeJSONLimitedRejectsTrailingData(t *testing.T) {
+	op := store.Outpoint{TxID: storetest.NewTxID(), Vout: 0}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/utxo/{txid}/json", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":0}garbage`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	o, err := teranode.NewURL(srv.URL + "/api/v1")
+	require.NoError(t, err)
+
+	_, err = o.Outpoints(context.Background(), []store.Outpoint{op})
+	require.ErrorIs(t, err, oracle.ErrUnavailable)
+}
+
+func TestDecodeJSONLimitedAllowsTrailingWhitespace(t *testing.T) {
+	// json.NewEncoder appends a trailing newline; that must still decode.
+	op := store.Outpoint{TxID: storetest.NewTxID(), Vout: 0}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/utxo/{txid}/json", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("{\"status\":0}\n\n  "))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	o, err := teranode.NewURL(srv.URL + "/api/v1")
 	require.NoError(t, err)
 
 	res, err := o.Outpoints(context.Background(), []store.Outpoint{op})

@@ -150,3 +150,54 @@ func TestTxNoSecondaryConfigured(t *testing.T) {
 	assert.True(t, st.Known)
 	assert.Nil(t, st.Inputs)
 }
+
+// TestTxSecondaryEmptyInputsStaysNonNil covers N2: a secondary that reports
+// Inputs as a non-nil, zero-length slice ("known, spends nothing we could
+// find") must not have that collapsed into the nil "unknown" sentinel by the
+// copy composite.Tx makes.
+func TestTxSecondaryEmptyInputsStaysNonNil(t *testing.T) {
+	ctx := context.Background()
+	txid := storetest.NewTxID()
+	txOracle := oracle.NewMock()
+	opsOracle := oracle.NewMock()
+	txOracle.SetTx(txid, oracle.TxStatus{Known: true})
+	opsOracle.SetTx(txid, oracle.TxStatus{Known: true, Inputs: []store.Outpoint{}})
+
+	c := composite.New(txOracle, opsOracle)
+	st, err := c.Tx(ctx, txid)
+	require.NoError(t, err)
+	assert.NotNil(t, st.Inputs)
+	assert.Empty(t, st.Inputs)
+}
+
+// TestTxSecondaryInputsAreClonedNotAliased covers the other half of N2:
+// composite.Tx must copy the secondary's Inputs slice rather than alias it,
+// so a caller mutating the returned slice cannot corrupt the secondary
+// oracle's own state.
+func TestTxSecondaryInputsAreClonedNotAliased(t *testing.T) {
+	ctx := context.Background()
+	txid := storetest.NewTxID()
+	txOracle := oracle.NewMock()
+	opsOracle := oracle.NewMock()
+	txOracle.SetTx(txid, oracle.TxStatus{Known: true})
+	original := []store.Outpoint{{TxID: storetest.NewTxID(), Vout: 0}}
+	opsOracle.SetTx(txid, oracle.TxStatus{Known: true, Inputs: original})
+
+	c := composite.New(txOracle, opsOracle)
+	st, err := c.Tx(ctx, txid)
+	require.NoError(t, err)
+	require.Len(t, st.Inputs, 1)
+
+	st.Inputs[0].Vout = 99
+
+	st2, err := c.Tx(ctx, txid)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(0), st2.Inputs[0].Vout, "mutating the returned Inputs must not affect later answers")
+}
+
+// TestNewPanicsOnNilTx covers N6: the primary tx oracle is required.
+func TestNewPanicsOnNilTx(t *testing.T) {
+	assert.Panics(t, func() {
+		composite.New(nil, oracle.NewMock())
+	})
+}
