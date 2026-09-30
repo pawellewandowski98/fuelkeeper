@@ -408,7 +408,7 @@ func (c *Config) Validate() error {
 			// verdict, which this oracle never gives: every released row
 			// would stay quarantined.
 			return fmt.Errorf("config: pool %s: release_policy=verify needs an oracle that answers outpoint queries, "+
-				"and oracle.kind %s does not; set oracle.teranode_url (kind composite) or oracle.kind: teranode, or use release_policy: trust",
+				"and oracle.kind %s does not; use kind: composite with oracle.teranode_url, or release_policy: trust",
 				p.Name, c.Oracle.Kind)
 		}
 	}
