@@ -65,7 +65,7 @@ func (s *Store) Reserve(_ context.Context, pool string, ops []store.ReserveOp) (
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.now()
+	now := s.clockNow()
 	applied := make([]store.ReserveOp, 0, len(ops))
 	for _, op := range ops {
 		r, ok := s.rows[op.Outpoint]
@@ -77,8 +77,9 @@ func (s *Store) Reserve(_ context.Context, pool string, ops []store.ReserveOp) (
 			r.State = store.StateReserved
 			r.ReservedBy = op.Token
 			r.ReservedAt = now
-			r.ExpiresAt = op.ExpiresAt
+			r.ExpiresAt = op.ExpiresAt.Truncate(time.Microsecond)
 			r.UpdatedAt = now
+			op.ExpiresAt = r.ExpiresAt // report the stored (truncated) expiry
 			applied = append(applied, op)
 		case r.State == store.StateReserved && r.ReservedBy == op.Token:
 			op.ExpiresAt = r.ExpiresAt // report the stored expiry on replay
@@ -98,7 +99,7 @@ func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpo
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.now()
+	now := s.clockNow()
 	n := 0
 	for _, op := range ops {
 		r, ok := s.rows[op]
@@ -184,7 +185,7 @@ func (s *Store) Quarantine(_ context.Context, pool string, before time.Time, lim
 	if len(due) > limit {
 		due = due[:limit]
 	}
-	now := s.now()
+	now := s.clockNow()
 	for _, r := range due {
 		r.State = store.StateQuarantined
 		r.QuarantinedAt = now
@@ -247,7 +248,7 @@ func (s *Store) Resolve(_ context.Context, pool string, ops []store.Outpoint, to
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.now()
+	now := s.clockNow()
 	n := 0
 	for _, op := range ops {
 		r, ok := s.rows[op]

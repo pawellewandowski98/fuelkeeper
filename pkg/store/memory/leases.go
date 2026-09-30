@@ -19,7 +19,10 @@ func (s *Store) TryAcquireOrRenew(_ context.Context, name, holder string, ttl ti
 	if ok && l.holder != holder && l.expires.After(now) {
 		return time.Time{}, nil
 	}
-	exp := now.Add(ttl)
+	// Truncate the stored/returned expiry to microsecond precision (store.go,
+	// "Clocks"): ttl itself may carry a sub-microsecond remainder even when now
+	// doesn't.
+	exp := now.Add(ttl).Truncate(time.Microsecond)
 	s.leases[name] = lease{holder: holder, expires: exp}
 	return exp, nil
 }

@@ -52,6 +52,9 @@ import (
 // expiry from their injected clock (time.Now by default). Callers pass now, before
 // and until explicitly where a comparison is made, so a single clock policy holds
 // across processes (see the design spec, "Restart / recovery, identity, clocks").
+//
+// All stored times have microsecond precision; backends truncate to the
+// microsecond on write and callers compare with time.Time.Truncate(time.Microsecond).
 type Store interface {
 	// Ping reports connectivity. It must not allocate or mutate.
 	Ping(ctx context.Context) error

@@ -28,7 +28,7 @@ func (s *Store) PutShard(_ context.Context, shard store.Shard, rows []store.Row)
 	if owner, ok := s.byTxID[shard.TxID]; ok && owner != shard.Pool {
 		return store.ErrShardExists
 	}
-	now := s.now()
+	now := s.clockNow()
 	for i := range rows {
 		r := cloneRow(&rows[i])
 		r.State = store.StateAvailable
@@ -86,7 +86,7 @@ func (s *Store) UpdateShard(_ context.Context, pool string, txid chainhash.Hash,
 		sh.BEEF = bytes.Clone(beef)
 	}
 	sh.Version++
-	sh.UpdatedAt = s.now()
+	sh.UpdatedAt = s.clockNow()
 	return nil
 }
 
@@ -104,7 +104,7 @@ func (s *Store) RetireShard(_ context.Context, pool string, txid chainhash.Hash)
 	if sh.Status == store.ShardInvalid {
 		return 0, nil
 	}
-	now := s.now()
+	now := s.clockNow()
 	sh.Status = store.ShardInvalid
 	sh.Owner, sh.LeaseUntil = "", time.Time{}
 	sh.Version++
@@ -162,8 +162,8 @@ func (s *Store) AcquireShard(_ context.Context, pool, holder string, now, until 
 		return nil, nil //nolint:nilnil // contract: (nil, nil) means nothing adoptable
 	}
 	best.Owner = holder
-	best.LeaseUntil = until
-	best.UpdatedAt = s.now()
+	best.LeaseUntil = until.Truncate(time.Microsecond)
+	best.UpdatedAt = s.clockNow()
 	c := cloneShard(best, true)
 	return &c, nil
 }
@@ -188,7 +188,7 @@ func (s *Store) RenewShard(_ context.Context, pool string, txid chainhash.Hash, 
 	if sh.Owner != holder {
 		return store.ShardHead{}, store.ErrNotOwner
 	}
-	sh.LeaseUntil = until
+	sh.LeaseUntil = until.Truncate(time.Microsecond)
 	return store.ShardHead{Status: sh.Status, Version: sh.Version}, nil
 }
 
@@ -208,7 +208,7 @@ func (s *Store) ReleaseShard(_ context.Context, pool string, txid chainhash.Hash
 	}
 	if sh.Owner == holder {
 		sh.Owner, sh.LeaseUntil = "", time.Time{}
-		sh.UpdatedAt = s.now()
+		sh.UpdatedAt = s.clockNow()
 	}
 	return nil
 }

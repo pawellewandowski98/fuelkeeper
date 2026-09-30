@@ -71,6 +71,13 @@ func (s *Store) Capabilities() store.Caps {
 // Close implements store.Store; it is idempotent.
 func (s *Store) Close() error { return nil }
 
+// clockNow returns the current time truncated to microsecond precision,
+// matching the contract's "all stored times have microsecond precision" rule
+// (store.go, "Clocks"). Postgres's TIMESTAMPTZ already has no finer native
+// resolution, so that backend gets this for free; this in-memory store must
+// truncate explicitly, since Go's time.Time carries full nanoseconds.
+func (s *Store) clockNow() time.Time { return s.now().Truncate(time.Microsecond) }
+
 func cloneShard(sh *store.Shard, withBEEF bool) store.Shard {
 	c := *sh
 	if withBEEF {

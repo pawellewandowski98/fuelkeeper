@@ -610,3 +610,32 @@ func testStatsCounts(t *testing.T, s store.Store, clk *Clock) {
 	require.NoError(t, err)
 	assert.Equal(t, store.Stats{}, empty)
 }
+
+// testTimePrecisionMicros pins the contract's "all stored times have
+// microsecond precision" rule (store.go, "Clocks"): Postgres's TIMESTAMPTZ has
+// no finer native resolution, so every backend must truncate a caller-supplied
+// time to the microsecond on write, and every caller must compare with
+// time.Time.Truncate(time.Microsecond) rather than assuming full nanosecond
+// round-tripping.
+func testTimePrecisionMicros(t *testing.T, s store.Store, clk *Clock) {
+	ctx := context.Background()
+	_, rows := MintShard(t, s, "main", 1, store.ShardMined)
+	tok := store.NewToken()
+	exp := clk.Now().Add(123456789 * time.Nanosecond)
+	wantExp := exp.Truncate(time.Microsecond)
+	require.NotEqual(t, exp, wantExp, "test setup: exp must carry a sub-microsecond remainder")
+
+	applied, err := s.Reserve(ctx, "main", ReserveOps(rows, tok, exp))
+	require.NoError(t, err)
+	require.Len(t, applied, 1)
+	assert.Equal(t, wantExp, applied[0].ExpiresAt.UTC(), "Reserve truncates ExpiresAt to microsecond precision")
+
+	got := RowsByOutpoint(t, s, "main", Ops(rows))[rows[0].Outpoint]
+	assert.Equal(t, wantExp, got.ExpiresAt.UTC(), "the stored ExpiresAt is truncated to microsecond precision")
+
+	ttl := 1500*time.Microsecond + 700*time.Nanosecond
+	wantLeaseExp := clk.Now().Add(ttl).Truncate(time.Microsecond)
+	leaseExp, err := s.TryAcquireOrRenew(ctx, "jobs/precision", "h", ttl)
+	require.NoError(t, err)
+	assert.Equal(t, wantLeaseExp, leaseExp.UTC(), "TryAcquireOrRenew truncates the lease expiry to microsecond precision")
+}

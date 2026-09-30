@@ -38,10 +38,15 @@ CREATE TABLE IF NOT EXISTS fuel_rows (
   PRIMARY KEY (txid, vout)
 );
 -- Partial indexes shrink with the live set (see the reservation review, idx_utxos_reserved lesson).
-CREATE INDEX IF NOT EXISTS fuel_rows_avail      ON fuel_rows (pool, txid, vout)      WHERE state = 0;
-CREATE INDEX IF NOT EXISTS fuel_rows_expiry     ON fuel_rows (pool, expires_at)      WHERE state = 1;
-CREATE INDEX IF NOT EXISTS fuel_rows_quar       ON fuel_rows (pool, quarantined_at)  WHERE state = 2;
-CREATE INDEX IF NOT EXISTS fuel_rows_shard_live ON fuel_rows (pool, txid)            WHERE state IN (0, 1, 2);
+-- fuel_rows_expiry and fuel_rows_quar carry (txid, vout) as trailing key columns
+-- (not just pool, expires_at/quarantined_at) so the reaper's keyset-paged scans
+-- (Quarantine's candidate CTE; ListQuarantined) can use the index's own order
+-- directly, with the row-value cursor comparison bounding the scan instead of
+-- requiring a separate sort or an unbounded re-scan from the start each page.
+CREATE INDEX IF NOT EXISTS fuel_rows_avail      ON fuel_rows (pool, txid, vout)                    WHERE state = 0;
+CREATE INDEX IF NOT EXISTS fuel_rows_expiry     ON fuel_rows (pool, expires_at, txid, vout)        WHERE state = 1;
+CREATE INDEX IF NOT EXISTS fuel_rows_quar       ON fuel_rows (pool, quarantined_at, txid, vout)    WHERE state = 2;
+CREATE INDEX IF NOT EXISTS fuel_rows_shard_live ON fuel_rows (pool, txid)                          WHERE state IN (0, 1, 2);
 CREATE INDEX IF NOT EXISTS fuel_rows_pool_state ON fuel_rows (pool, state);
 
 CREATE TABLE IF NOT EXISTS fuel_leases (

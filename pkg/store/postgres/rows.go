@@ -47,6 +47,20 @@ func sortedReserveOps(ops []store.ReserveOp) []store.ReserveOp {
 // that join fuel_rows against an unnest(...) key CTE (GetRows, Reserve).
 const rowCols = `r.txid, r.vout, r.pool, r.satoshis, r.locking_script, r.unlocking_script, r.state, r.reserved_by, r.reserved_at, r.expires_at, r.quarantined_at, r.spent_hint, r.spent_by, r.updated_at`
 
+// listQuarantinedSQL and listQuarantinedAfterSQL are ListQuarantined's two
+// variants (see its doc comment for why they are separate statements, not one
+// with an optional-cursor branch).
+const listQuarantinedSQL = `
+	SELECT ` + rowCols + ` FROM fuel_rows r
+	 WHERE r.pool = $1 AND r.state = 2 AND r.quarantined_at < $2
+	 ORDER BY r.quarantined_at, r.txid, r.vout LIMIT $3`
+
+const listQuarantinedAfterSQL = `
+	SELECT ` + rowCols + ` FROM fuel_rows r
+	 WHERE r.pool = $1 AND r.state = 2 AND r.quarantined_at < $2
+	   AND (r.quarantined_at, r.txid, r.vout) > ($3, $4, $5)
+	 ORDER BY r.quarantined_at, r.txid, r.vout LIMIT $6`
+
 func scanRow(sc rowScanner) (store.Row, error) {
 	var (
 		r                  store.Row
@@ -260,6 +274,16 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 }
 
 // ListQuarantined implements store.Store.
+//
+// Two separate statements, not one with an "after IS NULL OR ..." branch: the
+// fuel_rows_quar index now carries (quarantined_at, txid, vout) as trailing
+// key columns exactly matching the ORDER BY, so a row-value cursor comparison
+// against all three lets Postgres seek the index directly to the cursor and
+// scan forward from there (see EXPLAIN in explain_test.go). An optional-
+// parameter idiom folded into one statement routinely defeats that: the
+// planner can no longer prove which branch will run, so it falls back to
+// scanning from the start of the index and filtering, or adds an explicit
+// Sort.
 func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Time, after *store.RowCursor, limit int) ([]store.Row, error) {
 	if err := store.ValidatePool(pool); err != nil {
 		return nil, err
@@ -267,18 +291,11 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 	if err := store.ValidateLimit(limit); err != nil {
 		return nil, err
 	}
-	var cAt *time.Time
-	var cTx []byte
-	var cVout int32
-	if after != nil {
-		at := after.At
-		cAt, cTx, cVout = &at, after.Outpoint.TxID[:], int32(after.Outpoint.Vout) //nolint:gosec // bounded
+	if after == nil {
+		return s.queryRows(ctx, listQuarantinedSQL, pool, before, limit)
 	}
-	return s.queryRows(ctx, `
-		SELECT `+rowCols+` FROM fuel_rows r
-		 WHERE r.pool = $1 AND r.state = 2 AND r.quarantined_at < $2
-		   AND ($3::timestamptz IS NULL OR (r.quarantined_at, r.txid, r.vout) > ($3, $4::bytea, $5::int4))
-		 ORDER BY r.quarantined_at, r.txid, r.vout LIMIT $6`, pool, before, cAt, cTx, cVout, limit)
+	return s.queryRows(ctx, listQuarantinedAfterSQL,
+		pool, before, after.At, after.Outpoint.TxID[:], int32(after.Outpoint.Vout), limit) //nolint:gosec // bounded
 }
 
 // Resolve implements store.Store.
