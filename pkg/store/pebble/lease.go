@@ -41,11 +41,11 @@ func (s *Store) TryAcquireOrRenew(ctx context.Context, name, holder string, ttl 
 	if err != nil {
 		return time.Time{}, err
 	}
-	if cur != nil && cur.Holder != holder && fromUS(cur.Expires).After(now) {
+	if cur != nil && string(cur.Holder) != holder && fromUS(cur.Expires).After(now) {
 		return time.Time{}, nil
 	}
 	exp := now.Add(ttl).Truncate(time.Microsecond)
-	next := leaseDoc{Holder: holder, Expires: us(exp)}
+	next := leaseDoc{Holder: []byte(holder), Expires: us(exp)}
 	if err := s.db.Set(leaseKey(name), encodeLease(&next), s.wo); err != nil {
 		return time.Time{}, wrapErr(err)
 	}
@@ -72,7 +72,7 @@ func (s *Store) ReleaseLease(ctx context.Context, name, holder string) error {
 	if err != nil {
 		return err
 	}
-	if cur == nil || cur.Holder != holder {
+	if cur == nil || string(cur.Holder) != holder {
 		return nil
 	}
 	if err := s.db.Delete(leaseKey(name), s.wo); err != nil {

@@ -2,6 +2,8 @@ package pebble_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -91,69 +93,61 @@ func TestClosedStoreReturnsErrors(t *testing.T) {
 	require.Error(t, s.ReleaseLease(ctx, "jobs/x", "h"))
 }
 
-func TestCountersMatchScans(t *testing.T) {
+// TestNoOpCommitWritesNothing pins commit's empty-batch short-circuit
+// (pebble.go): a call that matches no rows/shards -- an idle reaper's
+// Quarantine tick finding nothing due, here -- must never reach Pebble's WAL,
+// since there is nothing to make durable. It checks this at the strongest
+// level available from outside the package: total bytes on disk, before and
+// after, must be identical, not just "no error and unaffected counters" (both
+// of which are checked too, since a no-op ought to guarantee them regardless
+// of whether it also avoided writing anything).
+func TestNoOpCommitWritesNothing(t *testing.T) {
 	ctx := context.Background()
-	clk := storetest.NewClock(storetest.Start)
-	s, err := pebblestore.Open(ctx, pebblestore.Config{Path: t.TempDir(), NoSync: true}, pebblestore.WithClock(clk.Now))
+	dir := t.TempDir()
+	s, err := pebblestore.Open(ctx, pebblestore.Config{Path: dir})
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
 
-	const pool = "main"
-	var rows []store.Row
-	for i := 0; i < 6; i++ {
-		_, rs := storetest.MintShard(t, s, pool, 5, store.ShardMined)
-		rows = append(rows, rs...)
-	}
-
-	rng := newRNG(12345)
-	var tokens []store.Token
-	for i := 0; i < 20; i++ {
-		tokens = append(tokens, store.NewToken())
-	}
-
-	for i := 0; i < 400; i++ {
-		clk.Advance(time.Millisecond)
-		op := rows[rng.Intn(len(rows))].Outpoint
-		tok := tokens[rng.Intn(len(tokens))]
-		switch rng.Intn(7) {
-		case 0:
-			_, _ = s.Reserve(ctx, pool, []store.ReserveOp{{Outpoint: op, Token: tok, ExpiresAt: clk.Now().Add(time.Minute)}})
-		case 1:
-			_, _ = s.Release(ctx, pool, tok, []store.Outpoint{op})
-		case 2:
-			_, _ = s.Spend(ctx, pool, tok, []store.Outpoint{op}, storetest.NewTxID(), false)
-		case 3:
-			_, _ = s.Spend(ctx, pool, tok, []store.Outpoint{op}, storetest.NewTxID(), true)
-		case 4:
-			_, _ = s.Quarantine(ctx, pool, clk.Now(), 5)
-		case 5:
-			txid := storetest.NewTxID()
-			_, _ = s.Resolve(ctx, pool, []store.Outpoint{op}, store.StateAvailable, &txid)
-		case 6:
-			if rng.Intn(10) == 0 {
-				sh := rows[rng.Intn(len(rows))].TxID
-				_, _ = s.RetireShard(ctx, pool, sh)
-			}
-		}
-	}
-
-	st, err := s.Stats(ctx, pool)
+	before, err := diskUsage(t, dir)
 	require.NoError(t, err)
-	scanned := pebblestore.ScanStats(t, s, pool)
-	require.Equal(t, scanned, st)
+
+	for i := 0; i < 20; i++ {
+		n, err := s.Quarantine(ctx, "main", time.Now().Add(time.Hour), 10)
+		require.NoError(t, err)
+		require.Equal(t, 0, n, "nothing exists yet, so nothing can be due")
+	}
+
+	after, err := diskUsage(t, dir)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "a no-op Quarantine must not write anything to disk (no WAL growth)")
+
+	st, err := s.Stats(ctx, "main")
+	require.NoError(t, err)
+	require.Equal(t, store.Stats{}, st, "counters must stay correct after no-op calls")
 }
 
-// newRNG returns a tiny deterministic PRNG (avoids importing math/rand here
-// twice with differing seeding conventions across Go versions).
-func newRNG(seed int64) *rngState { return &rngState{state: uint64(seed) | 1} }
-
-type rngState struct{ state uint64 }
-
-func (r *rngState) Intn(n int) int {
-	// xorshift64*
-	r.state ^= r.state >> 12
-	r.state ^= r.state << 25
-	r.state ^= r.state >> 27
-	v := r.state * 2685821657736338717
-	return int(v % uint64(n)) //nolint:gosec // test-only PRNG
+// diskUsage sums the size of every file under dir.
+func diskUsage(t *testing.T, dir string) (int64, error) {
+	t.Helper()
+	var total int64
+	err := filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+		return nil
+	})
+	return total, err
 }
+
+// TestDifferentialFuzz lives in differential_fuzz_test.go: it replaces the
+// former TestCountersMatchScans with a much stronger check, comparing pebble
+// against pkg/store/memory op-by-op instead of only checking pebble's own
+// counters against its own scans.

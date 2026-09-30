@@ -209,3 +209,46 @@ func testPoolIsolation(t *testing.T, s store.Store, clk *Clock) {
 	require.NoError(t, err)
 	assert.Len(t, leaseAvail, len(leaseRows), "cross-pool shard-write calls must not touch main's rows")
 }
+
+// testNamesMustBeUTF8 pins store.go's "Names" rule: pool, holder and lease
+// names must be valid UTF-8 and free of NUL bytes. A JSON-backed backend's
+// string encoding would otherwise silently replace an invalid UTF-8 byte with
+// U+FFFD instead of rejecting it, and a SQL backend's TEXT column cannot hold
+// either an invalid UTF-8 byte sequence or a NUL byte in the first place; both
+// must reject the same malformed name the same way, with ErrInvalidArgument,
+// before it ever reaches storage.
+func testNamesMustBeUTF8(t *testing.T, s store.Store, clk *Clock) {
+	ctx := context.Background()
+
+	invalidPool, invalidPoolRows := BuildShard("p\xff", 1, store.ShardMined)
+	require.ErrorIs(t, s.PutShard(ctx, invalidPool, invalidPoolRows), store.ErrInvalidArgument, "pool with an invalid UTF-8 byte")
+	_, err := s.GetShard(ctx, "p\xff", invalidPool.TxID)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "GetShard must reject the same pool the same way")
+
+	nulPool, nulPoolRows := BuildShard("p\x00", 1, store.ShardMined)
+	require.ErrorIs(t, s.PutShard(ctx, nulPool, nulPoolRows), store.ErrInvalidArgument, "pool with a NUL byte")
+
+	sh, _ := MintShard(t, s, "main", 1, store.ShardMined)
+	_, err = s.AcquireShard(ctx, "main", "h\xfe", clk.Now(), clk.Now().Add(time.Minute), []store.ShardStatus{store.ShardMined}, nil)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "holder with an invalid UTF-8 byte")
+	_, err = s.AcquireShard(ctx, "main", "h\x00", clk.Now(), clk.Now().Add(time.Minute), []store.ShardStatus{store.ShardMined}, nil)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "holder with a NUL byte")
+	require.ErrorIs(t, s.ReleaseShard(ctx, "main", sh.TxID, "h\xfe"), store.ErrInvalidArgument, "ReleaseShard holder with an invalid UTF-8 byte")
+	_, err = s.RenewShard(ctx, "main", sh.TxID, "h\xfe", clk.Now().Add(time.Minute))
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "RenewShard holder with an invalid UTF-8 byte")
+
+	_, err = s.TryAcquireOrRenew(ctx, "jobs/\xff", "h", time.Minute)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "lease name with an invalid UTF-8 byte")
+	_, err = s.TryAcquireOrRenew(ctx, "jobs/\x00reaper", "h", time.Minute)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "lease name with a NUL byte")
+	_, err = s.TryAcquireOrRenew(ctx, "jobs/reaper", "h\xfe", time.Minute)
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "lease holder with an invalid UTF-8 byte")
+	require.ErrorIs(t, s.ReleaseLease(ctx, "jobs/\xff", "h"), store.ErrInvalidArgument, "ReleaseLease name with an invalid UTF-8 byte")
+	require.ErrorIs(t, s.ReleaseLease(ctx, "jobs/reaper", "h\xfe"), store.ErrInvalidArgument, "ReleaseLease holder with an invalid UTF-8 byte")
+
+	// None of the rejected calls above may have created anything: a fresh,
+	// well-formed lease acquire must still see the lease as free.
+	until, err := s.TryAcquireOrRenew(ctx, "jobs/reaper", "h", time.Minute)
+	require.NoError(t, err)
+	assert.False(t, until.IsZero())
+}

@@ -35,6 +35,7 @@ func subtests() []subtest {
 		{"ShardLeaseBoundary", testShardLeaseBoundary},
 		{"ArgumentValidation", testArgumentValidation},
 		{"PoolIsolation", testPoolIsolation},
+		{"NamesMustBeUTF8", testNamesMustBeUTF8},
 		{"ReserveBasic", testReserveBasic},
 		{"ReserveMixedTokensMixedShards", testReserveMixedTokensMixedShards},
 		{"SameTokenNeverRevives", testSameTokenNeverRevives},

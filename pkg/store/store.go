@@ -46,6 +46,19 @@ import (
 // available, clears all five. UpdatedAt is stamped by every state change except a
 // same-token Reserve replay (see "Idempotency").
 //
+// # Names
+//
+// pool, holder (AcquireShard, RenewShard, ReleaseShard, TryAcquireOrRenew,
+// ReleaseLease) and lease names (TryAcquireOrRenew, ReleaseLease) must be
+// non-empty, at most their documented byte length, valid UTF-8, and free of
+// NUL bytes: ValidatePool, ValidateHolder and ValidateLeaseName enforce this
+// uniformly so every backend rejects the same malformed name the same way,
+// with ErrInvalidArgument — rather than a SQL backend surfacing a raw
+// driver-level error for a TEXT column that cannot hold invalid UTF-8 or a
+// NUL byte, or a JSON-backed backend silently corrupting the name (Go's JSON
+// encoder replaces an invalid UTF-8 byte with the Unicode replacement
+// character U+FFFD on a string field) instead of rejecting it up front.
+//
 // # Clocks
 //
 // Backends stamp created_at / reserved_at / quarantined_at / updated_at and lease
@@ -55,6 +68,17 @@ import (
 //
 // All stored times have microsecond precision; backends truncate to the
 // microsecond on write and callers compare with time.Time.Truncate(time.Microsecond).
+//
+// A non-zero time argument that is stored as data (AcquireShard's until, each
+// Reserve op's ExpiresAt) must be strictly after the Unix epoch: ValidateTime
+// rejects anything else with ErrInvalidArgument. The zero time itself is
+// always accepted separately wherever it means "unset" (ReservedAt, ExpiresAt,
+// QuarantinedAt and LeaseUntil before their field is ever set); it is never
+// treated as a data value needing this check. This matters because the zero
+// time and the exact Unix epoch instant round-trip through every backend's
+// on-disk time encoding identically (both are stored as 0), so accepting an
+// epoch-or-earlier value as real data would make it indistinguishable from
+// "unset" once read back.
 //
 // # Errors
 //

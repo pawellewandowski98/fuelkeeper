@@ -99,14 +99,43 @@ func (s *Store) Reserve(ctx context.Context, pool string, ops []store.ReserveOp)
 		return nil, errClosed
 	}
 	now := s.now().Truncate(time.Microsecond)
+	sorted := store.SortReserveOps(ops)
+
+	// Above reserveSeekThreshold ops, resolving every row via its own
+	// DB.Get point lookup (as below) does one B-tree/SSTable descent per op;
+	// since sorted's outpoints are already in the same ascending order as
+	// their row keys (rowKey's encoding preserves LessOutpoint's ordering),
+	// a single forward iterator walking sorted once (loadRowsSorted) instead
+	// resolves the whole batch in one pass. Below the threshold, a handful of
+	// point Gets skips the iterator's setup cost and is simply faster; see
+	// BenchmarkReserveRowLookup for the crossover.
+	var preloaded map[store.Outpoint]*store.Row
+	if len(sorted) > reserveSeekThreshold {
+		outs := make([]store.Outpoint, len(sorted))
+		for i, op := range sorted {
+			outs[i] = op.Outpoint
+		}
+		var err error
+		preloaded, err = s.loadRowsSorted(outs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	b := s.db.NewBatch()
 	defer func() { _ = b.Close() }()
 	deltas := map[string]int64{}
-	applied := make([]store.ReserveOp, 0, len(ops))
-	for _, op := range store.SortReserveOps(ops) {
-		r, err := s.loadRow(op.Outpoint)
-		if err != nil {
-			return nil, err
+	applied := make([]store.ReserveOp, 0, len(sorted))
+	for _, op := range sorted {
+		var r *store.Row
+		if preloaded != nil {
+			r = preloaded[op.Outpoint] // nil for a missing row, exactly like loadRow's nil-on-missing result
+		} else {
+			var err error
+			r, err = s.loadRow(op.Outpoint)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if r == nil || r.Pool != pool {
 			continue
@@ -225,7 +254,10 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 	})
 }
 
-// Quarantine implements store.Store.
+// Quarantine implements store.Store. It additionally rejects a pre-epoch (or
+// exact-epoch) before with ErrInvalidArgument via store.ValidateTime: this
+// backend-specific check is not yet part of the shared conformance suite,
+// since it isn't (yet) applied by every other backend's Quarantine.
 func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, limit int) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -234,6 +266,9 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 		return 0, err
 	}
 	if err := store.ValidateLimit(limit); err != nil {
+		return 0, err
+	}
+	if err := store.ValidateTime(before, "before"); err != nil {
 		return 0, err
 	}
 	before = before.Truncate(time.Microsecond)
@@ -289,7 +324,10 @@ func (s *Store) Quarantine(ctx context.Context, pool string, before time.Time, l
 	return n, nil
 }
 
-// ListQuarantined implements store.Store.
+// ListQuarantined implements store.Store. It additionally rejects a
+// pre-epoch (or exact-epoch) before with ErrInvalidArgument via
+// store.ValidateTime; see Quarantine's doc comment for why this is not yet a
+// suite-wide conformance requirement.
 func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Time, after *store.RowCursor, limit int) ([]store.Row, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -298,6 +336,9 @@ func (s *Store) ListQuarantined(ctx context.Context, pool string, before time.Ti
 		return nil, err
 	}
 	if err := store.ValidateLimit(limit); err != nil {
+		return nil, err
+	}
+	if err := store.ValidateTime(before, "before"); err != nil {
 		return nil, err
 	}
 	before = before.Truncate(time.Microsecond)

@@ -12,10 +12,18 @@ import (
 // rowDoc is the on-disk JSON encoding of a store.Row. Field names are
 // abbreviated to keep the value small; this is a stable on-disk format, not a
 // wire format, so it is never exposed outside this package.
+//
+// Pool is []byte, not string: encoding/json's string encoding replaces an
+// invalid UTF-8 byte with the Unicode replacement character U+FFFD instead of
+// failing, which would silently corrupt a pool name on write. ValidatePool
+// already rejects invalid UTF-8 before a name ever reaches this codec (see
+// store.go, "Names"), so this is defence in depth, not the primary guard: a
+// []byte field is base64-encoded, which round-trips any byte sequence
+// exactly regardless of content.
 type rowDoc struct {
 	TxID  []byte `json:"t"`
 	Vout  uint32 `json:"v"`
-	Pool  string `json:"p"`
+	Pool  []byte `json:"p"`
 	Sats  uint64 `json:"s"`
 	Lock  []byte `json:"l"`
 	Unl   []byte `json:"u"`
@@ -34,7 +42,7 @@ func encodeRow(r *store.Row) []byte {
 	d := rowDoc{
 		TxID:  r.TxID[:],
 		Vout:  r.Vout,
-		Pool:  r.Pool,
+		Pool:  []byte(r.Pool),
 		Sats:  r.Satoshis,
 		Lock:  r.LockingScript,
 		Unl:   r.UnlockingScript,
@@ -61,19 +69,23 @@ func encodeRow(r *store.Row) []byte {
 	return b
 }
 
-// decodeRow unmarshals a row from its on-disk JSON form.
+// decodeRow unmarshals a row from its on-disk JSON form. Every error path
+// wraps store.ErrUnavailable: a decode failure here means the on-disk record
+// is corrupt (or from an incompatible future format), which is an
+// infrastructure problem the caller may retry or escalate, not a malformed
+// argument it passed in.
 func decodeRow(b []byte) (store.Row, error) {
 	var d rowDoc
 	if err := json.Unmarshal(b, &d); err != nil {
-		return store.Row{}, fmt.Errorf("pebble: decode row: %w", err)
+		return store.Row{}, fmt.Errorf("%w: pebble: corrupt row record: %w", store.ErrUnavailable, err)
 	}
 	txid, err := chainhash.NewHash(d.TxID)
 	if err != nil {
-		return store.Row{}, fmt.Errorf("pebble: decode row txid: %w", err)
+		return store.Row{}, fmt.Errorf("%w: pebble: corrupt row record: bad txid: %w", store.ErrUnavailable, err)
 	}
 	r := store.Row{
 		Outpoint:        store.Outpoint{TxID: *txid, Vout: d.Vout},
-		Pool:            d.Pool,
+		Pool:            string(d.Pool),
 		Satoshis:        d.Sats,
 		LockingScript:   d.Lock,
 		UnlockingScript: d.Unl,
@@ -89,29 +101,30 @@ func decodeRow(b []byte) (store.Row, error) {
 	if len(d.Hint) == chainhash.HashSize {
 		h, herr := chainhash.NewHash(d.Hint)
 		if herr != nil {
-			return store.Row{}, fmt.Errorf("pebble: decode row hint: %w", herr)
+			return store.Row{}, fmt.Errorf("%w: pebble: corrupt row record: bad spend hint: %w", store.ErrUnavailable, herr)
 		}
 		r.SpentHint = h
 	}
 	if len(d.SB) == chainhash.HashSize {
 		h, herr := chainhash.NewHash(d.SB)
 		if herr != nil {
-			return store.Row{}, fmt.Errorf("pebble: decode row spent-by: %w", herr)
+			return store.Row{}, fmt.Errorf("%w: pebble: corrupt row record: bad spent-by: %w", store.ErrUnavailable, herr)
 		}
 		r.SpentBy = h
 	}
 	return r, nil
 }
 
-// shardDoc is the on-disk JSON encoding of a store.Shard.
+// shardDoc is the on-disk JSON encoding of a store.Shard. Pool and Owner are
+// []byte for the same reason as rowDoc.Pool (see its doc comment).
 type shardDoc struct {
-	Pool    string `json:"p"`
+	Pool    []byte `json:"p"`
 	TxID    []byte `json:"t"`
 	Size    int    `json:"n"`
 	Denom   uint64 `json:"d"`
 	Mode    uint8  `json:"m"`
 	Status  uint8  `json:"s"`
-	Owner   string `json:"o,omitempty"`
+	Owner   []byte `json:"o,omitempty"`
 	LU      uint64 `json:"lu,omitempty"`
 	Version int64  `json:"v"`
 	BEEF    []byte `json:"b"`
@@ -122,13 +135,13 @@ type shardDoc struct {
 // encodeShard marshals a shard to its on-disk JSON form.
 func encodeShard(sh *store.Shard) []byte {
 	d := shardDoc{
-		Pool:    sh.Pool,
+		Pool:    []byte(sh.Pool),
 		TxID:    sh.TxID[:],
 		Size:    sh.Size,
 		Denom:   sh.Denomination,
 		Mode:    uint8(sh.LockMode), //nolint:gosec // small enum
 		Status:  uint8(sh.Status),   //nolint:gosec // small enum
-		Owner:   sh.Owner,
+		Owner:   []byte(sh.Owner),
 		LU:      us(sh.LeaseUntil),
 		Version: sh.Version,
 		BEEF:    sh.BEEF,
@@ -142,24 +155,25 @@ func encodeShard(sh *store.Shard) []byte {
 	return b
 }
 
-// decodeShard unmarshals a shard from its on-disk JSON form.
+// decodeShard unmarshals a shard from its on-disk JSON form. Every error path
+// wraps store.ErrUnavailable; see decodeRow's doc comment for why.
 func decodeShard(b []byte) (store.Shard, error) {
 	var d shardDoc
 	if err := json.Unmarshal(b, &d); err != nil {
-		return store.Shard{}, fmt.Errorf("pebble: decode shard: %w", err)
+		return store.Shard{}, fmt.Errorf("%w: pebble: corrupt shard record: %w", store.ErrUnavailable, err)
 	}
 	txid, err := chainhash.NewHash(d.TxID)
 	if err != nil {
-		return store.Shard{}, fmt.Errorf("pebble: decode shard txid: %w", err)
+		return store.Shard{}, fmt.Errorf("%w: pebble: corrupt shard record: bad txid: %w", store.ErrUnavailable, err)
 	}
 	return store.Shard{
-		Pool:         d.Pool,
+		Pool:         string(d.Pool),
 		TxID:         *txid,
 		Size:         d.Size,
 		Denomination: d.Denom,
 		LockMode:     store.LockMode(d.Mode),      //nolint:gosec // small enum
 		Status:       store.ShardStatus(d.Status), //nolint:gosec // small enum
-		Owner:        d.Owner,
+		Owner:        string(d.Owner),
 		LeaseUntil:   fromUS(d.LU),
 		Version:      d.Version,
 		BEEF:         d.BEEF,
@@ -168,9 +182,10 @@ func decodeShard(b []byte) (store.Shard, error) {
 	}, nil
 }
 
-// leaseDoc is the on-disk JSON encoding of a job lease.
+// leaseDoc is the on-disk JSON encoding of a job lease. Holder is []byte for
+// the same reason as rowDoc.Pool (see its doc comment).
 type leaseDoc struct {
-	Holder  string `json:"h"`
+	Holder  []byte `json:"h"`
 	Expires uint64 `json:"e"`
 }
 
@@ -183,11 +198,12 @@ func encodeLease(d *leaseDoc) []byte {
 	return b
 }
 
-// decodeLease unmarshals a lease from its on-disk JSON form.
+// decodeLease unmarshals a lease from its on-disk JSON form. Its error path
+// wraps store.ErrUnavailable; see decodeRow's doc comment for why.
 func decodeLease(b []byte) (leaseDoc, error) {
 	var d leaseDoc
 	if err := json.Unmarshal(b, &d); err != nil {
-		return leaseDoc{}, fmt.Errorf("pebble: decode lease: %w", err)
+		return leaseDoc{}, fmt.Errorf("%w: pebble: corrupt lease record: %w", store.ErrUnavailable, err)
 	}
 	return d, nil
 }

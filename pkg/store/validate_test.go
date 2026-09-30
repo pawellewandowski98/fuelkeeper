@@ -130,9 +130,18 @@ func TestValidateOutpointsAndMisc(t *testing.T) {
 	require.NoError(t, store.ValidatePool("main"))
 	require.ErrorIs(t, store.ValidatePool(""), store.ErrInvalidArgument)
 	require.ErrorIs(t, store.ValidatePool(string(make([]byte, 65))), store.ErrInvalidArgument)
+	require.ErrorIs(t, store.ValidatePool("p\xff"), store.ErrInvalidArgument, "invalid UTF-8 byte")
+	require.ErrorIs(t, store.ValidatePool("p\x00"), store.ErrInvalidArgument, "NUL byte")
+	require.NoError(t, store.ValidatePool("café"), "valid multi-byte UTF-8 is fine")
 
 	require.NoError(t, store.ValidateHolder("inst-1/abc"))
 	require.ErrorIs(t, store.ValidateHolder(""), store.ErrInvalidArgument)
+	require.ErrorIs(t, store.ValidateHolder("h\xfe"), store.ErrInvalidArgument, "invalid UTF-8 byte")
+	require.ErrorIs(t, store.ValidateHolder("h\x00"), store.ErrInvalidArgument, "NUL byte")
+
+	require.NoError(t, store.ValidateLeaseName("jobs/reaper"))
+	require.ErrorIs(t, store.ValidateLeaseName("jobs/\xff"), store.ErrInvalidArgument, "invalid UTF-8 byte")
+	require.ErrorIs(t, store.ValidateLeaseName("jobs/\x00reaper"), store.ErrInvalidArgument, "NUL byte")
 
 	require.NoError(t, store.ValidateLimit(1))
 	require.ErrorIs(t, store.ValidateLimit(0), store.ErrInvalidArgument)
@@ -154,4 +163,33 @@ func TestValidateOutpointsAndMisc(t *testing.T) {
 
 	require.NoError(t, store.ValidateUpdateStatus(store.ShardRetired))
 	require.ErrorIs(t, store.ValidateUpdateStatus(store.ShardInvalid), store.ErrInvalidArgument)
+}
+
+func TestValidateTime(t *testing.T) {
+	require.NoError(t, store.ValidateTime(time.Time{}, "x"), "the zero time is always allowed")
+	require.NoError(t, store.ValidateTime(time.Unix(0, 1), "x"), "1ns after the epoch is fine")
+	require.NoError(t, store.ValidateTime(time.Now(), "x"))
+
+	require.ErrorIs(t, store.ValidateTime(time.Unix(0, 0), "x"), store.ErrInvalidArgument, "the exact epoch instant collides with the zero-time sentinel on disk")
+	require.ErrorIs(t, store.ValidateTime(time.Unix(-1, 0), "x"), store.ErrInvalidArgument, "before the epoch")
+	require.ErrorIs(t, store.ValidateTime(time.Unix(0, 0).Add(-time.Hour), "x"), store.ErrInvalidArgument)
+}
+
+func TestValidateAcquireUntilRejectsPreEpoch(t *testing.T) {
+	now := time.Now()
+	require.ErrorIs(t, store.ValidateAcquireUntil(time.Unix(0, 0), now), store.ErrInvalidArgument)
+	require.ErrorIs(t, store.ValidateAcquireUntil(time.Unix(-100, 0), now), store.ErrInvalidArgument)
+	require.NoError(t, store.ValidateAcquireUntil(now.Add(time.Minute), now))
+}
+
+func TestValidateReserveOpsRejectsPreEpochExpiry(t *testing.T) {
+	tok := store.NewToken()
+	preEpoch := []store.ReserveOp{{Outpoint: store.Outpoint{TxID: hashN(1), Vout: 0}, Token: tok, ExpiresAt: time.Unix(0, 0)}}
+	require.ErrorIs(t, store.ValidateReserveOps(preEpoch, 10), store.ErrInvalidArgument)
+
+	negative := []store.ReserveOp{{Outpoint: store.Outpoint{TxID: hashN(1), Vout: 0}, Token: tok, ExpiresAt: time.Unix(-1, 0)}}
+	require.ErrorIs(t, store.ValidateReserveOps(negative, 10), store.ErrInvalidArgument)
+
+	ok := []store.ReserveOp{{Outpoint: store.Outpoint{TxID: hashN(1), Vout: 0}, Token: tok, ExpiresAt: time.Now().Add(time.Minute)}}
+	require.NoError(t, store.ValidateReserveOps(ok, 10))
 }
