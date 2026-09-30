@@ -141,6 +141,30 @@ type Row struct {
 	SpentBy       string     `json:"spent_by,omitempty"`
 }
 
+// FundingInfo tells a payer how to pay the treasury (BRC-29 wallet payment).
+type FundingInfo struct {
+	IdentityKey      string `json:"identity_key"`      // treasury identity key, DER hex
+	DerivationPrefix string `json:"derivation_prefix"` // base64 nonce; use once per payment
+	Network          string `json:"network"`
+	Protocol         string `json:"protocol"` // "3241645161d8" (BRC-29), security level 2
+	Instructions     string `json:"instructions"`
+}
+
+// FundRequest is a completed payment.
+type FundRequest struct {
+	AtomicBEEF        string `json:"atomic_beef"`       // base64
+	OutputIndex       *int   `json:"output_index"`      // omit to auto-detect
+	DerivationPrefix  string `json:"derivation_prefix"` // base64, from FundingInfo
+	DerivationSuffix  string `json:"derivation_suffix"` // base64, chosen by the payer
+	SenderIdentityKey string `json:"sender_identity_key"`
+}
+
+// FundResult is what was internalized.
+type FundResult struct {
+	TxID     string `json:"txid"`
+	Satoshis uint64 `json:"satoshis"`
+}
+
 // Error is the error envelope.
 type Error struct {
 	Code       string `json:"code"`

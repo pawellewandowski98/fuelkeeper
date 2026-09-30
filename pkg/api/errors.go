@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/api/wire"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/treasury"
 )
 
 // statusClientClosedRequest is the (non-standard, but widely used) status for
@@ -21,14 +22,25 @@ const statusClientClosedRequest = 499
 // error. FuelKeeper has no better estimate to offer than "try again shortly".
 const retryAfterSeconds = 1
 
-// mapErr maps a pool/store/context error to an HTTP status, a stable error
-// code and, for retryable errors, the number of seconds a client should wait
-// before retrying (0 when the error is not retryable).
+// mapErr maps a pool/store/treasury/context error to an HTTP status, a stable
+// error code and, for retryable errors, the number of seconds a client should
+// wait before retrying (0 when the error is not retryable).
 //
 // Deviation from the original plan: a request whose client went away
 // (context.Canceled) maps to 499 client_closed_request with no Retry-After,
 // not 503 unavailable; context.DeadlineExceeded still maps to 503
 // unavailable.
+//
+// Two funding-only codes are not produced here: "funding_disabled" (404) is
+// written directly by the funding handlers when Deps.Funder is nil -- there is
+// no corresponding Go error, only a configuration condition -- following the
+// same direct-write pattern notFoundHandler and optionsOrMethodNotAllowed use
+// for "not_found"/"method_not_allowed". A treasury.Funder error that is not
+// treasury.ErrBadFunding is also not funneled through here: the funding
+// handlers map it to 503 "unavailable" themselves (see writeFunderError)
+// rather than falling through to this function's "internal" default, since an
+// arbitrary Funder failure (the toolbox may be mid-broadcast) is expected to
+// be transient, unlike an unrecognized pool/store error.
 func mapErr(err error) (status int, code string, retryAfter int) {
 	switch {
 	case errors.Is(err, context.Canceled):
@@ -37,6 +49,8 @@ func mapErr(err error) (status int, code string, retryAfter int) {
 		return http.StatusServiceUnavailable, "unavailable", retryAfterSeconds
 	case errors.Is(err, pool.ErrBadRequest), errors.Is(err, store.ErrInvalidArgument):
 		return http.StatusBadRequest, "bad_request", 0
+	case errors.Is(err, treasury.ErrBadFunding):
+		return http.StatusBadRequest, "bad_funding", 0
 	case errors.Is(err, pool.ErrUnknownPool):
 		return http.StatusNotFound, "unknown_pool", 0
 	case errors.Is(err, store.ErrNotFound):

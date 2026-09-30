@@ -12,6 +12,7 @@ import (
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/treasury"
 )
 
 func TestMapErr(t *testing.T) {
@@ -25,6 +26,8 @@ func TestMapErr(t *testing.T) {
 		{errors.Join(pool.ErrBadRequest, errors.New("x")), 400, "bad_request", false},
 		{store.ErrInvalidArgument, 400, "bad_request", false},
 		{pool.ErrUnknownPool, 404, "unknown_pool", false},
+		{treasury.ErrBadFunding, 400, "bad_funding", false},
+		{errors.Join(treasury.ErrBadFunding, errors.New("derivation mismatch")), 400, "bad_funding", false},
 		{store.ErrNotFound, 404, "not_found", false},
 		{pool.ErrInsufficient, 409, "insufficient", true},
 		{pool.ErrExhausted, 503, "exhausted", true},

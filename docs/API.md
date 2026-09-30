@@ -84,7 +84,7 @@ All non-2xx responses are JSON with the shape `{"code", "message", "retry_after"
 
 All `/v1/` operations require a fuel API key in the `Authorization: Bearer <key>` header when `api.api_keys` is configured in the server. 
 
-Admin operations (list/retire shards, list/requeue quarantined rows) require an admin key when `api.admin_keys` is configured; otherwise they accept fuel keys. 
+Admin operations (list/retire shards, list/requeue quarantined rows) and both funding operations (`GET`/`POST /v1/funding`) require an admin key when `api.admin_keys` is configured; otherwise they accept fuel keys. 
 
 With no keys configured, the API is open (development mode only).
 
@@ -100,6 +100,56 @@ The four admin operations require authentication (admin key when configured, els
 - **Requeue quarantined rows**: `POST /v1/pools/{pool}/quarantined/requeue` with `{"outpoints": [...]}` → `{"requeued": N}` (returns rows to the pool; use when you know they are unspent)
 
 Use the CLI or Go client (see below) to invoke these.
+
+## Funding the Treasury (BRC-29)
+
+FuelKeeper's treasury mints fuel from its own wallet balance. `GET`/`POST /v1/funding` let an operator top that balance up via a [BRC-29](https://github.com/bitcoin-sv/BRCs/blob/master/wallet/0029.md) wallet-to-wallet payment, driven from the operator's own BRC-100 wallet (e.g. the `fuelkeeper fund` CLI below). **Both operations are admin-tier**: funding is an operator action, and gating it behind an admin key (when `api.admin_keys` is configured) prevents anonymous nonce/BEEF spam. When no treasury is configured (e.g. nullnet/mock mode), both answer `404 funding_disabled`.
+
+### Flow
+
+1. **Get funding instructions**: `GET /v1/funding` → the treasury's identity key, a fresh derivation-prefix nonce, and the BRC-29 protocol ID.
+
+   ```json
+   GET /v1/funding
+
+   { "identity_key": "02ab...", "derivation_prefix": "b64nonce==",
+     "network": "main", "protocol": "3241645161d8",
+     "instructions": "Derive a BRC-29 key with GetPublicKey{...}, pay a P2PKH output to it, then POST the AtomicBEEF, prefix, suffix and your identity key here." }
+   ```
+
+2. **Derive a payment key** with your own wallet: `GetPublicKey{protocolID: [2, "3241645161d8"], keyID: "<derivation_prefix> <your suffix>", counterparty: identity_key}`, where `<your suffix>` is a fresh base64 value you choose (e.g. 8 random bytes).
+3. **Pay** a P2PKH output to the derived key's address with your wallet's `CreateAction` (or equivalent).
+4. **Submit the payment**: `POST /v1/funding` with the AtomicBEEF of the transaction you just created, the prefix and suffix, and your own identity key.
+
+   ```json
+   POST /v1/funding
+   { "atomic_beef": "<base64 AtomicBEEF>", "output_index": 0,
+     "derivation_prefix": "b64nonce==", "derivation_suffix": "<your base64 suffix>",
+     "sender_identity_key": "<your identity key, DER hex>" }
+
+   → { "txid": "...", "satoshis": 5000 }
+   ```
+
+   `output_index` may be omitted to ask the treasury to auto-detect the payment output; as of this version that auto-detect path is not yet supported and answers `400 bad_funding`, so pass the output's actual index explicitly.
+
+### Errors
+
+| Status | Code | Meaning | Retry-After |
+|--------|------|---------|-------------|
+| 400 | `bad_request` | Malformed request (bad base64, a `sender_identity_key` that is not 66 hex chars) | No |
+| 400 | `bad_funding` | The treasury could not verify or accept the payment (wrong derivation, missing output, insufficient value, ...) | No |
+| 404 | `funding_disabled` | This instance has no funding treasury configured | No |
+| 503 | `unavailable` | The treasury is temporarily unable to internalize the payment (e.g. mid-broadcast) | Yes (1s) |
+
+**Recovery.** A `bad_funding` or `unavailable` response never means the on-chain payment itself failed -- your wallet already broadcast it. Retry `POST /v1/funding` with the **same** `derivation_prefix` and `derivation_suffix`: the derivation nonce is HMAC-based and stays valid, so retrying does not require deriving a new key or making a new payment. `fuelkeeper fund` prints both values in its error message specifically so you can do this.
+
+### `fuelkeeper fund` CLI
+
+```
+fuelkeeper fund --sats N [--url http://127.0.0.1:8080] [--key K | FUELKEEPER_API_KEY] [--wallet http://localhost:3321] [--output-index -1]
+```
+
+Drives your local BRC-100 wallet (default `http://localhost:3321`) through the flow above: fetches funding instructions, derives a payment key, pays a P2PKH output for `--sats` satoshis, and posts the result. `--key` must be an admin key when the server has `api.admin_keys` configured. On success it prints `funded <sats> sats in <txid>`. If the wallet broadcasts the payment but `POST /v1/funding` then fails, the error names the already-broadcast txid and the `derivation_prefix`/`derivation_suffix` pair to retry with -- never re-run `fuelkeeper fund` from scratch in that case, since that would pay again.
 
 ## Go Client Quick Start
 
@@ -167,6 +217,8 @@ func main() {
 - `CreateActionInputs(res, description)` — convert reservation to go-sdk `wallet.CreateActionInput` values
 - `Surplus(denomination, estimatedTxBytes, satPerKB)` — how much to add to your own outputs instead of creating change
 - `PuzzleInputSize`, `P2PKHInputSize` — per-input byte counts for fee sizing
+- `FundingInfo(ctx)` — fetch the treasury's BRC-29 payment instructions (admin key required when configured)
+- `Fund(ctx, wire.FundRequest)` — submit a completed BRC-29 payment for the treasury to internalize
 
 ### Typed Errors
 
@@ -181,6 +233,8 @@ The client returns errors that can be checked with `errors.Is()`:
 - `client.ErrUnavailable` — 503 unavailable (also covers transport failures and 5xx without JSON body)
 
 Check `client.IsRetryable(err)` to determine whether to retry. `client_closed_request` (499) from the server has no client sentinel; it is not retryable.
+
+The funding endpoints' `bad_funding` (400) and `funding_disabled` (404) codes have no dedicated sentinel either; check `apiErr.Code` on the `*client.APIError` (via `errors.As`) directly. Neither is retryable.
 
 ## TypeScript / HTTP Clients
 

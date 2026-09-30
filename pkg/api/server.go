@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -19,6 +20,7 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/api/wire"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/treasury"
 )
 
 // PoolService is what the handlers need from pool.Pool.
@@ -68,6 +70,12 @@ type Deps struct {
 	MaxBodyBytes   int64         // default 1 MiB
 	RequestTimeout time.Duration // default 10 s; must exceed the pools' ReserveTimeout
 	Version        string
+	// Funder, when set, enables GET/POST /v1/funding (BRC-29 treasury
+	// funding). Both routes are admin-tier (see v1Routes): funding is an
+	// operator action, and gating it prevents anonymous nonce/BEEF spam. Left
+	// nil when the treasury is the mock/nullnet, in which case both routes
+	// answer 404 funding_disabled.
+	Funder treasury.Funder
 }
 
 // server holds the resolved dependencies the route handlers close over.
@@ -76,6 +84,7 @@ type server struct {
 	byName map[string]PoolService
 	store  store.Store
 	log    *slog.Logger
+	funder treasury.Funder
 }
 
 // pool looks up a configured pool by name, or pool.ErrUnknownPool.
@@ -141,6 +150,10 @@ var v1Routes = []v1Route{
 	{Route{Method: http.MethodPost, Pattern: "/v1/pools/{pool}/shards/{txid}/retire"}, true, (*server).retireShard},
 	{Route{Method: http.MethodGet, Pattern: "/v1/pools/{pool}/quarantined"}, true, (*server).listQuarantined},
 	{Route{Method: http.MethodPost, Pattern: "/v1/pools/{pool}/quarantined/requeue"}, true, (*server).requeue},
+	// Funding is an operator action (BRC-29 treasury top-up), gated admin-tier
+	// to prevent anonymous nonce/BEEF spam; see Deps.Funder.
+	{Route{Method: http.MethodGet, Pattern: "/v1/funding"}, true, (*server).fundingInfo},
+	{Route{Method: http.MethodPost, Pattern: "/v1/funding"}, true, (*server).fund},
 }
 
 // Routes lists every HTTP method+path pattern NewHandler serves, including
@@ -192,7 +205,7 @@ func NewHandler(d Deps) http.Handler {
 	for _, p := range d.Pools {
 		byName[p.Config().Name] = p
 	}
-	s := &server{pools: d.Pools, byName: byName, store: d.Store, log: log}
+	s := &server{pools: d.Pools, byName: byName, store: d.Store, log: log, funder: d.Funder}
 
 	// AdminKeys is a superset: when configured, an admin key also authorises
 	// the fuel routes (so an operator's CLI needs only one key), but the
@@ -210,24 +223,28 @@ func NewHandler(d Deps) http.Handler {
 	adminAuth := func(h http.HandlerFunc) http.HandlerFunc { return requireAPIKey(adminKeys, h) }
 
 	v1 := http.NewServeMux()
+	v1Only := make([]Route, 0, len(v1Routes))
 	for _, e := range v1Routes {
 		h := func(w http.ResponseWriter, r *http.Request) { e.handler(s, w, r) }
 		if e.admin {
-			addRoute(v1, e.Method, e.Pattern, adminAuth(h))
+			addMethodRoute(v1, e.Method, e.Pattern, adminAuth(h))
 		} else {
-			addRoute(v1, e.Method, e.Pattern, fuelAuth(h))
+			addMethodRoute(v1, e.Method, e.Pattern, fuelAuth(h))
 		}
+		v1Only = append(v1Only, e.Route)
 	}
+	addFallbackRoutes(v1, v1Only)
 	// Least specific: anything under /v1/ that didn't match one of the exact
 	// routes above (or their same-path OPTIONS/405 fallback registered by
-	// addRoute) is a genuinely unknown path.
+	// addFallbackRoutes) is a genuinely unknown path.
 	v1.HandleFunc("/v1/", notFoundHandler)
 
 	th := topHandlers(log, d)
 	mux := http.NewServeMux()
 	for _, rt := range topRoutes {
-		addRoute(mux, rt.Method, rt.Pattern, th[rt])
+		addMethodRoute(mux, rt.Method, rt.Pattern, th[rt])
 	}
+	addFallbackRoutes(mux, topRoutes)
 	mux.Handle("/v1/", v1)
 	mux.HandleFunc("/", notFoundHandler)
 
@@ -239,21 +256,55 @@ func NewHandler(d Deps) http.Handler {
 	return h
 }
 
-// addRoute registers h for method+path, plus a same-path fallback that
-// answers OPTIONS with a 204 (and an Allow header) and any other method on
-// that exact path with a JSON 405 (also carrying Allow). Because the
-// method-specific pattern is strictly more specific, it always wins for the
+// addMethodRoute registers h for exactly method+path. Because the
+// method-specific pattern is strictly more specific than the bare-path
+// fallback addFallbackRoutes registers separately, it always wins for the
 // method(s) it names; net/http's ServeMux additionally routes HEAD to a GET
-// pattern, so a GET route's Allow lists both. The bare fallback pattern
-// therefore only ever receives OPTIONS or a genuinely unsupported method (see
-// net/http's ServeMux precedence rules).
-func addRoute(mux *http.ServeMux, method, path string, h http.HandlerFunc) {
-	allow := method
-	if method == http.MethodGet {
-		allow = "GET, HEAD"
-	}
+// pattern.
+func addMethodRoute(mux *http.ServeMux, method, path string, h http.HandlerFunc) {
 	mux.HandleFunc(method+" "+path, h)
-	mux.HandleFunc(path, optionsOrMethodNotAllowed(allow))
+}
+
+// addFallbackRoutes registers, once per distinct Pattern among routes
+// (net/http's ServeMux rejects a second identical bare-path registration --
+// which two routes sharing one path, such as GET and POST /v1/funding, would
+// otherwise trigger), a handler that answers OPTIONS with an empty 204 and
+// any other method with a JSON 405, both carrying an Allow header listing
+// every method routed at that path. A path routed only via GET additionally
+// lists HEAD in Allow, since net/http's ServeMux routes HEAD to a GET pattern
+// itself; the bare fallback pattern therefore only ever receives OPTIONS or a
+// genuinely unsupported method (see net/http's ServeMux precedence rules).
+func addFallbackRoutes(mux *http.ServeMux, routes []Route) {
+	order := make([]string, 0, len(routes))
+	methods := make(map[string][]string, len(routes))
+	for _, r := range routes {
+		if _, ok := methods[r.Pattern]; !ok {
+			order = append(order, r.Pattern)
+		}
+		methods[r.Pattern] = append(methods[r.Pattern], r.Method)
+	}
+	for _, path := range order {
+		mux.HandleFunc(path, optionsOrMethodNotAllowed(allowHeader(methods[path])))
+	}
+}
+
+// allowHeader joins methods (in first-seen order, without duplicates) into an
+// Allow header value, inserting HEAD immediately after GET when GET is
+// present (see addFallbackRoutes).
+func allowHeader(methods []string) string {
+	seen := make(map[string]bool, len(methods)+1)
+	out := make([]string, 0, len(methods)+1)
+	for _, m := range methods {
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+		if m == http.MethodGet && !seen[http.MethodHead] {
+			seen[http.MethodHead] = true
+			out = append(out, http.MethodHead)
+		}
+	}
+	return strings.Join(out, ", ")
 }
 
 // optionsOrMethodNotAllowed answers OPTIONS with an empty 204 and everything

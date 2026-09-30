@@ -20,8 +20,15 @@ info:
     version, lockTime and input sequence you must use.
 
     **Authentication.** `/v1/` operations require a fuel API key in the `Authorization: Bearer <key>` header.
-    The four admin operations (list/retire shards, list/requeue quarantined rows) require an admin key when
-    `api.admin_keys` is configured, otherwise they accept fuel keys. With no keys configured, the API is open.
+    The four admin operations (list/retire shards, list/requeue quarantined rows) and both funding operations
+    (`GET`/`POST /v1/funding`) require an admin key when `api.admin_keys` is configured, otherwise they accept
+    fuel keys. With no keys configured, the API is open.
+
+    **Funding.** `GET /v1/funding` returns the treasury's BRC-29 identity key and a fresh derivation-prefix
+    nonce; derive a payment key from it with your own wallet, pay a P2PKH output to it, then
+    `POST /v1/funding` with the resulting AtomicBEEF for the treasury to internalize. Both operations are
+    admin-tier: funding is an operator action, and gating it prevents anonymous nonce/BEEF spam. `404
+    funding_disabled` means this instance has no funding treasury configured (e.g. nullnet/mock mode).
 
     **Errors.** Every non-2xx response is `{"code","message","retry_after"?}`. `503` and
     `409` carry `Retry-After`; clients should back off and retry.
@@ -38,6 +45,7 @@ tags:
   - name: fuel
   - name: pools
   - name: admin
+  - name: funding
   - name: ops
 paths:
   /healthz:
@@ -313,6 +321,53 @@ paths:
         "499": {$ref: "#/components/responses/Error"}
         "500": {$ref: "#/components/responses/Error"}
         "503": {$ref: "#/components/responses/ErrorRetry"}
+  /v1/funding:
+    get:
+      tags: [funding]
+      summary: Get BRC-29 funding instructions (admin)
+      operationId: fundingInfo
+      description: |
+        Admin-tier: funding is an operator action, and gating it prevents anonymous nonce/BEEF spam.
+        Returns the treasury's identity key and a fresh derivation-prefix nonce. Derive a BRC-29 payment
+        key from it with your own wallet (`GetPublicKey` with `protocolID:[2,"3241645161d8"]`,
+        `keyID:"<derivation_prefix> <your suffix>"`, `counterparty: identity_key`), pay a P2PKH output to
+        that key, then `POST` the payment to this same path. `404 funding_disabled` means this instance has
+        no funding treasury configured.
+      responses:
+        "200":
+          description: funding instructions
+          content: {application/json: {schema: {$ref: "#/components/schemas/FundingInfo"}}}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
+    post:
+      tags: [funding]
+      summary: Submit a completed BRC-29 payment (admin)
+      operationId: fund
+      description: |
+        Admin-tier (see `GET /v1/funding`). Internalizes a payment previously made to the identity key and
+        derivation prefix returned by `GET /v1/funding`. `400 bad_funding` means the treasury could not
+        verify or accept the payment (for example a wrong derivation, a missing output, or insufficient
+        value); the derivation nonce is HMAC-based and stays valid, so retry with the same
+        `derivation_prefix`/`derivation_suffix` once the payment is fixed. `404 funding_disabled` means this
+        instance has no funding treasury configured.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/FundRequest"}
+      responses:
+        "200":
+          description: internalized payment
+          content: {application/json: {schema: {$ref: "#/components/schemas/FundResult"}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "499": {$ref: "#/components/responses/Error"}
+        "500": {$ref: "#/components/responses/Error"}
+        "503": {$ref: "#/components/responses/ErrorRetry"}
 components:
   securitySchemes:
     bearerAuth: {type: http, scheme: bearer, description: "FuelKeeper API key"}
@@ -343,7 +398,7 @@ components:
       properties:
         code:
           type: string
-          enum: [bad_request, unauthorized, not_found, unknown_pool, insufficient, exhausted, backpressure, unavailable, client_closed_request, method_not_allowed, internal]
+          enum: [bad_request, unauthorized, not_found, unknown_pool, insufficient, exhausted, backpressure, unavailable, client_closed_request, method_not_allowed, internal, bad_funding, funding_disabled]
         message: {type: string}
         retry_after: {type: integer, description: "seconds to wait before retrying"}
     Ready:
@@ -488,3 +543,30 @@ components:
         quarantined_at: {type: string, format: "date-time"}
         spent_hint: {type: string}
         spent_by: {type: string}
+    FundingInfo:
+      type: object
+      required: [identity_key, derivation_prefix, network, protocol, instructions]
+      description: "How to pay the treasury a BRC-29 wallet payment; see GET /v1/funding."
+      properties:
+        identity_key: {type: string, description: "treasury identity key, DER hex"}
+        derivation_prefix: {type: string, description: "base64 nonce; use once per payment"}
+        network: {type: string, description: "main | test | ttn | tstn"}
+        protocol: {type: string, example: "3241645161d8", description: "BRC-29 protocol ID, security level 2"}
+        instructions: {type: string}
+    FundRequest:
+      type: object
+      required: [atomic_beef, derivation_prefix, derivation_suffix, sender_identity_key]
+      description: "A completed BRC-29 payment; see POST /v1/funding."
+      properties:
+        atomic_beef: {type: string, description: "base64 AtomicBEEF (BRC-95) of the payment transaction and its ancestry"}
+        output_index: {type: integer, nullable: true, description: "the payment output's index; omit or null to auto-detect"}
+        derivation_prefix: {type: string, description: "base64, from GET /v1/funding's response"}
+        derivation_suffix: {type: string, description: "base64, chosen by the payer"}
+        sender_identity_key: {type: string, pattern: "^[0-9a-fA-F]{66}$", description: "the payer's identity public key, DER hex"}
+    FundResult:
+      type: object
+      required: [txid, satoshis]
+      description: "What was internalized by POST /v1/funding."
+      properties:
+        txid: {type: string}
+        satoshis: {type: integer}
