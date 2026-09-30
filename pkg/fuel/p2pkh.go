@@ -1,6 +1,7 @@
 package fuel
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 
@@ -21,6 +22,13 @@ var ErrNilPublicKey = errors.New("fuel: nil public key")
 // ErrEmptyLockingScript is returned when P2PKHPresign is given no locking
 // script for the fuel output being spent.
 var ErrEmptyLockingScript = errors.New("fuel: empty locking script")
+
+// ErrLockMismatch is returned when P2PKHPresign is given a lockingScript that
+// is not priv's own P2PKHLock output: signing against it would still produce
+// bytes, but they would fail OP_EQUALVERIFY at spend time. Catching this at
+// split/presign time (when the caller still has both the key and the intended
+// lock handy) is cheaper than debugging a spend-time rejection later.
+var ErrLockMismatch = errors.New("fuel: locking script does not match private key")
 
 // Constraints a consuming transaction must satisfy for a presigned P2PKH fuel
 // input to remain valid: the FORKID sighash preimage always commits to
@@ -44,6 +52,13 @@ const (
 // the outputs and only this one input, so any transaction respecting
 // P2PKHTxVersion/P2PKHLockTime/P2PKHSequence can attach the fuel input
 // wherever it likes among its other inputs and outputs.
+//
+// Because SIGHASH_NONE signs no outputs at all, possessing a script signed
+// under this flag is possessing the ability to spend that output to any
+// destination whatsoever. The unlocking script P2PKHPresign returns must
+// therefore be handled as a bearer secret - never logged, kept only in
+// access-controlled storage, and handed out solely to whoever reserved the
+// output - exactly like a puzzle preimage (see Preimage).
 const P2PKHSigHash sighash.Flag = sighash.NoneForkID | sighash.AnyOneCanPay
 
 // P2PKHLock returns the standard 25-byte P2PKH locking script for pub
@@ -69,12 +84,25 @@ func P2PKHLock(pub *ec.PublicKey) ([]byte, error) {
 // (locked by lockingScript, worth satoshis) so that any consuming transaction
 // honouring P2PKHTxVersion/P2PKHLockTime/P2PKHSequence can spend it, no matter
 // what other inputs or outputs that transaction has.
+//
+// The returned unlocking script is a bearer secret: SIGHASH_NONE signs none
+// of the outputs, so whoever holds these bytes can spend the fuel output to
+// any destination they like. Callers must treat it exactly like a puzzle
+// preimage - never log it, store it only where access is controlled, and
+// hand it out only to whoever reserved the output.
 func P2PKHPresign(priv *ec.PrivateKey, txid chainhash.Hash, vout uint32, lockingScript []byte, satoshis uint64) ([]byte, error) {
 	if priv == nil {
 		return nil, ErrNilPrivateKey
 	}
 	if len(lockingScript) == 0 {
 		return nil, ErrEmptyLockingScript
+	}
+	wantLock, err := P2PKHLock(priv.PubKey())
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(wantLock, lockingScript) {
+		return nil, ErrLockMismatch
 	}
 	tx := transaction.NewTransaction()
 	tx.Version = P2PKHTxVersion
