@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -79,4 +80,30 @@ func TestMockCrossShardIndependence(t *testing.T) {
 
 	assert.False(t, fuel.VerifyPuzzle(a.Rows[0].LockingScript, b.Rows[0].UnlockingScript),
 		"b's unlocking script must not satisfy a's locking script")
+}
+
+// TestMockBEEFIsRealSplit checks that the mock's shard BEEF is a real,
+// parseable BEEF whose transaction is the split and carries the rows' outputs,
+// so client.InputBEEF and fuel.RawTxFromBEEF work without a real wallet.
+func TestMockBEEFIsRealSplit(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+	built, err := m.Build(ctx, treasury.MintRequest{Pool: "main", Denomination: 50, Count: 3})
+	require.NoError(t, err)
+
+	raw, err := fuel.RawTxFromBEEF(built.Shard.BEEF, built.Shard.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, built.RawTx, raw)
+	tx, err := transaction.NewTransactionFromBytes(raw)
+	require.NoError(t, err)
+	assert.Equal(t, built.Shard.TxID, *tx.TxID())
+	require.Len(t, tx.Outputs, len(built.Rows), "no change output")
+	for i, r := range built.Rows {
+		assert.Equal(t, r.Satoshis, tx.Outputs[i].Satoshis)
+		assert.Equal(t, r.LockingScript, []byte(*tx.Outputs[i].LockingScript))
+	}
+
+	merged := transaction.NewBeefV2()
+	require.NoError(t, merged.MergeBeefBytes(built.Shard.BEEF), "the BEEF merges the way client.InputBEEF merges it")
+	assert.NotNil(t, merged.FindTransaction(built.Shard.TxID.String()))
 }
