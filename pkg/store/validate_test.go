@@ -16,7 +16,7 @@ func hashN(n byte) chainhash.Hash {
 	return h
 }
 
-func rows(txid chainhash.Hash, pool string, n int) []store.Row {
+func rows(txid chainhash.Hash, pool string, n int) []store.Row { //nolint:unparam // pool is a general-purpose helper param; every call site here happens to pass "main"
 	out := make([]store.Row, n)
 	for i := range out {
 		out[i] = store.Row{
@@ -93,7 +93,7 @@ func TestValidateReserveOps(t *testing.T) {
 }
 
 func TestValidateOutpointsAndMisc(t *testing.T) {
-	ops := []store.Outpoint{{TxID: hashN(1), Vout: 0}, {TxID: hashN(1), Vout: 1}}
+	ops := []store.Outpoint{{TxID: hashN(1), Vout: 0}, {TxID: hashN(1), Vout: 1}} //nolint:prealloc // fixed 2-element literal; the append() below builds a throwaway slice, not a grown copy of ops
 	require.NoError(t, store.ValidateOutpoints(ops, 10))
 	require.ErrorIs(t, store.ValidateOutpoints(nil, 10), store.ErrInvalidArgument)
 	require.ErrorIs(t, store.ValidateOutpoints(append(ops, ops[0]), 10), store.ErrInvalidArgument)

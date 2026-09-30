@@ -43,7 +43,7 @@ func TestTokenRoundTrip(t *testing.T) {
 	_, err = store.ParseToken("too-short")
 	require.ErrorIs(t, err, store.ErrInvalidArgument)
 	assert.True(t, store.Token{}.IsZero())
-	assert.NotEqual(t, store.NewToken(), store.NewToken())
+	assert.NotEqual(t, store.NewToken(), store.NewToken()) //nolint:testifylint // two independently random tokens; not a same-variable comparison
 }
 
 func TestEnumStrings(t *testing.T) {

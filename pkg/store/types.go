@@ -72,6 +72,7 @@ func ParseToken(s string) (Token, error) {
 // storage format and must not change.
 type State uint8
 
+// State values; the numeric codes are part of the storage format and must not change.
 const (
 	StateAvailable   State = 0
 	StateReserved    State = 1
@@ -102,6 +103,7 @@ func (s State) Terminal() bool { return s == StateSpent || s == StateInvalid }
 // ShardStatus is the lifecycle status of a split transaction.
 type ShardStatus uint8
 
+// ShardStatus values.
 const (
 	ShardUnmined ShardStatus = 0
 	ShardMined   ShardStatus = 1
@@ -129,6 +131,7 @@ func (s ShardStatus) Terminal() bool { return s == ShardRetired || s == ShardInv
 // LockMode says how a fuel output is unlocked.
 type LockMode uint8
 
+// LockMode values.
 const (
 	LockPuzzle LockMode = 0 // OP_SHA256 <32B> OP_EQUAL; unlocking script pushes the preimage
 	LockP2PKH  LockMode = 1 // P2PKH presigned with NONE|ANYONECANPAY|FORKID
