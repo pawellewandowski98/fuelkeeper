@@ -35,12 +35,14 @@ func subtests() []subtest {
 		{"ShardLeaseBoundary", testShardLeaseBoundary},
 		{"ArgumentValidation", testArgumentValidation},
 		{"PoolIsolation", testPoolIsolation},
+		{"NamesMustBeUTF8", testNamesMustBeUTF8},
 		{"ReserveBasic", testReserveBasic},
 		{"ReserveMixedTokensMixedShards", testReserveMixedTokensMixedShards},
 		{"SameTokenNeverRevives", testSameTokenNeverRevives},
 		{"ReleaseGuard", testReleaseGuard},
 		{"SpendGuard", testSpendGuard},
 		{"QuarantineByExpiry", testQuarantineByExpiry},
+		{"EdgeTimeBoundsMatchNothing", testEdgeTimeBoundsMatchNothing},
 		{"ResolveGuard", testResolveGuard},
 		{"ListAvailablePagination", testListAvailablePagination},
 		{"StatsCounts", testStatsCounts},
@@ -55,6 +57,7 @@ func subtests() []subtest {
 		{"LeaserExclusiveConcurrent", testLeaserExclusiveConcurrent},
 		{"LeaseTakeoverRace", testLeaseTakeoverRace},
 		{"RetireVsReserveRace", testRetireVsReserveRace},
+		{"RetireVsReleaseRace", testRetireVsReleaseRace},
 		{"ReserveAllOrNothingOnCancel", testReserveAllOrNothingOnCancel},
 	}
 }

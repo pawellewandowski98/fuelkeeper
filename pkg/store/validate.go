@@ -2,31 +2,53 @@ package store
 
 import (
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 )
 
-const maxPoolNameLen = 64
+const (
+	maxPoolNameLen = 64
+	maxNameLen     = 128
+)
 
 func invalidf(format string, args ...any) error {
 	return fmt.Errorf("%w: "+format, append([]any{ErrInvalidArgument}, args...)...)
 }
 
-// ValidatePool checks a pool name: non-empty, at most 64 bytes.
-func ValidatePool(pool string) error {
-	if pool == "" || len(pool) > maxPoolNameLen {
-		return invalidf("pool name must be 1..%d bytes", maxPoolNameLen)
+// validateName checks a pool/holder/lease name shared by every backend:
+// non-empty, at most maxLen bytes, valid UTF-8, and free of NUL bytes.
+// Postgres and SQLite TEXT columns can store neither an invalid UTF-8 byte
+// sequence nor a NUL byte, and a JSON-backed backend's string encoding
+// silently replaces an invalid UTF-8 byte with the Unicode replacement
+// character U+FFFD instead of failing (see store.go, "Names"), so this is
+// checked once here rather than left to surface differently, or not at all,
+// per backend.
+func validateName(s string, maxLen int, what string) error {
+	if s == "" || len(s) > maxLen {
+		return invalidf("%s must be 1..%d bytes", what, maxLen)
+	}
+	if !utf8.ValidString(s) {
+		return invalidf("%s must be valid UTF-8", what)
+	}
+	if strings.IndexByte(s, 0) >= 0 {
+		return invalidf("%s must not contain a NUL byte", what)
 	}
 	return nil
 }
 
-// ValidateHolder checks an instance holder id.
+// ValidatePool checks a pool name: non-empty, at most 64 bytes, valid UTF-8,
+// and free of NUL bytes (see validateName and store.go, "Names").
+func ValidatePool(pool string) error {
+	return validateName(pool, maxPoolNameLen, "pool name")
+}
+
+// ValidateHolder checks an instance holder id: non-empty, at most 128 bytes,
+// valid UTF-8, and free of NUL bytes (see validateName and store.go, "Names").
 func ValidateHolder(holder string) error {
-	if holder == "" || len(holder) > 128 {
-		return invalidf("holder must be 1..128 bytes")
-	}
-	return nil
+	return validateName(holder, maxNameLen, "holder")
 }
 
 // ValidateLimit checks a positive page size.
@@ -37,10 +59,34 @@ func ValidateLimit(limit int) error {
 	return nil
 }
 
-// ValidateLeaseName checks a lease/job name (TryAcquireOrRenew, ReleaseLease).
+// ValidateLeaseName checks a lease/job name (TryAcquireOrRenew, ReleaseLease):
+// non-empty, at most 128 bytes, valid UTF-8, and free of NUL bytes (see
+// validateName and store.go, "Names").
 func ValidateLeaseName(name string) error {
-	if name == "" || len(name) > 128 {
-		return invalidf("lease name must be 1..128 bytes")
+	return validateName(name, maxNameLen, "lease name")
+}
+
+// unixEpoch is time.Unix(0, 0) in UTC: see ValidateTime.
+var unixEpoch = time.Unix(0, 0).UTC()
+
+// ValidateTime checks a non-sentinel time argument (store.go, "Clocks"): the
+// zero time.Time{} is always allowed, since backends use it throughout as
+// "unset" (ReservedAt/ExpiresAt/QuarantinedAt before their field is ever set,
+// LeaseUntil while a shard is unowned, ...), but any other value must be
+// strictly after the Unix epoch. A time at or before the epoch is rejected
+// rather than accepted: every backend's on-disk time encoding stores the zero
+// time and the exact epoch instant identically (both as 0), so a caller-
+// supplied epoch-or-earlier value would be indistinguishable from "unset"
+// once read back, and naively encoding a negative Unix time as an unsigned
+// microsecond count (every backend's key/counter layout needs unsigned,
+// order-preserving timestamps) would otherwise silently wrap around to a
+// huge, wrongly-ordered value instead of failing loudly here.
+func ValidateTime(t time.Time, what string) error {
+	if t.IsZero() {
+		return nil
+	}
+	if !t.After(unixEpoch) {
+		return invalidf("%s must be strictly after the Unix epoch", what)
 	}
 	return nil
 }
@@ -59,13 +105,17 @@ func ValidateLease(name, holder string, ttl time.Duration) error {
 	return nil
 }
 
-// ValidateAcquireUntil checks the lease expiry passed to AcquireShard: it must be
-// strictly after now, so a freshly granted lease is immediately held. The
-// comparison truncates both sides to microsecond precision first (store.go,
-// "Clocks"): every backend stores/compares at microsecond resolution, so an
-// until only a few hundred nanoseconds after now would truncate to the same
-// stored instant and be immediately free, not "immediately held".
+// ValidateAcquireUntil checks the lease expiry passed to AcquireShard: it must
+// be strictly after the Unix epoch (ValidateTime) and strictly after now, so a
+// freshly granted lease is immediately held. The after-now comparison
+// truncates both sides to microsecond precision first (store.go, "Clocks"):
+// every backend stores/compares at microsecond resolution, so an until only a
+// few hundred nanoseconds after now would truncate to the same stored instant
+// and be immediately free, not "immediately held".
 func ValidateAcquireUntil(until, now time.Time) error {
+	if err := ValidateTime(until, "acquire until"); err != nil {
+		return err
+	}
 	if !until.Truncate(time.Microsecond).After(now.Truncate(time.Microsecond)) {
 		return invalidf("acquire until must be after now")
 	}
@@ -73,12 +123,17 @@ func ValidateAcquireUntil(until, now time.Time) error {
 }
 
 // ValidateRenewUntil checks the lease expiry passed to RenewShard: it must be
-// non-zero (a zero time would be indistinguishable from "unowned").
+// non-zero (a zero time would be indistinguishable from "unowned") and, like
+// every other time argument stored as data, strictly after the Unix epoch
+// (ValidateTime). RenewShard stores until as the shard's LeaseUntil, so an
+// epoch-or-earlier until would otherwise round-trip indistinguishably from
+// "unset" (store.go, "Clocks"), breaking "Owner is empty iff LeaseUntil is
+// zero": Owner would stay set while LeaseUntil read back as the zero time.
 func ValidateRenewUntil(until time.Time) error {
 	if until.IsZero() {
 		return invalidf("renew until must not be zero")
 	}
-	return nil
+	return ValidateTime(until, "renew until")
 }
 
 // ValidateShardStatuses checks an AcquireShard status set: at least one status,
@@ -160,8 +215,9 @@ func ValidatePutShard(shard Shard, rows []Row) error {
 	return nil
 }
 
-// ValidateReserveOps checks a Reserve batch: 1..maxBatch ops, distinct outpoints,
-// non-zero tokens, non-zero expiry.
+// ValidateReserveOps checks a Reserve batch: 1..maxBatch ops, distinct
+// outpoints, non-zero tokens, non-zero expiry strictly after the Unix epoch
+// (ValidateTime).
 func ValidateReserveOps(ops []ReserveOp, maxBatch int) error {
 	if len(ops) == 0 || len(ops) > maxBatch {
 		return invalidf("reserve batch must have 1..%d ops, got %d", maxBatch, len(ops))
@@ -173,6 +229,9 @@ func ValidateReserveOps(ops []ReserveOp, maxBatch int) error {
 		}
 		if op.ExpiresAt.IsZero() {
 			return invalidf("op %d has no expiry", i)
+		}
+		if err := ValidateTime(op.ExpiresAt, fmt.Sprintf("op %d expiry", i)); err != nil {
+			return err
 		}
 		if _, dup := seen[op.Outpoint]; dup {
 			return invalidf("duplicate outpoint %s in batch", op.Outpoint)

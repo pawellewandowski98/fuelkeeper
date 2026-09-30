@@ -46,6 +46,19 @@ import (
 // available, clears all five. UpdatedAt is stamped by every state change except a
 // same-token Reserve replay (see "Idempotency").
 //
+// # Names
+//
+// pool, holder (AcquireShard, RenewShard, ReleaseShard, TryAcquireOrRenew,
+// ReleaseLease) and lease names (TryAcquireOrRenew, ReleaseLease) must be
+// non-empty, at most their documented byte length, valid UTF-8, and free of
+// NUL bytes: ValidatePool, ValidateHolder and ValidateLeaseName enforce this
+// uniformly so every backend rejects the same malformed name the same way,
+// with ErrInvalidArgument — rather than a SQL backend surfacing a raw
+// driver-level error for a TEXT column that cannot hold invalid UTF-8 or a
+// NUL byte, or a JSON-backed backend silently corrupting the name (Go's JSON
+// encoder replaces an invalid UTF-8 byte with the Unicode replacement
+// character U+FFFD on a string field) instead of rejecting it up front.
+//
 // # Clocks
 //
 // Backends stamp created_at / reserved_at / quarantined_at / updated_at and lease
@@ -55,6 +68,24 @@ import (
 //
 // All stored times have microsecond precision; backends truncate to the
 // microsecond on write and callers compare with time.Time.Truncate(time.Microsecond).
+//
+// A non-zero time argument that is stored as data (AcquireShard's until,
+// RenewShard's until, each Reserve op's ExpiresAt) must be strictly after the
+// Unix epoch: ValidateTime rejects anything else with ErrInvalidArgument. The
+// zero time itself is always accepted separately wherever it means "unset"
+// (ReservedAt, ExpiresAt, QuarantinedAt and LeaseUntil before their field is
+// ever set); it is never treated as a data value needing this check. This
+// matters because the zero time and the exact Unix epoch instant round-trip
+// through every backend's on-disk time encoding identically (both are stored
+// as 0), so accepting an epoch-or-earlier value as real data would make it
+// indistinguishable from "unset" once read back.
+//
+// ValidateTime applies only to times stored as data. Quarantine's before and
+// ListQuarantined's before/after are comparison bounds, not stored data, and
+// are never checked by ValidateTime: instead, an edge value that would be
+// invalid as data (the zero time, the exact epoch instant, or earlier) simply
+// matches nothing there, since every stored expires_at/quarantined_at is
+// strictly after the epoch (see Quarantine, ListQuarantined).
 //
 // # Errors
 //
@@ -90,10 +121,14 @@ type Store interface {
 	// RetireShard marks the shard invalid, clears its lease, bumps Version, and moves
 	// every non-terminal row (available, reserved, quarantined) to invalid, keeping
 	// all provenance fields (ReservedBy, ReservedAt, ExpiresAt, QuarantinedAt,
-	// SpentHint; see "Provenance"). It returns the number of rows changed. A shard
-	// already invalid is a no-op: it returns 0 and leaves Version/UpdatedAt
-	// unchanged. A retired shard may still be retired (retired -> invalid). Missing
-	// shard: ErrNotFound. pool must be non-empty (ErrInvalidArgument).
+	// SpentHint; see "Provenance"). It returns the number of rows this call moved to
+	// invalid (concurrent calls together move each non-terminal row exactly once).
+	// When the shard is already invalid and every row is terminal it returns 0 and
+	// leaves Version/UpdatedAt unchanged. Backends without multi-record atomicity
+	// cascade rows before marking the shard, so a retry repairs a partial retire; a
+	// retry that repairs rows returns the number it repaired. A retired shard may
+	// still be retired (retired -> invalid). Missing shard: ErrNotFound. pool must be
+	// non-empty (ErrInvalidArgument).
 	RetireShard(ctx context.Context, pool string, txid chainhash.Hash) (int, error)
 	// AcquireShard atomically claims the oldest shard (by created_at, then txid
 	// compared as its 32 internal bytes, not display hex) whose status is in statuses,
@@ -104,8 +139,10 @@ type Store interface {
 	AcquireShard(ctx context.Context, pool, holder string, now, until time.Time, statuses []ShardStatus, exclude []chainhash.Hash) (*Shard, error)
 	// RenewShard extends the lease if Owner == holder (even if it had expired: only a
 	// successful AcquireShard by another holder, or ReleaseShard, clears Owner) and
-	// returns the current status and version. until must be non-zero
-	// (ErrInvalidArgument otherwise). Otherwise ErrNotOwner; missing: ErrNotFound.
+	// returns the current status and version. until must be strictly after the Unix
+	// epoch (see "Clocks") (ErrInvalidArgument otherwise). Otherwise ErrNotOwner;
+	// missing: ErrNotFound. RenewShard is a heartbeat: it updates only lease_until
+	// and never stamps UpdatedAt or bumps Version.
 	RenewShard(ctx context.Context, pool string, txid chainhash.Hash, holder string, until time.Time) (ShardHead, error)
 	// ReleaseShard clears the lease if Owner == holder, after which the lease is free
 	// and a further RenewShard by the same holder returns ErrNotOwner; otherwise it is
@@ -128,7 +165,8 @@ type Store interface {
 	// in any order (ExpiresAt reflects the stored value, which on a replay is the
 	// original; see "Idempotency" and "Provenance"). Ops whose row is missing, in
 	// another state, or reserved under another token are omitted. Batch-level
-	// ErrInvalidArgument for duplicates, zero tokens, zero expiry or size.
+	// ErrInvalidArgument for duplicates, zero tokens, an expiry that is not
+	// strictly after the Unix epoch (see "Clocks"), or size.
 	Reserve(ctx context.Context, pool string, ops []ReserveOp) ([]ReserveOp, error)
 	// Release moves rows from reserved(token) back to available, clearing
 	// ReservedBy, ReservedAt, ExpiresAt, QuarantinedAt and SpentHint (see
@@ -146,7 +184,11 @@ type Store interface {
 	// Quarantine moves up to limit reserved rows whose expires_at < before to
 	// quarantined, picked in (expires_at, txid internal bytes, vout) ascending
 	// order, and returns how many it moved. ReservedBy, ReservedAt and ExpiresAt are
-	// kept for provenance (see "Provenance").
+	// kept for provenance (see "Provenance"). before is a comparison bound, not
+	// stored data (see "Clocks"): the zero time, the exact Unix epoch instant, or
+	// any earlier time all match nothing, since every stored expires_at is strictly
+	// after the epoch, and Quarantine returns 0, nil for these rather than
+	// ErrInvalidArgument.
 	Quarantine(ctx context.Context, pool string, before time.Time, limit int) (int, error)
 	// ListQuarantined returns quarantined rows ordered by (quarantined_at, txid
 	// internal bytes, vout) ascending, at most limit. before is exclusive on
@@ -154,7 +196,10 @@ type Store interface {
 	// vout) tuple is strictly greater than after's are returned, letting a reaper
 	// resume paging after the last row it saw (Row.QuarantineCursor) instead of
 	// always restarting from before: a row stuck at the head of the queue cannot
-	// starve the rest of it.
+	// starve the rest of it. before and after are comparison bounds, not stored
+	// data (see "Clocks"): a before at or before the Unix epoch, or an after cursor
+	// whose At is at or past before, both match nothing -- an empty page, nil --
+	// rather than ErrInvalidArgument.
 	ListQuarantined(ctx context.Context, pool string, before time.Time, after *RowCursor, limit int) ([]Row, error)
 	// Resolve moves quarantined rows to available, clearing ReservedBy, ReservedAt,
 	// ExpiresAt, QuarantinedAt and SpentHint, or to spent, setting SpentBy and

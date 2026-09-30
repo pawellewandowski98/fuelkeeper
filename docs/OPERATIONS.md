@@ -30,15 +30,34 @@ instance:
   flush_timeout: 5s            # Max time to hold a partial batch before flushing; default 5s
   adopt_timeout: 200ms         # Max time a reserve request waits for shard adoption; default 200ms
 
-# Store backend (memory, sqlite, postgres; pebble/mongodb/aerospike in Plan 4)
+# Store backend (memory, sqlite, postgres, pebble, mongodb, aerospike)
 store:
-  backend: memory              # Required: memory | sqlite | postgres
+  backend: memory              # Required: memory | sqlite | postgres | pebble | mongodb | aerospike
   sqlite:
     path: /var/lib/fuelkeeper/fuel.sqlite  # Required when backend: sqlite
     sync: FULL                 # Optional: FULL (default, fsyncs every commit) | NORMAL (faster, less durable)
   postgres:
     dsn: postgres://user:pass@localhost/fuel  # Required when backend: postgres
+    max_conns: 0                # Optional: pgx pool size; 0 = default (maxConcurrentFlushes + 4)
     # Note: synchronous_commit must NOT be 'off'; on, local, remote_write, remote_apply are accepted
+  pebble:
+    path: /var/lib/fuelkeeper/pebble  # Required when backend: pebble
+    no_sync: false              # Optional: must be false in production (fsync every write batch); default false
+    cache_bytes: 0               # Optional: block cache size; 0 = pebble's own default (256 MiB)
+  mongodb:
+    uri: mongodb://localhost:27017    # Required when backend: mongodb
+    database: fuelkeeper               # Required when backend: mongodb
+    max_pool_size: 0             # Optional: driver connection pool size; 0 = driver default (64)
+    op_timeout: 0s                # Optional: per-operation timeout; 0 = default (5s); raise for cross-region majority writes
+    # Note: the backend always writes with { w: majority, j: true }; op_timeout must leave room for that round trip
+  aerospike:
+    hosts: ["localhost:3000"]    # Required when backend: aerospike; "host:port" or bare "host" (defaults to port 3000)
+    namespace: fuelkeeper         # Required when backend: aerospike; must be strong-consistency in production
+    set_prefix: fk_               # Optional: prepended to every set/index name; fixed per deployment, never generated per store
+    key_prefix: ""                 # Optional: isolates this store's keys on sets shared with others; <= 64 bytes, no "|" or NUL
+    allow_availability_mode: false # Optional: opts out of the strong-consistency requirement; CE dev/test servers ONLY, never production
+    timeout: 0s                    # Optional: per-operation timeout; 0 = default (3s)
+    pool_size: 0                   # Optional: per-node connection pool size; 0 = default (128)
 
 # Pools: fixed-denomination fuel outputs
 pools:
@@ -165,8 +184,11 @@ log:
 
 On startup, FuelKeeper validates the configuration:
 
+- `store.backend` must be one of `memory`, `sqlite`, `postgres`, `pebble`, `mongodb`, `aerospike`; an empty or unrecognized value names the full list in the error
+- The chosen backend's required fields are checked at config load, before FuelKeeper ever opens the store, and named `store.<backend>.<field>`: `store.sqlite.path`, `store.postgres.dsn`, `store.pebble.path`, `store.mongodb.uri` and `store.mongodb.database`, `store.aerospike.hosts` (at least one) and `store.aerospike.namespace`
 - Postgres requires `synchronous_commit` not set to `off` (checked at connect time)
-- SQLite defaults to `synchronous=FULL` (fsync on every commit); set `sync: NORMAL` to opt out
+- SQLite defaults to `synchronous=FULL` (fsync on every commit); set `sync: NORMAL` to opt out; `store.sqlite.sync` is validated case-insensitively and normalized to `FULL`/`NORMAL`
+- Aerospike requires a strong-consistency namespace (checked at connect time, on every node) unless `store.aerospike.allow_availability_mode: true` (CE dev/test servers only); `key_prefix` must be valid UTF-8, at most 64 bytes, and contain neither `|` nor a NUL byte
 - `jobs.lease_ttl` must exceed twice the longest job interval (e.g., if minter.interval is 30s, lease_ttl must be > 60s)
 - `jobs.watcher.limit` must exceed `jobs.minter.max_pending_shards`
 - Mint capacity must be ≥ 1.2× `expected_tps` for each pool (when expected_tps > 0)
@@ -264,19 +286,114 @@ them out.
 
 ## Deployment Topologies
 
-### Single-Process (SQLite or memory)
+A config file has no notion of "several instances" in one place — each
+FuelKeeper process reads its own file (with its own `instance.instance_id`)
+and points `store:` at the same backend/database the other processes share.
+Which backends that's safe for is a property of the backend, captured by
+`store.Caps.MultiProcess` (see `pkg/store/factory.Config`'s doc comment):
 
-- One process per database
+### Single-Process (memory, SQLite or Pebble)
+
+- One process per database/directory
 - SQLite uses a write lock; a second writer waits for `busy_timeout` (5s)
+- Pebble locks its directory for exclusive access; a second process opening
+  the same `pebble.path` fails at store-open time rather than corrupting data
 - Memory backend: all state lost on restart; for development and testing only
+- Running two processes against the same sqlite file or pebble directory, or
+  sharing a memory store across processes (it is in-process only), is a
+  configuration error, not something FuelKeeper detects and refuses at
+  startup — keep exactly one process per single-process backend instance
 
-### Multi-Process (Postgres)
+### Multi-Process (Postgres, MongoDB or Aerospike)
 
-- Multiple processes share the same Postgres database
+- Multiple processes share the same backing database/cluster
 - Each instance acquires a lease on whole shards and job responsibilities
 - Shards from a crashed instance are re-adopted after `instance.lease_ttl`
 - Every store operation is a compare-and-set; no pessimistic locking
 - With `treasury.kind: toolbox`, every instance must use the same treasury storage: one postgres database in `treasury.toolbox.storage` and the same root key. The minter runs wherever the lease is and funding is served by whichever instance a request reaches, so with per-instance sqlite files a payment can land in a wallet the minter never spends (see [TREASURY.md](TREASURY.md#several-instances))
+
+**MongoDB.** The backend always writes with `{w: "majority", j: true}` and
+reads with read preference primary (not operator-configurable), so an
+acknowledged write is durable and visible to every subsequent read; there is
+deliberately no TTL index (`fuel_rows` never expires a document out from under
+a live reservation — cleanup is driven by explicit state transitions only).
+The package opens no session or multi-document transaction, so even a
+standalone `mongod` works for development; production should run a real
+replica set so `w: majority` has somewhere to replicate to and survives a
+primary failover. Schema v2 indexes (partial indexes on state) are created
+automatically at open.
+
+**Aerospike.** Production **must** run a namespace configured with
+`strong-consistency true` (Enterprise Edition; Community Edition cannot run
+SC) — `New` reads the namespace's `strong-consistency` info property on every
+node and refuses to start unless it is true. `allow_availability_mode` is the
+explicit opt-out, for single-node Community Edition development and test
+servers only; never set it in production, since availability (AP) mode lets
+two sides of a partition accept conflicting writes to the same record and a
+migration can resurrect an older copy, which breaks the "one row, one owner"
+invariant (G1). Recommended SC namespace settings:
+
+- `strong-consistency true`, with a roster covering every node
+- `replication-factor` 2 or more (`replication-factor 1` survives no node
+  loss: every partition on a failed node becomes unavailable, surfacing as
+  request errors rather than wrong answers)
+- `commit-to-device true` on the storage engine if the deployment must survive
+  a simultaneous crash of every replica of a partition without losing
+  acknowledged writes
+- `default-ttl 0` (rows and shards never expire; the backend never sets a
+  record TTL)
+
+Set names are fixed per deployment (`set_prefix` + `{rows, shards, txids,
+leases, meta}`; Aerospike never frees a set name once created, and a
+namespace is capped at roughly 4K of them) — never derive `set_prefix` per
+store instance. `key_prefix` isolates one FuelKeeper deployment's keys from
+another's on sets it shares with them (for example, several test runs against
+one server); it must be valid UTF-8, at most 64 bytes, and contain no `|` or
+NUL byte.
+
+## Local Integration Testing
+
+`deploy/docker-compose.yaml` defines the three multi-process backends'
+servers:
+
+| Service   | Port(s)         | Notes |
+|-----------|------------------|-------|
+| postgres  | 15432 (→ 5432)   | `postgres:16-alpine`; always started (no profile) |
+| mongo     | 27017            | `mongo:7`; behind the `mongo` compose profile |
+| aerospike | 3000-3002        | `aerospike/aerospike-server`; behind the `aerospike` compose profile; namespace `test`, allow-availability-mode configuration for CE (see `deploy/aerospike.conf`) |
+
+`make docker-up` (`docker compose -f deploy/docker-compose.yaml up -d --wait`)
+starts only postgres by default, so it works unmodified on a host where ports
+3000-3002 or 27017 are already taken by something else (including another
+FuelKeeper checkout's own aerospike/mongo, or a shared long-lived Aerospike
+test server other tooling depends on). Opt in to the other two with
+`COMPOSE_PROFILES`:
+
+```bash
+COMPOSE_PROFILES=mongo,aerospike make docker-up
+```
+
+`make test-integration` runs every backend's conformance suite under its
+build tag, plus the factory package's own tagged tests (which open a store
+through `pkg/store/factory.New` the way `pkg/config`/`cmd/fuelkeeper` do,
+rather than through the backend package directly):
+
+```bash
+FUELKEEPER_TEST_POSTGRES_DSN=...  go test -tags=postgres  ./pkg/store/postgres/... ./pkg/store/factory/...
+FUELKEEPER_TEST_MONGODB_URI=...   go test -tags=mongodb   ./pkg/store/mongodb/...  ./pkg/store/factory/...
+FUELKEEPER_TEST_AEROSPIKE_HOST=... go test -tags=aerospike ./pkg/store/aerospike/... ./pkg/store/factory/...
+```
+
+(see the Makefile for the exact commands and default DSN/URI/host values).
+Every mongodb/aerospike-tagged test skips itself when its env var is unset,
+so `make test-integration` without `COMPOSE_PROFILES` still runs cleanly
+against whatever subset is up. Aerospike's tests never create a new set name
+(fixed `fk_*` sets; see [Deployment Topologies](#deployment-topologies)) and
+isolate themselves with a random `key_prefix`, so it is safe to point them at
+a long-lived, shared Aerospike server instead of a disposable one — do not
+restart or `docker compose down` a shared server other tooling also depends
+on; verify with `docker exec <container> asinfo -v sets/<namespace> | tr ';'
+'\n' | grep -c set=` that the set-name count is unchanged after a run.
 
 ### Benchmark cluster
 
@@ -298,6 +415,9 @@ make bench-cluster-down                   # stop and remove volumes
 
 - **Postgres**: Enable `synchronous_commit` (not `off`). On, local, remote_write, or remote_apply all provide durable commits.
 - **SQLite**: Default `synchronous=FULL` fsyncs every commit. Opt-in `sync: NORMAL` trades durability for speed (on power loss, may forget the last reservation).
+- **Pebble**: `no_sync: false` (the default) fsyncs every write batch, which G1 depends on; only set `no_sync: true` for throwaway stores such as tests, never in production.
+- **MongoDB**: Every write uses write concern `{w: "majority", j: true}` (journaled, not operator-configurable), so an acknowledged write is durable and every subsequent read (primary read preference) observes it.
+- **Aerospike**: Production requires a strong-consistency namespace (see [Deployment Topologies](#deployment-topologies)); within that, `commit-to-device true` covers a simultaneous crash of every replica of a partition, and `replication-factor >= 2` covers a single node's loss. `allow_availability_mode` trades this guarantee away and is for CE dev/test servers only.
 
 ## Jobs and Leases
 
@@ -619,6 +739,12 @@ Check:
 
 **SQLite**: Check file permissions, disk space, and ensure only one process is writing.
 
+**Pebble**: Check directory permissions and disk space, and ensure only one process opens `pebble.path` at a time.
+
+**MongoDB**: Check the URI, credentials, and network; if writes hang or time out, `op_timeout` may be too low for a cross-region majority write to replicate in time — raise it.
+
+**Aerospike**: Check `hosts` and network; a refusal to start naming "strong-consistency" means the namespace is not configured for SC — either fix the namespace (production) or set `allow_availability_mode: true` (dev/test only). A `key_prefix` rejected as invalid must be valid UTF-8, at most 64 bytes, with no `|` or NUL byte.
+
 ### Verify Policies Without Oracle
 
 Pools with `spend_policy: verify` need an oracle that is not "none"; FuelKeeper will refuse to start with error `"spend_policy=verify requires an oracle"`.
@@ -633,4 +759,6 @@ Remedy: set `oracle.kind: arcade` (or `composite`, with or without `teranode_url
 - **Empty key strings rejected**: an empty string inside `api_keys` or `admin_keys` (for example from `${KEY:-}`) is a configuration error; leaving the list empty is allowed only on a loopback listen, or anywhere with `insecure: true`
 - **Non-loopback requires insecure**: if `api.listen` is not loopback (127.0.0.1 or ::1), you must set `api.insecure: true` to run without API keys
 - **SQLite/Postgres DSN required**: `store.sqlite.path` or `store.postgres.dsn` must be set when using those backends
+- **Pebble/MongoDB/Aerospike fields required**: `store.pebble.path`; `store.mongodb.uri` and `store.mongodb.database`; `store.aerospike.hosts` (at least one) and `store.aerospike.namespace` must be set when using those backends
 - **Postgres synchronous_commit**: Postgres checks `synchronous_commit` at connect time and rejects `off` with an error
+- **Aerospike strong consistency**: Aerospike checks every node's namespace `strong-consistency` info property at connect time and refuses to start unless it is true, unless `store.aerospike.allow_availability_mode: true` (dev/test only)

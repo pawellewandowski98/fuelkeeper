@@ -5,35 +5,82 @@ that wallets reserve on demand and attach as one extra input to pay transaction
 fees. Fuel is spendable with unlocking data prepared in advance (a hash-puzzle
 preimage by default), so no signing service sits on the hot path.
 
-Status: Plan 5 complete: the go-wallet-toolbox treasury, BRC-29 funding
+Status: Plans 1-5 complete: the go-wallet-toolbox treasury, BRC-29 funding
 and the chain oracle (see `docs/TREASURY.md` and `docs/FUNDING.md`) -- by
 default an arcade-only oracle when `treasury.kind: toolbox` is configured; a
 direct teranode connection is never assumed, only an optional, opt-in
 accelerator (`oracle.kind: composite` with `teranode_url`) -- on top of the
-HTTP API, Go client and `serve` command (Plan 3) and the pool core (Plan 2):
-hash-puzzle fuel, sharded per-instance ownership with batched (group-commit)
-reservations, and background jobs (reaper, proof watcher, minter) behind
-leased runners. A module importing `pkg/config` or `pkg/treasury/...` must
-copy the three `replace` lines from this `go.mod`. Design:
-`docs/superpowers/specs/2026-09-29-fuelkeeper-design.md`.
+HTTP API, Go client and `serve` command (Plan 3), the pool core (Plan 2), and
+six store backends -- memory, sqlite, postgres, pebble, mongodb and aerospike
+(Plan 4; see "Store backends" below): hash-puzzle fuel, sharded per-instance
+ownership with batched (group-commit) reservations, and background jobs
+(reaper, proof watcher, minter) behind leased runners. A module importing
+`pkg/config` or `pkg/treasury/...` must copy the three `replace` lines from
+this `go.mod`. Design: `docs/superpowers/specs/2026-09-29-fuelkeeper-design.md`.
 
 ## Develop
 
-    make test              # unit + sqlite/memory conformance, -race
-    make docker-up         # Postgres 16 on :15432
-    make test-integration  # postgres conformance (build tag: postgres)
+    make test              # unit + memory/sqlite/pebble conformance, -race (~90s incl. pebble's fuzz)
+    make docker-up         # Postgres 16 on :15432 (always); COMPOSE_PROFILES=mongo,aerospike for the other two
+    make test-integration  # postgres/mongodb/aerospike conformance (build tags: postgres, mongodb, aerospike)
     make lint
 
 ## Store backends
 
-| Backend  | Multi-process | Conformance run | Notes |
-|----------|---------------|-----------------|-------|
-| memory   | no            | always          | tests and benchmarks |
-| sqlite   | no            | always          | single writer; `_pragma` DSN (`_txlock=immediate` on the writer, `synchronous` FULL by default); journal_mode/busy_timeout/synchronous/journal_size_limit/query_only read back at open |
-| postgres | yes           | `make test-integration` | `FOR UPDATE SKIP LOCKED` adoption, per-row CAS UPDATEs pipelined in one `pgx.Batch` in (txid, vout) order, partial indexes |
-| pebble, mongodb, aerospike | see spec | Plan 4 | |
+| Backend   | Multi-process | Conformance run          | Notes |
+|-----------|---------------|--------------------------|-------|
+| memory    | no            | `make test`              | tests and benchmarks |
+| sqlite    | no            | `make test`              | single writer, `synchronous=FULL`, pragmas verified at open |
+| pebble    | no            | `make test`              | embedded LSM, one batch per mutation, sync writes by default; differential-fuzzed against the memory store |
+| postgres  | yes           | `make test-integration`  | `FOR UPDATE SKIP LOCKED` adoption; per-row CAS `UPDATE`s pipelined in one `pgx.Batch`, always in `(txid, vout)` order (never `unnest`: a combined multi-row statement would let Postgres's planner pick its own row-lock order, and two concurrent batches walking overlapping rows in different orders can then deadlock), partial indexes |
+| mongodb   | yes           | `make test-integration`  | conditional single-document updates, write concern majority+journal, no TTL indexes; schema v2 indexes |
+| aerospike | yes           | `make test-integration` (local compose) | filter-expression CAS, presence-encoded index bins, `MaxRetries=0` on writes; requires a strong-consistency namespace in production (`allow_availability_mode` only for tests) |
 
-Every backend must pass `pkg/store/storetest.RunSuite` with `-race`.
+Every backend must pass `pkg/store/storetest.RunSuite` with `-race`. mongodb and
+aerospike are exercised in CI/locally only under their own build tags
+(`mongodb`, `aerospike`); aerospike is not a CI service (see
+`.github/workflows/ci.yml`) — run it locally with `COMPOSE_PROFILES=mongo,aerospike
+make docker-up && make test-integration` (`make docker-up` alone only starts
+postgres; see `docs/OPERATIONS.md`'s "Local Integration Testing").
+
+### Configuring a store
+
+`pkg/store/factory.Config` selects and configures a backend; every field an
+operator can set has a `yaml:"snake_case"` tag (pebble, mongodb and aerospike
+via small mirror structs in the factory package, since the backend `Config`
+types themselves carry no YAML tags). Only the fields for the chosen
+`backend` need to be set. `time.Duration` fields (`op_timeout`, `timeout`,
+...) are written below in human-readable form ("5s", "3s"); `pkg/config`'s
+strict YAML loader (`gopkg.in/yaml.v3`, `KnownFields(true)`) decodes them
+directly via `time.ParseDuration`, and rejects an unrecognized key such as a
+typo'd field name. This `store:` block nests under a full config's own
+`store:` key -- see `docs/OPERATIONS.md`'s Full Configuration Template.
+
+```yaml
+store:
+  backend: pebble
+  pebble:
+    path: /var/lib/fuelkeeper/pebble
+    no_sync: false        # leave false in production (fsync every batch)
+    cache_bytes: 268435456 # 0 = 256 MiB default
+
+  # backend: mongodb
+  mongodb:
+    uri: mongodb://localhost:27017
+    database: fuelkeeper
+    max_pool_size: 64      # 0 = default
+    op_timeout: 5s         # 0 = default
+
+  # backend: aerospike
+  aerospike:
+    hosts: ["localhost:3000"]
+    namespace: fuelkeeper
+    set_prefix: fk_        # fixed per deployment; never generate this per store
+    key_prefix: ""         # optional tenant isolation on shared sets
+    allow_availability_mode: false # true only for CE dev/test servers
+    timeout: 3s            # 0 = default
+    pool_size: 128         # 0 = default
+```
 
 ## Run It (Development Mode)
 
@@ -80,9 +127,22 @@ That durability requirement shapes how each backend must be deployed:
   file's write lock, a conflicting writer waits out `busy_timeout` (5s)
   regardless of the caller's own context deadline before SQLite reports
   `SQLITE_BUSY`. Run exactly one process per SQLite database file.
-- SQLite and memory are both single-process backends
-  (`Capabilities().MultiProcess == false`); only Postgres supports multiple
-  processes sharing one store.
+- **Pebble** fsyncs every write batch by default (`no_sync: false`); only set
+  `no_sync: true` for throwaway stores such as tests, never in production.
+- **MongoDB** always writes with `{w: "majority", j: true}` and reads with
+  primary read preference (not operator-configurable), so an acknowledged
+  write is durable and every subsequent read observes it.
+- **Aerospike** requires a strong-consistency namespace in production
+  (`New` checks every node's `strong-consistency` info property and refuses
+  to start otherwise); `allow_availability_mode` opts out for CE dev/test
+  servers only. Recommended SC settings: `replication-factor >= 2`,
+  `commit-to-device true`, `default-ttl 0`.
+- Memory, SQLite and Pebble are single-process backends
+  (`Capabilities().MultiProcess == false`); Postgres, MongoDB and Aerospike
+  support multiple processes sharing one store. See `docs/OPERATIONS.md`'s
+  "Deployment Topologies" for what each multi-process backend needs in
+  production (MongoDB: a real replica set behind its majority+journal write
+  concern; Aerospike: a strong-consistency namespace).
 
 Pool behaviour that operators should know:
 
