@@ -25,7 +25,7 @@ instance:
   lease_ttl: 30s               # Duration the instance holds shard leases; must exceed rescan_interval; default 30s
   rescan_interval: 5s          # How often to rescan the store for new shards; default 5s
   reserve_timeout: 2s          # Max time a single reserve request can take; default 2s
-  flush_window: 0              # Time to batch row state changes before persisting; default 0 (no batching)
+  flush_window: 0              # Extra time the coalescer waits to batch concurrent Reserve calls into one store write; default 0 (flush as soon as a slot is free)
   max_batch: 0                 # Max rows to batch before flushing; default 0 (no limit)
   flush_timeout: 5s            # Max time to hold a partial batch before flushing; default 5s
   adopt_timeout: 200ms         # Max time a reserve request waits for shard adoption; default 200ms
@@ -363,7 +363,7 @@ Remedy: either set `oracle.kind` to teranode, arcade, composite, or mock (with a
 ### Configuration Validation Errors
 
 - **Pool name validation**: pool names must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$` (alphanumeric start, then alphanumeric/underscore/dot/dash, max 64 chars)
-- **Empty API keys rejected**: an empty `api_keys` list is not allowed; use `insecure: true` for open dev access
+- **Empty key strings rejected**: an empty string inside `api_keys` or `admin_keys` (for example from `${KEY:-}`) is a configuration error; leaving the list empty is allowed only on a loopback listen, or anywhere with `insecure: true`
 - **Non-loopback requires insecure**: if `api.listen` is not loopback (127.0.0.1 or ::1), you must set `api.insecure: true` to run without API keys
 - **SQLite/Postgres DSN required**: `store.sqlite.path` or `store.postgres.dsn` must be set when using those backends
 - **Postgres synchronous_commit**: Postgres checks `synchronous_commit` at connect time and rejects `off` with an error
