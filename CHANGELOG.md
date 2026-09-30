@@ -137,8 +137,55 @@ hot path.
   topologies, the reaper lifecycle and metrics, runbook), `docs/ARCHITECTURE.md`
   (components, state machine, guarantees, background jobs, oracle roles,
   store contract), `docs/TREASURY.md` and `docs/FUNDING.md` (the toolbox
-  treasury and BRC-29 funding flow). Benchmark methodology and results are
-  being published separately -- see `docs/PERFORMANCE.md`.
+  treasury and BRC-29 funding flow), and `docs/PERFORMANCE.md` (benchmark
+  method, headline numbers, capacity guidance, and the correctness audit
+  statement).
+
+### Fixed
+
+- **Shard adoption could starve under sustained load.** A shard whose fuel
+  had all been spent (or invalidated) stayed `mined` and adoptable forever;
+  once more such spent-out shards preceded an instance's live ones than its
+  60-second, 256-entry re-adoption exclusion list could hold, adoption
+  cycled through dead shards indefinitely and the instance answered
+  `exhausted` even with fuel available further down the queue. Adoption now
+  retires a shard outright once every one of its rows is terminal
+  (`fuelkeeper_shard_drops_total{reason="retired"}`), removing it from the
+  serve set for good instead of relying on the bounded exclusion list. A
+  shard that is merely drained but not yet terminal (rows still reserved or
+  quarantined) is not covered by this fix -- see `docs/OPERATIONS.md`'s
+  "Known Limits".
+- **A background rescan could re-add a row already handed out by a
+  concurrent `Reserve`**, inflating `fuelkeeper_cas_missed_total` with
+  self-inflicted misses rather than genuine cross-instance overlap. Store
+  listings taken during a rescan are now bracketed against the allocator's
+  own in-flight tracking, so a row `Forget` resolves mid-listing is never
+  re-queued from that same listing. `fuelkeeper_cas_missed_total` is now a
+  clean audit signal for a second owner actually touching a row -- the
+  signal `docs/PERFORMANCE.md` relies on to confirm zero double hand-outs
+  -- see `docs/OPERATIONS.md`'s "Adoption Behavior".
+
+### Performance
+
+- **SQLite and Pebble group-commit concurrent durable writes into one
+  fsync.** Every write (including every `/spend` and `/release`, each its
+  own store write with no batching) previously paid its own WAL fsync while
+  holding the only write path, capping throughput at roughly one write per
+  fsync latency (≈65 writes/s at ≈15 ms fsync on the benchmark host's SATA
+  SSD/btrfs -- ≈55 reserves/s at ≈550 ms p50 end-to-end). Concurrent
+  durable writes on both backends now share one fsync per commit;
+  durability semantics are unchanged -- see `docs/OPERATIONS.md`'s
+  "Durability and Consistency" and `docs/ARCHITECTURE.md`'s store backends
+  matrix. This and the shard-retirement fix above landed after the
+  published `docs/PERFORMANCE.md` benchmark run (commit `236642c`); its
+  SQLite/Pebble numbers and any run affected by shard exhaustion predate
+  both fixes.
+- **The memory store's `Stats` no longer scans every row.** Spent and
+  invalid rows are never pruned, so the previous full-row scan (polled once
+  a second by the minter, and served from `GET /v1/pools`) got slower the
+  longer a pool ran. `Stats` now reads incrementally maintained per-pool,
+  per-state row counters in O(1); shard-status counts are unchanged
+  (O(shards)).
 
 ### Known limitations
 

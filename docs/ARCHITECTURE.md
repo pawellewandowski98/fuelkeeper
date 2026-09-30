@@ -49,13 +49,13 @@ respectively; this document is the map connecting them.
                                |                          |
                                v                          v
                          fuel store                 treasury storage
-                    (memory | sqlite |          (go-wallet-toolbox GORM:
-                     postgres; pebble/               sqlite | postgres)
-                   mongodb/aerospike: Plan 4)
+                  (memory | sqlite | pebble |    (go-wallet-toolbox GORM:
+                   postgres | mongodb |              sqlite | postgres)
+                       aerospike)
 ```
 
-Many instances can share one fuel store (Postgres) and scale horizontally;
-SQLite and the in-memory backend are single-instance. Background jobs run on
+Many instances can share one fuel store (Postgres, MongoDB or Aerospike) and
+scale horizontally; memory, SQLite and Pebble are single-instance. Background jobs run on
 one instance at a time under a store-held lease (`jobs/<name>`), regardless of
 how many instances are running. See `docs/OPERATIONS.md` for deployment
 topologies.
@@ -153,10 +153,16 @@ later tick -- the reaper never guesses.
 split transaction; its rows only leave `available` (become servable) once the
 shard reaches `mined` under the default `serve_policy=mined_only` (or
 immediately, at higher risk, under `serve_policy=any`). `retired` and
-`invalid` are terminal: `RetireShard` marks the shard invalid, clears its
-lease, bumps its version, and moves every non-terminal row (available,
-reserved, quarantined) of that shard to `invalid`, preserving their
-provenance fields.
+`invalid` are both terminal, reached two different ways: the store's
+`RetireShard` marks a dead split (rejected or double-spent) `invalid`,
+clears its lease, bumps its version, and moves every non-terminal row
+(available, reserved, quarantined) of that shard to `invalid`, preserving
+their provenance fields; separately, a *mined* shard every one of whose
+rows has already reached a terminal state on its own (spent or invalid,
+with nothing left to cascade) is marked `retired` instead
+(`UpdateShard(..., store.ShardRetired, nil)`, "all rows terminal; kept for
+history") -- see "Shard manager" below for who does this, and why it
+matters for adoption.
 
 ## Guarantees and Where They Are Enforced
 
@@ -224,7 +230,8 @@ pull-based, one at a time, while in-memory available rows are below
 `low_water_rows` and owned shards are below `max_shards`. `AcquireShard`
 picks the oldest adoptable shard (by `created_at`, then txid) whose status is
 in the serve set and whose lease is free, excluding shards this instance
-recently drained. Adoption never writes fuel rows. Renewal (`RenewOnce`,
+recently drained. Adoption never writes fuel rows (`retireIfSpentOut`,
+below, writes the shard record, not a row). Renewal (`RenewOnce`,
 roughly every `lease_ttl/3`) drops a shard on `ErrNotOwner`/`ErrNotFound`, on
 a status no longer in the serve set, or on a lease stale for more than one
 full TTL under a persistent renew error; a CAS miss on a shard's row
@@ -232,6 +239,29 @@ full TTL under a persistent renew error; a CAS miss on a shard's row
 ahead of its regular turn. A shard that rescans empty
 `emptyRescansMax` (2) times in a row is dropped and excluded from
 re-adoption for 60 seconds. Graceful shutdown releases every owned shard.
+
+A shard adopted with zero available rows to load (`AdoptOnce`) is checked
+by `retireIfSpentOut` before falling back to the 60-second exclusion above:
+when every one of its rows (vouts `0..Size-1`) is already terminal (spent
+or invalid) and the shard is `mined`, it is marked `retired`
+(`UpdateShard(..., store.ShardRetired, nil)`) and dropped with reason
+`"retired"` (`fuelkeeper_shard_drops_total`) instead of `"empty"` -- out of
+the serve set for good, so it needs no exclusion entry at all (unlike
+`"empty"`, which only holds for 60 seconds). Terminal row states never
+change, so the check cannot race a row coming back; it is skipped (leaving
+the shard to the ordinary `"empty"`/60-second path) on any store error, a
+non-mined shard, or a row that is not yet terminal. This closes a gap where
+a spent-out shard stayed `mined` and adoptable forever: `AcquireShard`
+always tries the oldest adoptable shard first, so without retirement, once
+more spent-out shards preceded the live ones than the (256-entry) exclusion
+list holds, an instance could answer `exhausted` indefinitely with fuel
+still available further down the queue. **Not yet covered**: a shard whose
+rows are merely *drained but not yet terminal* (still reserved or
+quarantined -- e.g. very long reservation TTLs at a high reservation rate)
+cannot be retired this way, only excluded for 60 seconds at a time; past
+256 such shards preceding the live ones, adoption can still cycle. The
+planned fix is a store-side `AcquireShard` that skips row-less shards
+server-side rather than relying on this bounded client-side exclusion list.
 
 **Allocator** (`pkg/pool/allocator.go`, per pool): the in-memory FIFO of
 available rows across this instance's owned shards, oldest shard first, so a
@@ -499,21 +529,20 @@ and reported through the applied set or changed count, never an error (see
 kept across every later transition except a return to `available`. All
 stored times are microsecond-precision, taken from an injected clock.
 
-Every backend must pass `pkg/store/storetest.RunSuite` with `-race`. On this
-branch, three backends exist:
+Every backend must pass `pkg/store/storetest.RunSuite` with `-race`. Six
+backends exist:
 
 | Backend | Multi-process | CAS primitive |
 |---|---|---|
-| **memory** (`pkg/store/memory`) | no | One mutex guards the whole store; every mutation is a plain in-process check-then-write. Reference implementation for tests and benchmarks. |
-| **sqlite** (`pkg/store/sqlite`, modernc, no CGO) | no | One process, one writer: every mutation runs as a `database/sql` transaction on a dedicated single-connection handle (`MaxOpenConns(1)`, `_txlock=immediate`), per-op statements executed in sorted `(txid, vout)` order; reads use a separate read-only WAL handle running concurrently with the open write transaction. Each statement's `WHERE` re-asserts the row's current state (and owner, where relevant). |
+| **memory** (`pkg/store/memory`) | no | One mutex guards the whole store; every mutation is a plain in-process check-then-write. Reference implementation for tests and benchmarks; `Stats` reads incrementally maintained per-pool, per-state counters (`counts.go`) rather than scanning every row, so its cost does not grow with how long a pool has run. |
+| **sqlite** (`pkg/store/sqlite`, modernc, no CGO) | no | One process, one writer: every mutation runs as a `database/sql` transaction on a dedicated single-connection handle (`MaxOpenConns(1)`, `_txlock=immediate`), per-op statements executed in sorted `(txid, vout)` order; reads use a separate read-only WAL handle running concurrently with the open write transaction. Each statement's `WHERE` re-asserts the row's current state (and owner, where relevant). The single writer group-commits: every write queued behind the in-flight commit runs (each in its own `SAVEPOINT`, so each stays all-or-nothing on its own) in that one transaction, which then commits once, so concurrent writers share one WAL fsync instead of each paying its own. |
+| **pebble** (`pkg/store/pebble`, embedded LSM) | no | The whole store lives behind one write mutex: every method holds it for its entire body up to and including applying its batch, so reads and writes alike see a fully consistent view without relying on Pebble's own MVCC snapshots. Every mutation builds and commits exactly one `*pebble.Batch` (the row/shard record, every index key, and every per-pool counter it touches), so a crash between two otherwise-separate writes can never leave an index or counter out of sync. Only the batch's WAL fsync is awaited with the mutex released, so concurrent durable writes share fsyncs instead of each queueing its own behind the mutex; no call returns before everything it wrote or observed is durable. Differential-fuzzed against the memory store. |
 | **postgres** (`pkg/store/postgres`, pgx) | yes | Every batch mutation (`Reserve`, `Release`, `Spend`, `Resolve`, `RetireShard`'s row cascade) issues one single-row, primary-key point `UPDATE` per op, pipelined as one `pgx.Batch` inside a single transaction, always in ascending `(txid, vout)` order. A combined multi-row `UPDATE ... FROM unnest(...)` was tried and rejected: Postgres's planner is free to pick its own row-lock order for it, so two concurrent batches touching overlapping rows in different orders could deadlock; sequencing every batch's own per-row updates into one global lock order rules that out. `AcquireShard`/`Quarantine` use `FOR UPDATE SKIP LOCKED`. |
-| pebble | -- | *Plan 4 (not yet in this tree): batch-per-mutation under one store-wide write mutex, per the design spec.* |
-| mongodb | -- | *Plan 4 (not yet in this tree): per-record conditional `UpdateOne`/`BulkWrite` CAS, per the design spec.* |
-| aerospike | -- | *Plan 4 (not yet in this tree): per-record filter-expression CAS (`BatchOperate`), per the design spec.* |
+| **mongodb** (`pkg/store/mongodb`) | yes | No multi-document transactions: every mutation is a per-document conditional update (a compare-and-set on the document's current state), and a batch touching several documents (`Reserve`, `Release`, `Spend`, `Resolve`, `Quarantine`) is classified by a follow-up read rather than a shared transaction -- a standalone `mongod` works, since the package never opens a session or transaction. Every write uses write concern `{w: "majority", j: true}` with primary read preference; deliberately no TTL index on `fuel_rows`, since a row's lifecycle is driven entirely by explicit state transitions, never by MongoDB expiring a document out from under a live reservation. |
+| **aerospike** (`pkg/store/aerospike`) | yes | Per-record compare-and-set: every mutation is a single- or per-record (inside a batch) conditional write guarded by a filter expression re-asserting the record's current state on its own bins -- never a generation check, since Aerospike's generation counter cannot distinguish "untouched" from "rewritten with the same value." Every write policy sets `MaxRetries = 0` (the client's own retry could resend an already-applied non-idempotent write and misread it as lost); callers instead retry `ErrUnavailable` at the `store.Store` layer, where `Reserve` and friends are idempotent. Production requires a strong-consistency namespace (`New` checks it on every node and refuses to start otherwise); `AllowAvailabilityMode` opts out for single-node CE dev/test servers only, since AP mode does not survive G1 under a partition. |
 
-(See `README.md`'s backend table and `docs/OPERATIONS.md` for the same three
-built backends plus deployment notes; pebble/mongodb/aerospike are tracked as
-Plan 4 there too.)
+(See `README.md`'s backend table and `docs/OPERATIONS.md` for the same six
+backends plus deployment notes.)
 
 ## Metrics and Benchmarks
 

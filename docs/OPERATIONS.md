@@ -552,11 +552,53 @@ Runs every `minter.interval`. Responsibilities:
 
 The shard manager per instance (not the minter) owns shards and replenishes in-memory rows:
 
-- Adopts one shard at a time when in-memory rows < `low_water_rows` and owned shards < `max_shards`; at `max_shards` it rescans up to 2 drained shards (oldest first), keeps any whose rows are back, releases those the store shows empty (excluded from re-adoption by this instance for 60 s), and adopts into the freed slots
+- Adopts one shard at a time when in-memory rows < `low_water_rows` and owned shards < `max_shards`; at `max_shards` it rescans up to 2 drained shards (oldest first), keeps any whose rows are back, and for one the store shows empty either **retires it outright** -- every row already terminal (spent or invalid), so the shard is marked `retired` for good (`fuelkeeper_shard_drops_total{pool,reason="retired"}`), needing no exclusion entry -- or, when some rows are merely not yet available again (still reserved or quarantined), releases it excluded from re-adoption by this instance for 60 s instead (`reason="empty"`); then adopts into the freed slots
 - A reserve request waits at most `instance.adopt_timeout` for adoption to complete; lease releases from that rotation run in the background (each bounded at 1 s) and are not charged to the request
 - A crashed instance's shards are re-adopted by others after `instance.lease_ttl` expires
 
-The metric `fuelkeeper_cas_missed_total` counts brief moments when two instances briefly serve the same shard; it clears within one rescan cycle.
+Retiring spent-out shards keeps a high-throughput instance from cycling
+through hundreds of dead shards ahead of its live ones: `AcquireShard`
+always tries the oldest adoptable shard first, and before this a spent-out
+shard stayed `mined` and adoptable forever, with only the 60-second,
+256-entry exclusion list above keeping adoption away from it -- once more
+spent-out shards preceded the live ones than that list holds, an instance
+could answer `exhausted` indefinitely even with fuel available further down
+the queue. See `docs/ARCHITECTURE.md`'s "Shard statuses" and "Shard
+manager" for the mechanism, and "Known Limits" below for what retirement
+does not yet cover.
+
+The metric `fuelkeeper_cas_missed_total` now counts only a genuine second
+owner briefly touching a row (e.g. during a lease hand-over): a rescan's own
+store listing can no longer re-add a row that a concurrent `Reserve` already
+popped and applied, so it no longer includes those self-inflicted misses
+(bracketed listing generations, `pkg/pool/allocator.go`). This makes it the
+audit signal `docs/PERFORMANCE.md` relies on to confirm zero double
+hand-outs during a benchmark run; it clears (stops incrementing) within one
+rescan cycle once the overlap resolves.
+
+## Known Limits
+
+- **Adoption can still cycle through dead shards in one case.** Only a
+  fully spent-out shard (every row terminal) is retired outright. A shard
+  whose rows are merely *drained but not yet terminal* -- still reserved or
+  quarantined, e.g. under very long reservation TTLs at a high reservation
+  rate -- cannot be retired this way, only excluded from re-adoption for
+  60 s at a time, and that exclusion list is capped at 256 entries (see
+  "Adoption Behavior" above). If more than 256 such shards precede the live
+  ones, adoption can still cycle indefinitely. The planned fix is a
+  store-side `AcquireShard` that skips row-less shards server-side instead
+  of relying on a bounded client-side exclusion list.
+- **`/spend` is not coalesced.** Reserve requests are batched by the
+  per-pool coalescer (group-commit), but every `spend` and `release` call is
+  its own store write, one per call -- there is no equivalent batching path
+  for them. A write-bound store (see "Durability and Consistency" above)
+  therefore sees roughly one write transaction per output spent or
+  released, versus roughly one write transaction per *batch* of outputs
+  reserved: at a `count` of 20 per reserve, that is on the order of 20×
+  more write transactions from spends than from reserves for the same
+  throughput of outputs. Size `split_size`/`target_available` and the
+  store's write capacity with that ratio in mind, not just the reserve
+  rate.
 
 ## Development Mode (Nullnet)
 
@@ -631,7 +673,7 @@ Monitor these Prometheus metrics to stay on top of pool health:
 | `fuelkeeper_reserve_requests_total` | counter | pool, result (ok\|bad_request\|insufficient\|exhausted\|error\|canceled) | insufficient rate ↑? | Reserve attempts by outcome |
 | `fuelkeeper_reserve_outputs_total` | counter | pool | track | Total outputs handed out (cumulative) |
 | `fuelkeeper_reserve_latency_seconds` | histogram | pool | p99 > 100ms? | Reserve request latency |
-| `fuelkeeper_cas_missed_total` | counter | pool | > 0? | Concurrent shard ownership (clears within rescan) |
+| `fuelkeeper_cas_missed_total` | counter | pool | > 0? | A second owner touched the row (cross-instance overlap only -- self-inflicted rescan misses are no longer counted); the audit signal for zero double hand-outs, see [Adoption Behavior](#adoption-behavior) |
 | `fuelkeeper_release_total` | counter | pool, result | track | Release calls by outcome |
 | `fuelkeeper_spend_total` | counter | pool, result | track | Spend calls by outcome |
 | `fuelkeeper_allocator_available` | gauge | pool | track | Rows queued in memory |
