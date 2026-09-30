@@ -24,6 +24,12 @@ const (
 	emptyRescansMax  = 2                // consecutive empty rescans before dropping a shard
 	adoptAttempts    = 5                // per hunger event
 	maxRecentlyEmpty = 256              // caps the exclusion set AcquireShard is called with
+
+	// rotateMax bounds how many drained shards one rotation (see
+	// rotateDrained) rescans and may release per EnsureRows or FeedOnce call,
+	// so a single hungry request never does more than rotateMax extra
+	// ListAvailable round trips plus the adoptions refilling the freed slots.
+	rotateMax = 2
 )
 
 type ownedState struct {
@@ -110,11 +116,29 @@ func (m *ShardManager) Hungry() {
 	}
 }
 
+// isHungry reports whether the instance should pull another shard: in-memory
+// rows are below LowWaterRows and either a slot is free (owned < MaxShards)
+// or, at MaxShards, at least one owned shard's FIFO is empty so rotateDrained
+// may be able to trade it for a fresh one.
 func (m *ShardManager) isHungry() bool {
+	if m.alloc.Available() >= m.cfg.LowWaterRows {
+		return false
+	}
+	if m.ownedCount() < m.cfg.MaxShards {
+		return true
+	}
+	for _, txid := range m.ownedIDs() {
+		if m.alloc.ShardAvailable(txid) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *ShardManager) ownedCount() int {
 	m.mu.Lock()
-	n := len(m.owned)
-	m.mu.Unlock()
-	return n < m.cfg.MaxShards && m.alloc.Available() < m.cfg.LowWaterRows
+	defer m.mu.Unlock()
+	return len(m.owned)
 }
 
 // FeedOnce adopts shards while hungry, bounded by adoptAttempts per call.
@@ -124,6 +148,9 @@ func (m *ShardManager) isHungry() bool {
 // shards up to MaxShards when another instance may also need one. It shares
 // adoptSem with EnsureRows so the two never adopt concurrently; it blocks on
 // ctx (no separate timeout) to get its turn.
+//
+// When hungry at MaxShards it runs one rotateDrained pass first (at most once
+// per call) and adopts only into the slots that pass freed.
 func (m *ShardManager) FeedOnce(ctx context.Context) error {
 	select {
 	case m.adoptSem <- struct{}{}:
@@ -131,7 +158,17 @@ func (m *ShardManager) FeedOnce(ctx context.Context) error {
 		return ctx.Err()
 	}
 	defer func() { <-m.adoptSem }()
+	rotated := false
 	for i := 0; i < adoptAttempts && m.isHungry(); i++ {
+		if m.ownedCount() >= m.cfg.MaxShards {
+			if rotated {
+				return nil
+			}
+			rotated = true
+			if released, refilled := m.rotateDrained(ctx); refilled || released == 0 {
+				return nil
+			}
+		}
 		adopted, err := m.AdoptOnce(ctx)
 		if err != nil {
 			return err
@@ -150,6 +187,13 @@ func (m *ShardManager) FeedOnce(ctx context.Context) error {
 // instead of causing a spurious exhaustion, and concurrent callers cannot
 // together push the owned shard count past MaxShards. Returns true if rows
 // are available once it returns.
+//
+// At MaxShards with no rows in memory it does not give up: one rotateDrained
+// pass rescans up to rotateMax drained shards, keeping any whose rows came
+// back and releasing the ones the store shows empty, and the freed slots are
+// then refilled by adoption while in-memory rows stay below LowWaterRows (so
+// a rotation of two shards adopts up to two, not just the first with rows).
+// All of it runs under adoptSem and within AdoptTimeout.
 func (m *ShardManager) EnsureRows(ctx context.Context) bool {
 	if m.alloc.Available() > 0 {
 		return true
@@ -162,18 +206,101 @@ func (m *ShardManager) EnsureRows(ctx context.Context) bool {
 		return m.alloc.Available() > 0
 	}
 	defer func() { <-m.adoptSem }()
-	for i := 0; i < adoptAttempts && m.alloc.Available() == 0; i++ {
-		m.mu.Lock()
-		full := len(m.owned) >= m.cfg.MaxShards
-		m.mu.Unlock()
-		if full {
+	rotated := false // a rotation freed slots: keep filling them while below LowWaterRows
+	for i := 0; i < adoptAttempts; i++ {
+		avail := m.alloc.Available()
+		if avail > 0 && (!rotated || avail >= m.cfg.LowWaterRows) {
 			break
+		}
+		if m.ownedCount() >= m.cfg.MaxShards {
+			if rotated || avail > 0 {
+				break
+			}
+			released, refilled := m.rotateDrained(ctx)
+			if refilled || released == 0 {
+				break
+			}
+			rotated = true
 		}
 		if ok, err := m.AdoptOnce(ctx); err != nil || !ok {
 			break
 		}
 	}
 	return m.alloc.Available() > 0
+}
+
+// rotateDrained is the "hungry at MaxShards" path shared by EnsureRows and
+// FeedOnce; callers hold adoptSem. It takes up to rotateMax owned shards whose
+// allocator FIFO is empty, oldest first, and rescans each once via
+// ListAvailable:
+//   - rows the allocator does not already track came back (released by a
+//     client or another instance): they are added, the shard is kept, and
+//     rotation stops there (refilled is true);
+//   - the store lists rows but all are already tracked (popped, in flight
+//     through this instance's coalescer, not yet reserved in the store): the
+//     shard is neither refilled nor released; rotation moves on to the next
+//     candidate, and a later call sees it empty once those flushes land;
+//   - the store lists zero available rows: the shard has nothing to give
+//     now. It is dropped at once with reason "empty"
+//     (lease released, excluded from re-adoption for emptyExclusion), without
+//     waiting for RescanOnce's emptyRescansMax consecutive ticks, which exist
+//     only to avoid churn when the instance is not starved.
+//
+// Releasing is always safe: adoption never writes fuel rows and G1 rests on
+// the store's row-level CAS, not on leases. Rows of a released shard can
+// still be in flight through this instance's coalescer (their CAS applied
+// but Reserve has not yet called Forget, or a concurrent Reserve popped rows
+// NoteReleased re-added after the listing). They are handled exactly as on
+// the not_owner drop path (drop -> Allocator.RemoveShard): they stay tracked
+// as inflight until the pending CAS resolves them, Forget untracks them if it
+// applied, and Return untracks rather than requeues them since the shard is
+// gone; the store's CAS decides every outcome. Whoever adopts the shard later (us after the exclusion window,
+// or another instance) reloads whatever the store then shows available.
+//
+// It returns how many shards it released (slots now free for AdoptOnce) and
+// whether a rescan re-added rows.
+func (m *ShardManager) rotateDrained(ctx context.Context) (released int, refilled bool) {
+	var drained []chainhash.Hash
+	for _, sh := range m.alloc.Shards() { // oldest first
+		if len(drained) == rotateMax {
+			break
+		}
+		m.mu.Lock()
+		_, mine := m.owned[sh.TxID]
+		m.mu.Unlock()
+		if mine && m.alloc.ShardAvailable(sh.TxID) == 0 {
+			drained = append(drained, sh.TxID)
+		}
+	}
+	for _, txid := range drained {
+		added, listed, err := m.loadRowsCounting(ctx, txid)
+		if err != nil {
+			if ctx.Err() != nil {
+				return released, refilled
+			}
+			m.log.Warn("rotate: rescan drained shard", "txid", txid.String(), "err", err)
+			continue
+		}
+		m.mu.Lock()
+		st := m.owned[txid]
+		if st == nil { // dropped concurrently (e.g. by RenewOnce)
+			m.mu.Unlock()
+			continue
+		}
+		if added > 0 || m.alloc.ShardAvailable(txid) > 0 {
+			st.emptyRescans = 0
+			m.mu.Unlock()
+			return released, true
+		}
+		m.mu.Unlock()
+		if listed > 0 { // only rows already in flight through us: not empty in the store
+			continue
+		}
+		m.log.Debug("rotating out drained shard", "txid", txid.String())
+		m.drop(ctx, txid, true, "empty")
+		released++
+	}
+	return released, false
 }
 
 // excludeList returns the currently-excluded (recently drained) shard ids and
@@ -284,20 +411,29 @@ func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// loadRows pages ListAvailable into the allocator.
+// loadRows pages ListAvailable into the allocator and returns how many rows
+// were newly added.
 func (m *ShardManager) loadRows(ctx context.Context, txid chainhash.Hash) (int, error) {
-	total := 0
+	added, _, err := m.loadRowsCounting(ctx, txid)
+	return added, err
+}
+
+// loadRowsCounting is loadRows that also reports how many rows the store
+// listed as available, including ones the allocator already tracks (queued,
+// or popped and still in flight through the coalescer) and so did not re-add.
+func (m *ShardManager) loadRowsCounting(ctx context.Context, txid chainhash.Hash) (added, listed int, err error) {
 	var from uint32
 	for {
 		opStart := time.Now()
 		rows, err := m.st.ListAvailable(ctx, m.pc.Name, txid, from, listPage)
 		m.listAvailableLatency.Observe(time.Since(opStart).Seconds())
 		if err != nil {
-			return total, err
+			return added, listed, err
 		}
-		total += m.alloc.Add(txid, rows)
+		listed += len(rows)
+		added += m.alloc.Add(txid, rows)
 		if len(rows) < listPage {
-			return total, nil
+			return added, listed, nil
 		}
 		from = rows[len(rows)-1].Vout + 1
 	}
@@ -407,7 +543,10 @@ func (m *ShardManager) servable(s store.ShardStatus) bool {
 }
 
 // RescanOnce reloads available rows of owned shards and drops shards that stay
-// empty for emptyRescansMax consecutive scans.
+// empty for emptyRescansMax consecutive scans. Requiring several consecutive
+// empty scans avoids churn while the instance is not starved; a drained shard
+// that blocks adoption at MaxShards is instead rotated out at once by
+// rotateDrained.
 func (m *ShardManager) RescanOnce(ctx context.Context) error {
 	var firstErr error
 	for _, txid := range m.ownedIDs() {

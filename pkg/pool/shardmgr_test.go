@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -538,4 +539,205 @@ func TestShardManagerRenewOnceDropsUnservableShardOnStatusChange(t *testing.T) {
 	got, err := st.GetShard(ctx, "main", sh.TxID)
 	require.NoError(t, err)
 	assert.Empty(t, got.Owner, "released back to the pool")
+}
+
+// mintN mints n shards of rows rows each, one clock millisecond apart so
+// oldest-first adoption order is deterministic.
+func mintN(t *testing.T, st store.Store, clk *storetest.Clock, poolName string, n, rows int) ([]store.Shard, [][]store.Row) {
+	t.Helper()
+	shards := make([]store.Shard, n)
+	all := make([][]store.Row, n)
+	for i := range n {
+		shards[i], all[i] = storetest.MintShard(t, st, poolName, rows, store.ShardMined)
+		clk.Advance(time.Millisecond)
+	}
+	return shards, all
+}
+
+// drainAll pops every queued row, reserves it store-side under one token (as
+// a real Reserve would) and forgets it locally, leaving every owned shard's
+// FIFO empty and the store with no available rows for those shards.
+func drainAll(t *testing.T, st store.Store, clk *storetest.Clock, poolName string, alloc *pool.Allocator) (store.Token, []store.Row) {
+	t.Helper()
+	popped := alloc.Pop(alloc.Available())
+	tok := store.NewToken()
+	if len(popped) > 0 {
+		storetest.MustReserve(t, st, poolName, popped, tok, clk.Now().Add(time.Hour))
+		alloc.Forget(storetest.Ops(popped))
+	}
+	return tok, popped
+}
+
+func dropsEmpty(poolName string) float64 {
+	return testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "empty"))
+}
+
+func adoptionsOK(poolName string) float64 {
+	return testutil.ToFloat64(pool.ShardAdoptions.WithLabelValues(poolName, "ok"))
+}
+
+// TestEnsureRowsRotatesDrainedShardsWithoutRescanTick pins the fix for the
+// MaxShards throughput cliff: once every owned shard is drained, EnsureRows
+// releases the drained shards and adopts fresh ones in the same call instead
+// of reporting exhaustion until two RescanInterval ticks have passed.
+func TestEnsureRowsRotatesDrainedShardsWithoutRescanTick(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "rotate-ensure"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, rows := mintN(t, st, clk, poolName, 4, 10)
+	cfg := testInstanceConfig() // MaxShards=2
+	cfg.LowWaterRows = 100      // stay hungry so one FeedOnce owns both slots
+	m, alloc := newMgr(t, st, clk, cfg, pc)
+	require.NoError(t, m.FeedOnce(ctx))
+	require.True(t, alloc.Has(shards[0].TxID))
+	require.True(t, alloc.Has(shards[1].TxID))
+
+	tok, _ := drainAll(t, st, clk, poolName, alloc)
+	require.Equal(t, 0, alloc.Available())
+	dropsBefore, adoptsBefore := dropsEmpty(poolName), adoptionsOK(poolName)
+
+	// No clock advance, no RescanOnce: the request path alone must rotate.
+	require.True(t, m.EnsureRows(ctx), "drained shards must be rotated out, not answered with exhaustion")
+	assert.InDelta(t, dropsBefore+2, dropsEmpty(poolName), 0, "both drained shards dropped as empty")
+	assert.InDelta(t, adoptsBefore+2, adoptionsOK(poolName), 0, "both freed slots refilled while below LowWaterRows")
+	assert.False(t, alloc.Has(shards[0].TxID))
+	assert.False(t, alloc.Has(shards[1].TxID))
+	assert.True(t, alloc.Has(shards[2].TxID))
+	assert.True(t, alloc.Has(shards[3].TxID))
+	for _, sh := range shards[:2] {
+		got, err := st.GetShard(ctx, poolName, sh.TxID)
+		require.NoError(t, err)
+		assert.Empty(t, got.Owner, "released in the store")
+	}
+
+	// Keep consuming: every time the FIFO runs dry EnsureRows must find rows
+	// until all 40 are gone.
+	consumed := 20
+	for consumed < 40 {
+		got := alloc.Pop(3)
+		if len(got) == 0 {
+			require.True(t, m.EnsureRows(ctx), "spurious exhaustion after %d of 40 rows", consumed)
+			continue
+		}
+		storetest.MustReserve(t, st, poolName, got, store.NewToken(), clk.Now().Add(time.Hour))
+		alloc.Forget(storetest.Ops(got))
+		consumed += len(got)
+	}
+	assert.False(t, m.EnsureRows(ctx), "all 40 rows consumed: genuinely exhausted")
+
+	// The rotated-out shards sit in the exclusion list: even with rows back in
+	// the store they are not re-adopted inside the exclusion window.
+	_, err := st.Release(ctx, poolName, tok, storetest.Ops(rows[0][:2]))
+	require.NoError(t, err)
+	adopted, err := m.AdoptOnce(ctx)
+	require.NoError(t, err)
+	assert.False(t, adopted, "rotated-out shard excluded from immediate re-adoption")
+	assert.False(t, alloc.Has(shards[0].TxID))
+}
+
+// TestEnsureRowsKeepsShardWhoseRowsReturned pins that rotation rescans a
+// drained shard before giving it up: rows released back to the store since
+// the FIFO emptied are re-added and the shard is kept.
+func TestEnsureRowsKeepsShardWhoseRowsReturned(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "rotate-keep"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, _ := mintN(t, st, clk, poolName, 2, 5)
+	cfg := testInstanceConfig()
+	cfg.MaxShards = 1
+	m, alloc := newMgr(t, st, clk, cfg, pc)
+	require.NoError(t, m.FeedOnce(ctx))
+	require.True(t, alloc.Has(shards[0].TxID))
+
+	tok, popped := drainAll(t, st, clk, poolName, alloc)
+	require.Len(t, popped, 5)
+	n, err := st.Release(ctx, poolName, tok, storetest.Ops(popped[:3]))
+	require.NoError(t, err)
+	require.Equal(t, 3, n)
+	dropsBefore := dropsEmpty(poolName)
+
+	require.True(t, m.EnsureRows(ctx))
+	assert.Equal(t, 3, alloc.Available(), "released rows picked up by the immediate rescan")
+	assert.True(t, alloc.Has(shards[0].TxID), "shard with rows in the store is kept")
+	assert.False(t, alloc.Has(shards[1].TxID), "no rotation needed")
+	assert.InDelta(t, dropsBefore, dropsEmpty(poolName), 0)
+	got, err := st.GetShard(ctx, poolName, shards[0].TxID)
+	require.NoError(t, err)
+	assert.Equal(t, m.Holder(), got.Owner)
+}
+
+// TestHungryAtMaxShardsTriggersBackgroundRotation pins that the background
+// loop rotates too: with every owned shard drained at MaxShards, the next
+// hunger signal releases and replaces them, with renew and rescan tickers
+// set far beyond the test's duration.
+func TestHungryAtMaxShardsTriggersBackgroundRotation(t *testing.T) {
+	const poolName = "rotate-bg"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, _ := mintN(t, st, clk, poolName, 4, 10)
+	cfg := testInstanceConfig() // MaxShards=2
+	cfg.LowWaterRows = 100
+	cfg.LeaseTTL = time.Hour
+	cfg.RescanInterval = time.Hour
+	m, alloc := newMgr(t, st, clk, cfg, pc)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx) }()
+	require.Eventually(t, func() bool { return alloc.Has(shards[0].TxID) && alloc.Has(shards[1].TxID) },
+		2*time.Second, 5*time.Millisecond, "Run fills both slots on start")
+
+	drainAll(t, st, clk, poolName, alloc)
+	m.Hungry() // what Reserve does when the allocator is below LowWaterRows
+
+	require.Eventually(t, func() bool {
+		return !alloc.Has(shards[0].TxID) && !alloc.Has(shards[1].TxID) &&
+			alloc.Has(shards[2].TxID) && alloc.Has(shards[3].TxID)
+	}, 2*time.Second, 5*time.Millisecond, "hunger at MaxShards with drained shards rotates without a rescan tick")
+	assert.Equal(t, 20, alloc.Available())
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+// TestRotationBoundedPerCall pins the per-call rotation bound: one EnsureRows
+// call releases and replaces at most two drained shards; the rest stay owned
+// until a later call needs them.
+func TestRotationBoundedPerCall(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "rotate-bound"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, _ := mintN(t, st, clk, poolName, 10, 10)
+	cfg := testInstanceConfig()
+	cfg.MaxShards = 6
+	cfg.LowWaterRows = 1000
+	m, alloc := newMgr(t, st, clk, cfg, pc)
+	require.NoError(t, m.FeedOnce(ctx))
+	require.NoError(t, m.FeedOnce(ctx)) // adoptAttempts is per call; make sure all six slots are filled
+	require.Len(t, alloc.Shards(), 6)
+
+	drainAll(t, st, clk, poolName, alloc)
+	dropsBefore, adoptsBefore := dropsEmpty(poolName), adoptionsOK(poolName)
+
+	require.True(t, m.EnsureRows(ctx))
+	assert.InDelta(t, dropsBefore+2, dropsEmpty(poolName), 0, "at most two drained shards released per call")
+	assert.InDelta(t, adoptsBefore+2, adoptionsOK(poolName), 0, "at most two fresh shards adopted per call")
+	assert.Len(t, alloc.Shards(), 6)
+	assert.False(t, alloc.Has(shards[0].TxID), "oldest drained shards rotate first")
+	assert.False(t, alloc.Has(shards[1].TxID))
+	for _, sh := range shards[2:6] {
+		assert.True(t, alloc.Has(sh.TxID), "remaining drained shards stay owned")
+	}
+	assert.True(t, alloc.Has(shards[6].TxID))
+	assert.True(t, alloc.Has(shards[7].TxID))
+
+	// Rows are available now, so a further call does not rotate anything.
+	require.True(t, m.EnsureRows(ctx))
+	assert.InDelta(t, dropsBefore+2, dropsEmpty(poolName), 0)
 }
