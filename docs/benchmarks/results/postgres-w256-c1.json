@@ -1,0 +1,19 @@
+{
+  "label": "postgres-w256-c1",
+  "backend": "postgres",
+  "instances": 1,
+  "workers": 256,
+  "count": 1,
+  "mode": "spend",
+  "seconds": 60.003371009,
+  "reserves": 107277,
+  "outputs": 107277,
+  "reserves_per_sec": 1787.849552384471,
+  "outputs_per_sec": 1787.849552384471,
+  "p50_us": 70783,
+  "p95_us": 120383,
+  "p99_us": 153215,
+  "max_us": 1356799,
+  "go_version": "go1.26.3",
+  "timestamp": "2026-09-30T18:35:19.025780085Z"
+}

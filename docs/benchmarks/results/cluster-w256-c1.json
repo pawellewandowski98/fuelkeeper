@@ -1,0 +1,19 @@
+{
+  "label": "cluster-w256-c1",
+  "backend": "postgres",
+  "instances": 3,
+  "workers": 256,
+  "count": 1,
+  "mode": "spend",
+  "seconds": 60.006735266,
+  "reserves": 113394,
+  "outputs": 113394,
+  "reserves_per_sec": 1889.6878741585094,
+  "outputs_per_sec": 1889.6878741585094,
+  "p50_us": 54911,
+  "p95_us": 117951,
+  "p99_us": 554495,
+  "max_us": 1479679,
+  "go_version": "go1.26.3",
+  "timestamp": "2026-09-30T19:01:32.340959637Z"
+}

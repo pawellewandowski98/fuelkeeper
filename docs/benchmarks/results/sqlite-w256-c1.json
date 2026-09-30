@@ -1,0 +1,22 @@
+{
+  "label": "sqlite-w256-c1",
+  "backend": "sqlite",
+  "instances": 1,
+  "workers": 256,
+  "count": 1,
+  "mode": "spend",
+  "seconds": 60.002376345,
+  "reserves": 767,
+  "outputs": 767,
+  "reserves_per_sec": 12.782827059880507,
+  "outputs_per_sec": 12.782827059880507,
+  "p50_us": 722431,
+  "p95_us": 1789951,
+  "p99_us": 1949695,
+  "max_us": 1995775,
+  "errors": {
+    "unavailable": 6906
+  },
+  "go_version": "go1.26.3",
+  "timestamp": "2026-09-30T18:27:33.661218612Z"
+}

@@ -7,8 +7,10 @@ AERO_HOST ?= localhost:3000
 
 # bench-run defaults: a three-instance cluster (bench-cluster-up), 64
 # workers, one output per reserve, 60s, against the postgres-backed cluster.
-# OUT defaults to /tmp (not docs/benchmarks/, which does not exist in this
-# tree and whose creation is out of scope here).
+# OUT defaults to /tmp for a throwaway run; published results live under
+# docs/benchmarks/results/ instead (see docs/benchmarks/README.md and
+# docs/PERFORMANCE.md) -- pass OUT=docs/benchmarks/results/<name>.json to
+# save a run there.
 WORKERS ?= 64
 COUNT ?= 1
 DURATION ?= 60s

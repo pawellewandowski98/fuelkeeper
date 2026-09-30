@@ -1,0 +1,22 @@
+{
+  "label": "aerospike-w64-c1",
+  "backend": "aerospike",
+  "instances": 1,
+  "workers": 64,
+  "count": 1,
+  "mode": "spend",
+  "seconds": 60.00017256,
+  "reserves": 179930,
+  "outputs": 179930,
+  "reserves_per_sec": 2998.824708713471,
+  "outputs_per_sec": 2998.824708713471,
+  "p50_us": 300,
+  "p95_us": 708,
+  "p99_us": 1151,
+  "max_us": 35807,
+  "errors": {
+    "exhausted": 48
+  },
+  "go_version": "go1.26.3",
+  "timestamp": "2026-09-30T18:45:57.254067251Z"
+}

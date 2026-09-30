@@ -1,0 +1,19 @@
+{
+  "label": "mongodb-w256-c1",
+  "backend": "mongodb",
+  "instances": 1,
+  "workers": 256,
+  "count": 1,
+  "mode": "spend",
+  "seconds": 60.001542471,
+  "reserves": 199329,
+  "outputs": 199329,
+  "reserves_per_sec": 3322.0645968616536,
+  "outputs_per_sec": 3322.0645968616536,
+  "p50_us": 39615,
+  "p95_us": 72959,
+  "p99_us": 97535,
+  "max_us": 548863,
+  "go_version": "go1.26.3",
+  "timestamp": "2026-09-30T18:41:32.30600927Z"
+}

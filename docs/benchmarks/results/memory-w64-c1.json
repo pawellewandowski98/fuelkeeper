@@ -1,0 +1,19 @@
+{
+  "label": "memory-w64-c1",
+  "backend": "memory",
+  "instances": 1,
+  "workers": 64,
+  "count": 1,
+  "mode": "spend",
+  "seconds": 60.000353244,
+  "reserves": 173118,
+  "outputs": 173118,
+  "reserves_per_sec": 2885.283013184788,
+  "outputs_per_sec": 2885.283013184788,
+  "p50_us": 342,
+  "p95_us": 9247,
+  "p99_us": 37663,
+  "max_us": 85055,
+  "go_version": "go1.26.3",
+  "timestamp": "2026-09-30T18:18:49.228503717Z"
+}

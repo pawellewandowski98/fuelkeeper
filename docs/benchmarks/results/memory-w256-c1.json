@@ -1,0 +1,19 @@
+{
+  "label": "memory-w256-c1",
+  "backend": "memory",
+  "instances": 1,
+  "workers": 256,
+  "count": 1,
+  "mode": "spend",
+  "seconds": 59.99997645,
+  "reserves": 60002,
+  "outputs": 60002,
+  "reserves_per_sec": 1000.0337258465707,
+  "outputs_per_sec": 1000.0337258465707,
+  "p50_us": 343,
+  "p95_us": 25519,
+  "p99_us": 55007,
+  "max_us": 96767,
+  "go_version": "go1.26.3",
+  "timestamp": "2026-09-30T18:19:51.821568222Z"
+}

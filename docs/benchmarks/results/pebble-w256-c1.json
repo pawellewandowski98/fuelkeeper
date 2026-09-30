@@ -1,0 +1,22 @@
+{
+  "label": "pebble-w256-c1",
+  "backend": "pebble",
+  "instances": 1,
+  "workers": 256,
+  "count": 1,
+  "mode": "spend",
+  "seconds": 60.012125012,
+  "reserves": 802,
+  "outputs": 802,
+  "reserves_per_sec": 13.363966029192142,
+  "outputs_per_sec": 13.363966029192142,
+  "p50_us": 870911,
+  "p95_us": 1850367,
+  "p99_us": 1970175,
+  "max_us": 2003967,
+  "errors": {
+    "unavailable": 6369
+  },
+  "go_version": "go1.26.3",
+  "timestamp": "2026-09-30T18:31:29.820833768Z"
+}

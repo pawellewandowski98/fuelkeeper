@@ -1,0 +1,23 @@
+{
+  "label": "cluster-w64-c10",
+  "backend": "postgres",
+  "instances": 3,
+  "workers": 64,
+  "count": 10,
+  "mode": "spend",
+  "seconds": 60.001856065,
+  "reserves": 24394,
+  "outputs": 243940,
+  "reserves_per_sec": 406.55409015304434,
+  "outputs_per_sec": 4065.5409015304435,
+  "p50_us": 36671,
+  "p95_us": 230271,
+  "p99_us": 431871,
+  "max_us": 1143807,
+  "errors": {
+    "exhausted": 6459,
+    "insufficient": 232
+  },
+  "go_version": "go1.26.3",
+  "timestamp": "2026-09-30T19:02:40.51485411Z"
+}
