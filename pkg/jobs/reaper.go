@@ -56,6 +56,20 @@ const (
 	inputMismatchSourceHint   = "hint"
 )
 
+// Spent sources for reaperSpent: what proved the row spent. A mined spender
+// found through resolveViaTx is counted under its inputMismatchSource*
+// value ("oracle" or "hint").
+const (
+	// spentSourceHint: the client's SpentHint, mined.
+	spentSourceHint = inputMismatchSourceHint
+	// spentSourceCompetitor: a mined transaction among the hint's
+	// CompetingTxs that spends the outpoint (or whose inputs are unknown).
+	spentSourceCompetitor = "competitor"
+	// spentSourceInputsSpent: the hint was rejected because an input was
+	// already spent; SpentBy is the attempt (the hint), not the spender.
+	spentSourceInputsSpent = "inputs_spent"
+)
+
 // Requeue reasons for reaperRequeued: why a quarantined row was returned to
 // available.
 const (
@@ -65,35 +79,63 @@ const (
 	// requeueUnknownAged: an unhinted row with no oracle verdict in a pool
 	// with expiry_policy requeue, quarantined for at least UnknownRequeueAge.
 	requeueUnknownAged = "unknown_aged"
+	// requeueRejected: a hinted row whose transaction was rejected as
+	// invalid (its inputs untouched), after HintPatience.
+	requeueRejected = "rejected"
+	// requeueHintExpired: a hinted row whose transaction was never mined or
+	// classified, after HintMaxWait.
+	requeueHintExpired = "hint_expired"
 )
 
-// Held reasons for reaperHeld: why a quarantined row the reaper examined this
-// tick was left quarantined. Not every held row is counted: rows the tick
-// never classified (an outpoint-oracle outage or malformed answer), an
-// Unspent row still waiting out its age, a Spent verdict naming no txid,
-// and an unconfirmed outpoint-oracle SpendingTxID on an unhinted row have
-// no reason yet.
+// Held reasons for reaperHeld: why a quarantined row the reaper listed this
+// tick was left quarantined. Every listed row that is not resolved is
+// counted under exactly one reason.
 const (
+	// heldOracleDown: the outpoint oracle failed (or answered malformed)
+	// before this row was classified.
+	heldOracleDown = "oracle_down"
 	// heldUnknownFresh: unhinted, no verdict, quarantined for less than
 	// UnknownRequeueAge under expiry_policy requeue.
 	heldUnknownFresh = "unknown_fresh"
 	// heldExpiryHold: unhinted, no verdict, and the pool's expiry_policy is
 	// hold (or UnknownRequeueAge is 0, which disables the requeue).
 	heldExpiryHold = "expiry_hold"
-	// heldHintPending: hinted, and Tx(spender) is known but not (yet)
-	// provably the mined spender of this outpoint: unmined, rejected, or its
-	// inputs do not include the outpoint.
+	// heldUnspentFresh: an Unspent verdict still waiting out MinUnspentAge
+	// (HintPatience for a hinted row).
+	heldUnspentFresh = "unspent_fresh"
+	// heldSpentNoTxID: a Spent verdict naming no txid, on an unhinted row.
+	heldSpentNoTxID = "spent_no_txid"
+	// heldSpenderPending: the outpoint oracle's own SpendingTxID is not (yet)
+	// provably the mined spender: unseen, unmined, rejected, or its inputs
+	// exclude the outpoint.
+	heldSpenderPending = "spender_pending"
+	// heldHintPending: hinted, and Tx(hint) is known but not mined and not
+	// rejected, or mined (or inputs-spent rejected) without spending the
+	// outpoint.
 	heldHintPending = "hint_pending"
-	// heldHintUnseen: hinted, and Tx(spender) is not Known.
+	// heldHintUnseen: hinted, and Tx(hint) is not Known.
 	heldHintUnseen = "hint_unseen"
+	// heldCompetitorPending: hinted, the hint has competing transactions,
+	// and none of those looked up is mined.
+	heldCompetitorPending = "competitor_pending"
+	// heldRejectedFresh: hinted, the hint was rejected as invalid, and the
+	// row has not yet waited HintPatience.
+	heldRejectedFresh = "rejected_fresh"
+	// heldRejectedUnknown: hinted, the hint was rejected for an
+	// unclassified reason.
+	heldRejectedUnknown = "rejected_unknown"
 	// heldConflicting: the outpoint oracle answered Conflicting.
 	heldConflicting = "conflicting"
-	// heldTxDown: the Tx lookup the row depends on failed this tick.
+	// heldTxDown: a Tx lookup the row depends on failed this tick.
 	heldTxDown = "tx_down"
 )
 
 // heldReasons lists every held reason, so each tick can reset all of them.
-var heldReasons = []string{heldUnknownFresh, heldExpiryHold, heldHintPending, heldHintUnseen, heldConflicting, heldTxDown}
+var heldReasons = []string{
+	heldOracleDown, heldUnknownFresh, heldExpiryHold, heldUnspentFresh, heldSpentNoTxID, heldSpenderPending,
+	heldHintPending, heldHintUnseen, heldCompetitorPending, heldRejectedFresh, heldRejectedUnknown,
+	heldConflicting, heldTxDown,
+}
 
 // ReaperConfig tunes the expiry/quarantine/oracle flow (spec "Background jobs").
 type ReaperConfig struct {
@@ -186,10 +228,10 @@ func (c ReaperConfig) Validate() error {
 }
 
 // Reaper is the background job that quarantines expired reservations and asks
-// the oracle whether to requeue them (available) or retire them (spent). It
-// never retires a row on a guess: a Conflicting answer, an oracle error, an
-// oracle "spent" verdict with no spending txid and no client hint, and a
-// hinted row whose spender is not proven all leave the row quarantined.
+// the oracle whether to requeue them (available) or retire them (spent). A
+// Conflicting answer, an oracle error, and an oracle "spent" verdict with no
+// spending txid and no client hint all leave the row quarantined; hinted
+// rows follow the rules below.
 //
 // Quarantine policy for unhinted rows (an expired reservation, or a
 // release_policy verify release, which stores no hint): an Unspent verdict
@@ -212,13 +254,50 @@ func (c ReaperConfig) Validate() error {
 // rows are conserved (G2): a requeue only moves a row from quarantined to
 // available.
 //
-// Hinted rows follow the terminal-state policy below; an Unknown or Unspent
-// verdict never requeues a hinted row faster than HintPatience. Further
-// rules for hinted rows (HintMaxWait, TxRecheckInterval) are added in a
-// later step; today such a row waits until its spender is proven mined, or
-// for an Unspent verdict held for HintPatience.
+// Hinted rows (a client's spend, under spend_policy verify) whose outpoint
+// verdict is Unknown — every hinted row when arcade is the only chain
+// source — are decided from Tx(hint), in this order (classifyHinted):
 //
-// Terminal-state policy: only an oracle-proven, MINED spend may retire a row.
+//  1. Hint Known, Mined, not Rejected: spent by the hint (source "hint"), if
+//     its inputs include the outpoint or are unknown; otherwise held
+//     (hint_pending, input mismatch counted) as in rule 5.
+//  2. Hint has CompetingTxs (rejected, or a double-spend attempt): up to
+//     maxCompetitorsPerHint competitors are looked up (cached per tick,
+//     with fillInputs). The first mined competitor whose inputs include the
+//     outpoint, or are unknown (trusted, logged at Warn once per hint per
+//     tick), is the spender (source "competitor"); a mined competitor whose
+//     known inputs exclude the outpoint is ignored. No mined competitor:
+//     held (competitor_pending) as in rule 5. Only non-spending mined
+//     competitors: fall through to rules 3-5.
+//  3. Rejected, RejectReasonInputsSpent: spent with SpentBy = the hint
+//     (source "inputs_spent"). SpentBy here records the attempt, not the
+//     spender, which arcade does not name. When the hint's inputs are known
+//     and exclude the outpoint it is held (hint_pending) instead.
+//  4. Rejected, RejectReasonTxInvalid: the fuel output is untouched; the
+//     row is requeued (reason "rejected") once quarantined for HintPatience,
+//     held (rejected_fresh) before that.
+//  5. Rejected with RejectReasonUnknown (rejected_unknown), Known but not
+//     mined (hint_pending), or not Known (hint_unseen): held; with
+//     HintMaxWait > 0, requeued (reason "hint_expired", Warn once per hint
+//     per tick) once now - QuarantinedAt >= HintMaxWait.
+//
+// Every one of these transitions, including the hint_expired requeue,
+// needs a successful Tx(hint) answer (and, for rule 2, successful
+// competitor answers) in the same tick: a Tx outage holds the row (tx_down)
+// however old it is. Tx(hint) is asked at most once per TxRecheckInterval
+// per txid across ticks (hintThrottle, bounded to maxHintChecks txids);
+// in between, rows naming it are held with the reason of the last answer,
+// so a transition can lag its age gate by up to one interval. An Unspent
+// verdict requeues a hinted row after HintPatience; a Spent or Conflicting
+// verdict takes precedence over the hint as for any row.
+//
+// A hostile client can at worst retire its own reserved fuel output early
+// (rule 3 by naming an unrelated inputs-spent rejection whose inputs arcade
+// does not report); it cannot make an output be handed out twice.
+//
+// Terminal-state policy: only an oracle-proven, MINED spend may retire a row,
+// with one exception: hinted rule 3 above (the hint's rejection says the
+// fuel output's input is already spent).
 // Every candidate spending txid — the outpoint oracle's own SpendingTxID, and
 // a client's SpentHint used as a fallback when the outpoint oracle names none
 // — is confirmed via Tx and requires Known && Mined && !Rejected before the
@@ -275,6 +354,9 @@ type Reaper struct {
 	cfg    ReaperConfig
 	clock  pool.Clock
 	log    *slog.Logger
+	// hints throttles Tx(hint) lookups across ticks (TxRecheckInterval); the
+	// same single-caller argument as next applies.
+	hints *hintThrottle
 	// next is the per-pool ListQuarantined resume cursor (see listQuarantined).
 	// It is safe without a lock because Job.RunOnce is never called
 	// concurrently with itself for the same job instance (the Runner
@@ -296,7 +378,7 @@ func NewReaper(st store.Store, orc oracle.Oracle, pools []pool.Config, cfg Reape
 	}
 	return &Reaper{
 		st: st, orc: orc, names: names, expiry: expiry, cfg: cfg, clock: clock,
-		log: log.With("job", "reaper"), next: map[string]*store.RowCursor{},
+		log: log.With("job", "reaper"), next: map[string]*store.RowCursor{}, hints: newHintThrottle(),
 	}, nil
 }
 
@@ -312,6 +394,7 @@ func (r *Reaper) Interval() time.Duration { return r.cfg.Interval }
 // are logged, not returned: they are not a job failure, and rows they leave
 // quarantined are picked up again on the next tick.
 func (r *Reaper) RunOnce(ctx context.Context) error {
+	r.hints.prune(r.clock.Now())
 	var errs []error
 	for _, p := range r.names {
 		if err := r.reapPool(ctx, p); err != nil {
@@ -455,6 +538,11 @@ func newVerdicts() verdicts {
 	}
 }
 
+func (v verdicts) spend(txid chainhash.Hash, source string, op store.Outpoint) {
+	k := spentKey{txid: txid, source: source}
+	v.toSpent[k] = append(v.toSpent[k], op)
+}
+
 func (v verdicts) requeue(reason string, op store.Outpoint) {
 	v.toAvailable[reason] = append(v.toAvailable[reason], op)
 }
@@ -469,8 +557,12 @@ func (v verdicts) requeue(reason string, op store.Outpoint) {
 // cancellation.
 func (r *Reaper) classify(ctx context.Context, p string, now time.Time, rows []store.Row) (verdicts, error) {
 	v := newVerdicts()
-	txCache := map[chainhash.Hash]*txCacheEntry{}
-	txDown := false
+	t := newTick(now)
+	defer func() {
+		for txid := range t.resolvedHints {
+			r.hints.forget(txid)
+		}
+	}()
 
 	for start := 0; start < len(rows); start += r.cfg.OracleBatch {
 		if err := ctx.Err(); err != nil {
@@ -486,18 +578,20 @@ func (r *Reaper) classify(ctx context.Context, p string, now time.Time, rows []s
 		if oerr != nil {
 			oracleRequests.WithLabelValues("outpoints", "error").Inc()
 			r.log.Warn("oracle unavailable; leaving remaining rows quarantined this tick", "pool", p, "err", oerr)
+			v.held[heldOracleDown] += len(rows) - start
 			return v, nil
 		}
 		if !sameOutpoints(batch, results) {
 			oracleRequests.WithLabelValues("outpoints", "error").Inc()
 			r.log.Error("oracle returned mismatched results; leaving remaining rows quarantined this tick",
 				"pool", p, "want", len(batch), "got", len(results))
+			v.held[heldOracleDown] += len(rows) - start
 			return v, nil
 		}
 		oracleRequests.WithLabelValues("outpoints", "ok").Inc()
 
 		for i, row := range batch {
-			if cerr := r.classifyOne(ctx, p, now, row, results[i], v, txCache, &txDown); cerr != nil {
+			if cerr := r.classifyOne(ctx, p, t, row, results[i], v); cerr != nil {
 				return v, cerr
 			}
 		}
@@ -521,11 +615,8 @@ func sameOutpoints(batch []store.Row, results []oracle.Result) bool {
 
 // classifyOne applies one oracle verdict to one row, recording the outcome
 // in v. The returned error is non-nil only for context cancellation
-// encountered while resolving a hint.
-func (r *Reaper) classifyOne(
-	ctx context.Context, p string, now time.Time, row store.Row, res oracle.Result,
-	v verdicts, txCache map[chainhash.Hash]*txCacheEntry, txDown *bool,
-) error {
+// encountered while resolving a spender.
+func (r *Reaper) classifyOne(ctx context.Context, p string, t *tick, row store.Row, res oracle.Result, v verdicts) error {
 	switch res.Status {
 	case oracle.StatusSpent:
 		spender := res.SpendingTxID
@@ -540,39 +631,37 @@ func (r *Reaper) classifyOne(
 			// fabricate one. Leave the row quarantined.
 			r.log.Warn("oracle reports spent with no spending txid and no hint; leaving quarantined",
 				"pool", p, "outpoint", row.Outpoint)
+			v.held[heldSpentNoTxID]++
 			return nil
 		}
 		// Even the outpoint oracle's own SpendingTxID is only mempool
 		// evidence until Tx confirms it is mined: see the terminal-state
 		// policy in the Reaper doc comment.
-		out, err := r.resolveViaTx(ctx, p, row.Outpoint, *spender, source, v, txCache, txDown)
+		out, err := r.resolveViaTx(ctx, p, t, row.Outpoint, *spender, source, v)
 		if err != nil {
 			return err
 		}
-		r.countTxOutcome(v, out, hasHint(row))
+		countTxOutcome(v, out, source)
 	case oracle.StatusUnspent:
 		wait := r.cfg.MinUnspentAge
 		if hasHint(row) {
 			wait = r.cfg.HintPatience
 		}
-		if now.Sub(row.QuarantinedAt) >= wait {
+		if t.now.Sub(row.QuarantinedAt) >= wait {
 			v.requeue(requeueUnspent, row.Outpoint)
+		} else {
+			v.held[heldUnspentFresh]++
 		}
 	case oracle.StatusUnknown:
 		if hasHint(row) {
-			out, err := r.resolveViaTx(ctx, p, row.Outpoint, *row.SpentHint, inputMismatchSourceHint, v, txCache, txDown)
-			if err != nil {
-				return err
-			}
-			r.countTxOutcome(v, out, true)
-			return nil
+			return r.classifyHinted(ctx, p, t, row, v)
 		}
 		// Unhinted, no verdict (an expired reservation or a verified
 		// release): see the quarantine policy in the Reaper doc comment.
 		switch {
 		case r.expiry[p] != pool.ExpiryRequeue || r.cfg.UnknownRequeueAge <= 0:
 			v.held[heldExpiryHold]++
-		case now.Sub(row.QuarantinedAt) >= r.cfg.UnknownRequeueAge:
+		case t.now.Sub(row.QuarantinedAt) >= r.cfg.UnknownRequeueAge:
 			v.requeue(requeueUnknownAged, row.Outpoint)
 		default:
 			v.held[heldUnknownFresh]++
@@ -585,20 +674,20 @@ func (r *Reaper) classifyOne(
 }
 
 // countTxOutcome records why a row that went through resolveViaTx was held,
-// if it was. The hint_* reasons are counted only for hinted rows; an
-// unhinted row waiting on the outpoint oracle's own SpendingTxID has no held
-// reason yet (see heldReasons).
-func (r *Reaper) countTxOutcome(v verdicts, out txOutcome, hinted bool) {
+// if it was: hint_* for a client's hint, spender_pending for the outpoint
+// oracle's own SpendingTxID.
+func countTxOutcome(v verdicts, out txOutcome, source string) {
 	switch out {
 	case txProven:
 	case txLookupDown:
 		v.held[heldTxDown]++
-	case txUnseen:
-		if hinted {
+	case txUnseen, txPending:
+		switch {
+		case source == inputMismatchSourceOracle:
+			v.held[heldSpenderPending]++
+		case out == txUnseen:
 			v.held[heldHintUnseen]++
-		}
-	case txPending:
-		if hinted {
+		default:
 			v.held[heldHintPending]++
 		}
 	}
@@ -642,8 +731,8 @@ const (
 // resolveViaTx looks up a claimed spending txid — the outpoint oracle's own
 // SpendingTxID, or a client's SpentHint, named by source — through the tick's
 // cache, and counts it as proven only once it is mined (see the Reaper doc
-// comment's terminal-state policy). On an oracle failure it sets *txDown and
-// logs once, so 1000 rows sharing one txid cost at most one failed Tx call
+// comment's terminal-state policy). On an oracle failure lookupTx sets
+// t.txDown and logs once, so 1000 rows sharing one txid cost at most one failed Tx call
 // and one warning per tick, not one per row. When the verdict's Inputs is
 // non-nil, outpoint must also be a member of it (see the Reaper doc comment's
 // input verification paragraph); a mismatch is logged at most once per txid
@@ -654,34 +743,14 @@ const (
 // log line. It reports what it concluded (see txOutcome); the returned error
 // is non-nil only for context cancellation.
 func (r *Reaper) resolveViaTx(
-	ctx context.Context, p string, outpoint store.Outpoint, txid chainhash.Hash, source string,
-	v verdicts, txCache map[chainhash.Hash]*txCacheEntry, txDown *bool,
+	ctx context.Context, p string, t *tick, outpoint store.Outpoint, txid chainhash.Hash, source string, v verdicts,
 ) (txOutcome, error) {
-	entry, cached := txCache[txid]
-	if !cached {
-		if *txDown {
-			return txLookupDown, nil
-		}
-		if err := ctx.Err(); err != nil {
-			return txLookupDown, err
-		}
-		got, err := r.orc.Tx(ctx, txid)
-		if err != nil {
-			oracleRequests.WithLabelValues("tx", "error").Inc()
-			*txDown = true
-			r.log.Warn("oracle Tx lookup unavailable; leaving quarantined rows waiting on it this tick", "pool", p, "err", err)
-			return txLookupDown, nil
-		}
-		oracleRequests.WithLabelValues("tx", "ok").Inc()
-		r.fillInputs(ctx, p, txid, &got)
-		entry = &txCacheEntry{ts: &got}
-		if got.Inputs != nil {
-			entry.inputs = make(map[store.Outpoint]struct{}, len(got.Inputs))
-			for _, in := range got.Inputs {
-				entry.inputs[in] = struct{}{}
-			}
-		}
-		txCache[txid] = entry
+	entry, err := r.lookupTx(ctx, p, t, txid)
+	if err != nil {
+		return txLookupDown, err
+	}
+	if entry == nil {
+		return txLookupDown, nil
 	}
 	ts := entry.ts
 	if !ts.Known {
@@ -690,29 +759,34 @@ func (r *Reaper) resolveViaTx(
 	if !ts.Mined || ts.Rejected {
 		return txPending, nil
 	}
-	if entry.inputs != nil {
-		if _, spendsOutpoint := entry.inputs[outpoint]; !spendsOutpoint {
-			reaperInputMismatch.WithLabelValues(p, source).Inc()
-			switch source {
-			case inputMismatchSourceOracle:
-				if !entry.warnedOracle {
-					r.log.Error("outpoint oracle's own spending txid does not spend this outpoint; leaving quarantined, not falling back to a client hint",
-						"pool", p, "txid", txid, "source", source)
-					entry.warnedOracle = true
-				}
-			default: // inputMismatchSourceHint
-				if !entry.warnedHint {
-					r.log.Warn("mined spender's inputs do not include this outpoint; leaving quarantined",
-						"pool", p, "txid", txid, "source", source)
-					entry.warnedHint = true
-				}
-			}
-			return txPending, nil
+	if !entry.spends(outpoint) {
+		r.inputMismatch(p, txid, source, entry)
+		return txPending, nil
+	}
+	v.spend(txid, source, outpoint)
+	return txProven, nil
+}
+
+// inputMismatch counts a mined (or inputs-spent rejected) txid whose known
+// inputs exclude the row's outpoint and logs it once per txid per source per
+// tick: Error for source "oracle" (the trusted outpoint oracle contradicted
+// itself), Warn for source "hint" (an unproven client claim).
+func (r *Reaper) inputMismatch(p string, txid chainhash.Hash, source string, entry *txCacheEntry) {
+	reaperInputMismatch.WithLabelValues(p, source).Inc()
+	switch source {
+	case inputMismatchSourceOracle:
+		if !entry.warnedOracle {
+			r.log.Error("outpoint oracle's own spending txid does not spend this outpoint; leaving quarantined, not falling back to a client hint",
+				"pool", p, "txid", txid, "source", source)
+			entry.warnedOracle = true
+		}
+	default: // inputMismatchSourceHint
+		if !entry.warnedHint {
+			r.log.Warn("mined spender's inputs do not include this outpoint; leaving quarantined",
+				"pool", p, "txid", txid, "source", source)
+			entry.warnedHint = true
 		}
 	}
-	k := spentKey{txid: txid, source: source}
-	v.toSpent[k] = append(v.toSpent[k], outpoint)
-	return txProven, nil
 }
 
 // fillInputs asks an oracle.InputsResolver for the inputs of a mined spender

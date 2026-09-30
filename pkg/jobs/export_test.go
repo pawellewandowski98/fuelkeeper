@@ -1,5 +1,7 @@
 package jobs
 
+import "time"
+
 // ReaperInputMismatch exposes the reaper's input-mismatch counter to tests.
 var ReaperInputMismatch = reaperInputMismatch
 
@@ -17,3 +19,12 @@ var ReaperHeld = reaperHeld
 
 // ReaperResolved exposes the reaper's resolved counter (by target state) to tests.
 var ReaperResolved = reaperResolved
+
+// SetHintCheckCap overrides the reaper's hint recheck map capacity.
+func SetHintCheckCap(r *Reaper, n int) { r.hints.cap = n }
+
+// HintChecks returns how many txids the reaper's hint recheck map holds.
+func HintChecks(r *Reaper) int { return len(r.hints.m) }
+
+// PruneHintChecks drops recheck entries due at or before now.
+func PruneHintChecks(r *Reaper, now time.Time) { r.hints.prune(now) }
