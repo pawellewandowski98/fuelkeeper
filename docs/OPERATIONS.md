@@ -345,6 +345,15 @@ Monitor these Prometheus metrics to stay on top of pool health:
 | `fuelkeeper_spend_total` | counter | pool, result | track | Spend calls by outcome |
 | `fuelkeeper_allocator_available` | gauge | pool | track | Rows queued in memory |
 | `fuelkeeper_shards_owned` | gauge | pool | track | Shards leased by this instance |
+| `fuelkeeper_coalescer_batch_size` | histogram | pool | track | Ops grouped into one coalescer flush |
+| `fuelkeeper_coalescer_flush_latency_seconds` | histogram | pool | p99 high? | Store Reserve call duration per flush, including retries |
+| `fuelkeeper_coalescer_inflight_ops` | gauge | pool | near MaxInflightOps? | Ops queued plus ops currently in a flush |
+| `fuelkeeper_cas_unknown_total` | counter | pool | > 0 sustained? | Ops whose Reserve outcome was unknown after retries were exhausted |
+| `fuelkeeper_compensating_release_total` | counter | pool | track | Compensating Release calls issued by the coalescer after an in-doubt flush |
+| `fuelkeeper_shard_adoptions_total` | counter | pool, result (ok\|none\|error) | error rate ↑? | AdoptOnce attempts by result |
+| `fuelkeeper_shard_drops_total` | counter | pool, reason (not_owner\|retired\|empty\|stale\|closed) | not_owner/stale rate ↑? | Owned shards dropped, by reason |
+| `fuelkeeper_lease_renew_failures_total` | counter | pool | > 0 sustained? | RenewShard calls that failed transiently (excludes lease-loss) |
+| `fuelkeeper_store_op_latency_seconds` | histogram | pool, op (reserve\|release\|spend\|acquire_shard\|renew_shard\|release_shard\|list_available) | p99 high? | Store call latency observed at the pool's call sites |
 | `fuelkeeper_quarantine_oldest_age_seconds` | gauge | pool | > 5 minutes? | Oldest stuck quarantined row |
 | `fuelkeeper_watcher_unmined_shards` | gauge | pool | > limit × 0.8? | Current unmined shard count |
 | `fuelkeeper_watcher_oldest_unmined_age_seconds` | gauge | pool | > 2 hours? | Age of oldest unmined shard |

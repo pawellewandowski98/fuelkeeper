@@ -162,19 +162,29 @@ func (c *Coalescer) Submit(ctx context.Context, ops []store.ReserveOp) Result {
 	return Result{Err: ctx.Err()}
 }
 
+// addInflight adjusts the inflight counter and mirrors it onto the exported
+// gauge, so every enqueue/withdraw/drain/flush accounting site stays in sync
+// with fuelkeeper_coalescer_inflight_ops without each call site touching the
+// gauge itself.
+func (c *Coalescer) addInflight(n int64) int64 {
+	v := c.inflight.Add(n)
+	coalescerInflightOps.WithLabelValues(c.pool).Set(float64(v))
+	return v
+}
+
 // enqueue appends req to the pending queue, or reports why it could not:
 // ErrBackpressure when the inflight cap is exceeded, ErrUnavailable when the
 // coalescer has stopped.
 func (c *Coalescer) enqueue(req *request) error {
 	n := int64(len(req.ops))
-	if c.inflight.Add(n) > int64(c.cfg.MaxInflightOps) {
-		c.inflight.Add(-n)
+	if c.addInflight(n) > int64(c.cfg.MaxInflightOps) {
+		c.addInflight(-n)
 		return ErrBackpressure
 	}
 	c.mu.Lock()
 	if c.stopped.Load() { // drain already ran; do not strand this request
 		c.mu.Unlock()
-		c.inflight.Add(-n)
+		c.addInflight(-n)
 		return ErrUnavailable
 	}
 	c.pending = append(c.pending, req)
@@ -201,7 +211,7 @@ func (c *Coalescer) withdraw(req *request) bool {
 		if p == req {
 			c.pending = append(c.pending[:i], c.pending[i+1:]...)
 			c.pendingOps -= len(req.ops)
-			c.inflight.Add(-int64(len(req.ops)))
+			c.addInflight(-int64(len(req.ops)))
 			return true
 		}
 	}
@@ -308,7 +318,7 @@ func (c *Coalescer) drain(err error) {
 	}
 	c.mu.Unlock()
 	for _, req := range pending {
-		c.inflight.Add(-int64(len(req.ops)))
+		c.addInflight(-int64(len(req.ops)))
 		c.deliver(req, Result{Unflushed: true, Err: err})
 	}
 }
@@ -337,7 +347,8 @@ func (c *Coalescer) flush(base context.Context, batch []*request) {
 	for _, r := range batch {
 		total += len(r.ops)
 	}
-	defer c.inflight.Add(-int64(total))
+	defer c.addInflight(-int64(total))
+	coalescerBatchSize.WithLabelValues(c.pool).Observe(float64(total))
 
 	ops := make([]store.ReserveOp, 0, total)
 	owner := make(map[store.Outpoint]int, total)
@@ -359,13 +370,16 @@ func (c *Coalescer) flush(base context.Context, batch []*request) {
 	var applied []store.ReserveOp
 	var err error
 	backoff := c.cfg.RetryBackoff
+	flushStart := time.Now()
 	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			time.Sleep(backoff)
 			backoff *= 2
 		}
 		fctx, cancel := context.WithTimeout(base, c.cfg.FlushTimeout)
+		opStart := time.Now()
 		applied, err = c.st.Reserve(fctx, c.pool, ops)
+		storeOpLatency.WithLabelValues(c.pool, "reserve").Observe(time.Since(opStart).Seconds())
 		cancel()
 		if err == nil {
 			break
@@ -374,12 +388,14 @@ func (c *Coalescer) flush(base context.Context, batch []*request) {
 			break // not retryable
 		}
 	}
+	coalescerFlushLatency.WithLabelValues(c.pool).Observe(time.Since(flushStart).Seconds())
 	if err != nil {
 		// Outcome unknown: compensate once over the deduplicated ops actually sent,
 		// not once per request, so N requests sharing a flush don't each pay their
 		// own CompensateTime budget while still holding the slot. Release on a
 		// never-applied row is a no-op.
-		c.releaseApplied(ops)
+		casUnknown.WithLabelValues(c.pool).Add(float64(len(ops)))
+		c.compensate(ops)
 		for _, r := range batch {
 			c.deliver(r, Result{Err: fmt.Errorf("%w: %w", ErrUnavailable, err)})
 		}
@@ -422,10 +438,27 @@ func (c *Coalescer) deliver(req *request, res Result) {
 	c.releaseApplied(res.Applied)
 }
 
-// releaseApplied best-effort releases ops grouped by token under a detached context.
+// releaseApplied best-effort releases ops grouped by token under a detached
+// context. Used to give back rows an abandoned request no longer needs; not
+// counted as a compensating release (see compensate).
 func (c *Coalescer) releaseApplied(ops []store.ReserveOp) {
+	c.releaseByToken(ops)
+}
+
+// compensate best-effort releases ops whose Reserve outcome is unknown after
+// retries were exhausted, counting each Release call it issues.
+func (c *Coalescer) compensate(ops []store.ReserveOp) {
+	n := c.releaseByToken(ops)
+	if n > 0 {
+		compensatingRelease.WithLabelValues(c.pool).Add(float64(n))
+	}
+}
+
+// releaseByToken groups ops by token and issues one Release call per token
+// under a detached context, returning how many calls it made.
+func (c *Coalescer) releaseByToken(ops []store.ReserveOp) int {
 	if len(ops) == 0 {
-		return
+		return 0
 	}
 	byToken := map[store.Token][]store.Outpoint{}
 	for _, op := range ops {
@@ -434,6 +467,10 @@ func (c *Coalescer) releaseApplied(ops []store.ReserveOp) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.CompensateTime)
 	defer cancel()
 	for tok, outs := range byToken {
-		_, _ = c.st.Release(ctx, c.pool, tok, outs) // errors leave rows to the expiry path
+		start := time.Now()
+		_, err := c.st.Release(ctx, c.pool, tok, outs) // errors leave rows to the expiry path
+		storeOpLatency.WithLabelValues(c.pool, "release").Observe(time.Since(start).Seconds())
+		_ = err
 	}
+	return len(byToken)
 }

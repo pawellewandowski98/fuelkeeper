@@ -311,11 +311,28 @@ func (p *Pool) releaseBestEffort(token store.Token, applied []store.ReserveOp) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, err := p.st.Release(ctx, p.cfg.Name, token, ops); err != nil {
+	if _, err := p.storeRelease(ctx, token, ops); err != nil {
 		p.log.Warn("release partial reservation", "err", err)
 		return
 	}
 	p.noteReleased(ctx, ops)
+}
+
+// storeRelease and storeSpend wrap the store's Release/Spend calls with
+// fuelkeeper_store_op_latency_seconds; every pool call site that reaches the
+// store's Release or Spend goes through one of these.
+func (p *Pool) storeRelease(ctx context.Context, token store.Token, ops []store.Outpoint) (int, error) {
+	start := time.Now()
+	n, err := p.st.Release(ctx, p.cfg.Name, token, ops)
+	storeOpLatency.WithLabelValues(p.cfg.Name, "release").Observe(time.Since(start).Seconds())
+	return n, err
+}
+
+func (p *Pool) storeSpend(ctx context.Context, token store.Token, ops []store.Outpoint, txid chainhash.Hash, terminal bool) (int, error) {
+	start := time.Now()
+	n, err := p.st.Spend(ctx, p.cfg.Name, token, ops, txid, terminal)
+	storeOpLatency.WithLabelValues(p.cfg.Name, "spend").Observe(time.Since(start).Seconds())
+	return n, err
 }
 
 // noteReleased re-adds released rows of owned shards to the allocator.
@@ -352,9 +369,9 @@ func (p *Pool) Release(ctx context.Context, token store.Token, ops []store.Outpo
 	var n int
 	var err error
 	if p.cfg.ReleasePolicy == ReleaseVerify {
-		n, err = p.st.Spend(ctx, p.cfg.Name, token, ops, chainhash.Hash{}, false) // a zero txid records no hint: SpentHint stays nil
+		n, err = p.storeSpend(ctx, token, ops, chainhash.Hash{}, false) // a zero txid records no hint: SpentHint stays nil
 	} else {
-		n, err = p.st.Release(ctx, p.cfg.Name, token, ops)
+		n, err = p.storeRelease(ctx, token, ops)
 	}
 	if err != nil {
 		releaseTotal.WithLabelValues(p.cfg.Name, "error").Inc()
@@ -374,7 +391,7 @@ func (p *Pool) Spend(ctx context.Context, token store.Token, ops []store.Outpoin
 		spendTotal.WithLabelValues(p.cfg.Name, "bad_request").Inc()
 		return 0, fmt.Errorf("%w: token, txid and 1..%d outpoints required", ErrBadRequest, p.cfg.MaxCount)
 	}
-	n, err := p.st.Spend(ctx, p.cfg.Name, token, ops, txid, p.cfg.SpendPolicy == SpendTrust)
+	n, err := p.storeSpend(ctx, token, ops, txid, p.cfg.SpendPolicy == SpendTrust)
 	if err != nil {
 		spendTotal.WithLabelValues(p.cfg.Name, "error").Inc()
 		return 0, mapStoreErr(err)

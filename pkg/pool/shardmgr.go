@@ -200,18 +200,24 @@ func (m *ShardManager) markRecentlyEmpty(txid chainhash.Hash, at time.Time) {
 func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 	now := m.clock.Now()
 	until := now.Add(m.cfg.LeaseTTL)
+	opStart := time.Now()
 	sh, err := m.st.AcquireShard(ctx, m.pc.Name, m.holder, now, until, m.serve, m.excludeList(now))
+	storeOpLatency.WithLabelValues(m.pc.Name, "acquire_shard").Observe(time.Since(opStart).Seconds())
 	if err != nil {
+		shardAdoptions.WithLabelValues(m.pc.Name, "error").Inc()
 		return false, err
 	}
 	if sh == nil {
+		shardAdoptions.WithLabelValues(m.pc.Name, "none").Inc()
 		return false, nil
 	}
+	shardAdoptions.WithLabelValues(m.pc.Name, "ok").Inc()
 
 	m.mu.Lock()
 	switch {
 	case m.closed:
 		m.mu.Unlock()
+		shardDrops.WithLabelValues(m.pc.Name, "closed").Inc()
 		m.releaseLease(ctx, sh.TxID)
 		return false, nil
 	case m.owned[sh.TxID] != nil:
@@ -232,7 +238,7 @@ func (m *ShardManager) AdoptOnce(ctx context.Context) (bool, error) {
 		return true, err // keep the shard; rescan will retry
 	}
 	if loaded == 0 {
-		m.drop(ctx, sh.TxID, true)
+		m.drop(ctx, sh.TxID, true, "empty")
 		return false, nil
 	}
 	m.log.Debug("adopted shard", "txid", sh.TxID.String(), "rows", loaded)
@@ -244,7 +250,9 @@ func (m *ShardManager) loadRows(ctx context.Context, txid chainhash.Hash) (int, 
 	total := 0
 	var from uint32
 	for {
+		opStart := time.Now()
 		rows, err := m.st.ListAvailable(ctx, m.pc.Name, txid, from, listPage)
+		storeOpLatency.WithLabelValues(m.pc.Name, "list_available").Observe(time.Since(opStart).Seconds())
 		if err != nil {
 			return total, err
 		}
@@ -262,15 +270,19 @@ func (m *ShardManager) loadRows(ctx context.Context, txid chainhash.Hash) (int, 
 func (m *ShardManager) releaseLease(ctx context.Context, txid chainhash.Hash) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
+	opStart := time.Now()
 	err := m.st.ReleaseShard(rctx, m.pc.Name, txid, m.holder)
+	storeOpLatency.WithLabelValues(m.pc.Name, "release_shard").Observe(time.Since(opStart).Seconds())
 	if err != nil && !errors.Is(err, store.ErrNotFound) && !errors.Is(err, store.ErrNotOwner) {
 		m.log.Warn("release shard", "txid", txid.String(), "err", err)
 	}
 }
 
 // drop forgets a shard locally and, when release is true, releases its lease
-// and excludes it from re-adoption for emptyExclusion.
-func (m *ShardManager) drop(ctx context.Context, txid chainhash.Hash, release bool) {
+// and excludes it from re-adoption for emptyExclusion. reason feeds
+// shard_drops_total (e.g. "empty", "not_owner", "stale", "retired").
+func (m *ShardManager) drop(ctx context.Context, txid chainhash.Hash, release bool, reason string) {
+	shardDrops.WithLabelValues(m.pc.Name, reason).Inc()
 	m.alloc.RemoveShard(txid)
 	m.mu.Lock()
 	delete(m.owned, txid)
@@ -300,13 +312,16 @@ func (m *ShardManager) RenewOnce(ctx context.Context) error {
 	until := now.Add(m.cfg.LeaseTTL)
 	var firstErr error
 	for _, txid := range m.ownedIDs() {
+		opStart := time.Now()
 		head, err := m.st.RenewShard(ctx, m.pc.Name, txid, m.holder, until)
+		storeOpLatency.WithLabelValues(m.pc.Name, "renew_shard").Observe(time.Since(opStart).Seconds())
 		switch {
 		case errors.Is(err, store.ErrNotOwner), errors.Is(err, store.ErrNotFound):
 			m.log.Info("lost shard lease", "txid", txid.String())
-			m.drop(ctx, txid, false)
+			m.drop(ctx, txid, false, "not_owner")
 			continue
 		case err != nil:
+			leaseRenewFailures.WithLabelValues(m.pc.Name).Inc()
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -319,13 +334,13 @@ func (m *ShardManager) RenewOnce(ctx context.Context) error {
 			m.mu.Unlock()
 			if stale {
 				m.log.Warn("dropping shard with stale lease", "txid", txid.String())
-				m.drop(ctx, txid, false)
+				m.drop(ctx, txid, false, "stale")
 			}
 			continue
 		}
 		if !m.servable(head.Status) {
 			m.log.Info("shard no longer servable", "txid", txid.String(), "status", head.Status.String())
-			m.drop(ctx, txid, true)
+			m.drop(ctx, txid, true, "retired")
 			continue
 		}
 		m.mu.Lock()
@@ -376,7 +391,7 @@ func (m *ShardManager) RescanOnce(ctx context.Context) error {
 		m.mu.Unlock()
 		if empty {
 			m.log.Debug("dropping drained shard", "txid", txid.String())
-			m.drop(ctx, txid, true)
+			m.drop(ctx, txid, true, "empty")
 		}
 	}
 	return firstErr
@@ -402,13 +417,16 @@ func (m *ShardManager) rescanFlagged(ctx context.Context) error {
 	until := now.Add(m.cfg.LeaseTTL)
 	var firstErr error
 	for _, txid := range flagged {
+		opStart := time.Now()
 		head, err := m.st.RenewShard(ctx, m.pc.Name, txid, m.holder, until)
+		storeOpLatency.WithLabelValues(m.pc.Name, "renew_shard").Observe(time.Since(opStart).Seconds())
 		switch {
 		case errors.Is(err, store.ErrNotOwner), errors.Is(err, store.ErrNotFound):
 			m.log.Info("lost shard lease", "txid", txid.String())
-			m.drop(ctx, txid, false)
+			m.drop(ctx, txid, false, "not_owner")
 			continue
 		case err != nil:
+			leaseRenewFailures.WithLabelValues(m.pc.Name).Inc()
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -416,7 +434,7 @@ func (m *ShardManager) rescanFlagged(ctx context.Context) error {
 		}
 		if !m.servable(head.Status) {
 			m.log.Info("shard no longer servable", "txid", txid.String(), "status", head.Status.String())
-			m.drop(ctx, txid, true)
+			m.drop(ctx, txid, true, "retired")
 			continue
 		}
 		m.mu.Lock()
@@ -475,11 +493,14 @@ func (m *ShardManager) ReleaseAll(ctx context.Context) error {
 	m.mu.Unlock()
 	var firstErr error
 	for _, txid := range m.ownedIDs() {
+		shardDrops.WithLabelValues(m.pc.Name, "closed").Inc()
 		m.alloc.RemoveShard(txid)
 		m.mu.Lock()
 		delete(m.owned, txid)
 		m.mu.Unlock()
+		opStart := time.Now()
 		err := m.st.ReleaseShard(ctx, m.pc.Name, txid, m.holder)
+		storeOpLatency.WithLabelValues(m.pc.Name, "release_shard").Observe(time.Since(opStart).Seconds())
 		if err != nil && !errors.Is(err, store.ErrNotFound) && !errors.Is(err, store.ErrNotOwner) && firstErr == nil {
 			firstErr = err
 		}
