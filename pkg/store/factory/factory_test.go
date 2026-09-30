@@ -33,7 +33,7 @@ func TestNew(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrInvalidArgument, "postgres needs a DSN")
 
 	_, err = factory.New(ctx, factory.Config{Backend: ""}, time.Now)
-	require.ErrorIs(t, err, store.ErrInvalidArgument, "empty backend is required")
+	require.ErrorIs(t, err, store.ErrInvalidArgument, "empty backend must be rejected")
 	require.Contains(t, err.Error(), "backend is required")
 }
 

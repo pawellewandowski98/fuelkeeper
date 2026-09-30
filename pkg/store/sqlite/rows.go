@@ -140,18 +140,18 @@ func scanRow(sc rowScanner) (store.Row, error) {
 func (s *Store) queryRows(ctx context.Context, q string, args ...any) ([]store.Row, error) {
 	rs, err := s.reader.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, wrap(err)
+		return nil, wrapCtx(ctx, err)
 	}
 	defer func() { _ = rs.Close() }()
 	var out []store.Row
 	for rs.Next() {
 		r, err := scanRow(rs)
 		if err != nil {
-			return nil, wrap(err)
+			return nil, wrapCtx(ctx, err)
 		}
 		out = append(out, r)
 	}
-	return out, wrap(rs.Err())
+	return out, wrapCtx(ctx, rs.Err())
 }
 
 // ListAvailable implements store.Store.
@@ -175,7 +175,7 @@ func (s *Store) GetRows(ctx context.Context, pool string, ops []store.Outpoint) 
 	}
 	stmt, err := s.reader.PrepareContext(ctx, `SELECT `+rowCols+` FROM fuel_rows WHERE pool=? AND txid=? AND vout=?`)
 	if err != nil {
-		return nil, wrap(err)
+		return nil, wrapCtx(ctx, err)
 	}
 	defer func() { _ = stmt.Close() }()
 	out := make([]store.Row, 0, len(ops))
@@ -185,7 +185,7 @@ func (s *Store) GetRows(ctx context.Context, pool string, ops []store.Outpoint) 
 			continue
 		}
 		if err != nil {
-			return nil, wrap(err)
+			return nil, wrapCtx(ctx, err)
 		}
 		out = append(out, r)
 	}
@@ -362,7 +362,7 @@ func (s *Store) Resolve(ctx context.Context, pool string, ops []store.Outpoint, 
 func countGroupBy(ctx context.Context, q querier, query, pool string) (map[int]int64, error) {
 	rs, err := q.QueryContext(ctx, query, pool)
 	if err != nil {
-		return nil, wrap(err)
+		return nil, wrapCtx(ctx, err)
 	}
 	defer func() { _ = rs.Close() }()
 	out := make(map[int]int64)
@@ -370,11 +370,11 @@ func countGroupBy(ctx context.Context, q querier, query, pool string) (map[int]i
 		var key int
 		var n int64
 		if err := rs.Scan(&key, &n); err != nil {
-			return nil, wrap(err)
+			return nil, wrapCtx(ctx, err)
 		}
 		out[key] = n
 	}
-	return out, wrap(rs.Err())
+	return out, wrapCtx(ctx, rs.Err())
 }
 
 // Stats implements store.Store. Both counts run inside one read-only
@@ -386,7 +386,7 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 	}
 	tx, err := s.reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return store.Stats{}, wrap(err)
+		return store.Stats{}, wrapCtx(ctx, err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -409,5 +409,5 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 	st.ShardsMined = shardCounts[int(store.ShardMined)]
 	st.ShardsRetired = shardCounts[int(store.ShardRetired)]
 	st.ShardsInvalid = shardCounts[int(store.ShardInvalid)]
-	return st, wrap(tx.Commit())
+	return st, wrapCtx(ctx, tx.Commit())
 }

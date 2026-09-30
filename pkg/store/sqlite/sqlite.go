@@ -202,38 +202,38 @@ func (s *Store) Pragmas(ctx context.Context) (Pragmas, error) {
 	var p Pragmas
 	wconn, err := s.writer.Conn(ctx)
 	if err != nil {
-		return p, wrap(err)
+		return p, wrapCtx(ctx, err)
 	}
 	defer func() { _ = wconn.Close() }()
 	if err := wconn.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&p.JournalMode); err != nil {
-		return p, wrap(err)
+		return p, wrapCtx(ctx, err)
 	}
 	if err := wconn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&p.BusyTimeout); err != nil {
-		return p, wrap(err)
+		return p, wrapCtx(ctx, err)
 	}
 	if err := wconn.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&p.Synchronous); err != nil {
-		return p, wrap(err)
+		return p, wrapCtx(ctx, err)
 	}
 	if err := wconn.QueryRowContext(ctx, `PRAGMA journal_size_limit`).Scan(&p.JournalSizeLimit); err != nil {
-		return p, wrap(err)
+		return p, wrapCtx(ctx, err)
 	}
 	p.JournalMode = strings.ToLower(p.JournalMode)
 
 	rconn, err := s.reader.Conn(ctx)
 	if err != nil {
-		return p, wrap(err)
+		return p, wrapCtx(ctx, err)
 	}
 	defer func() { _ = rconn.Close() }()
 	var queryOnly int
 	if err := rconn.QueryRowContext(ctx, `PRAGMA query_only`).Scan(&queryOnly); err != nil {
-		return p, wrap(err)
+		return p, wrapCtx(ctx, err)
 	}
 	p.ReaderQueryOnly = queryOnly != 0
 	return p, nil
 }
 
 // Ping checks the reader handle.
-func (s *Store) Ping(ctx context.Context) error { return wrap(s.reader.PingContext(ctx)) }
+func (s *Store) Ping(ctx context.Context) error { return wrapCtx(ctx, s.reader.PingContext(ctx)) }
 
 // Capabilities reports SQLite limits: one writer, batches bounded, single process.
 func (s *Store) Capabilities() store.Caps {
@@ -243,7 +243,7 @@ func (s *Store) Capabilities() store.Caps {
 // Analyze refreshes planner statistics (tests and operators).
 func (s *Store) Analyze(ctx context.Context) error {
 	_, err := s.writer.ExecContext(ctx, `ANALYZE`)
-	return wrap(err)
+	return wrapCtx(ctx, err)
 }
 
 // Checkpoint runs a PASSIVE WAL checkpoint: it folds as many WAL frames into
@@ -253,14 +253,14 @@ func (s *Store) Analyze(ctx context.Context) error {
 // growth between the automatic checkpoints SQLite already runs on its own.
 func (s *Store) Checkpoint(ctx context.Context) error {
 	_, err := s.writer.ExecContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`)
-	return wrap(err)
+	return wrapCtx(ctx, err)
 }
 
 // ExplainQueryPlan returns the detail lines of EXPLAIN QUERY PLAN for q.
 func (s *Store) ExplainQueryPlan(ctx context.Context, q string, args ...any) ([]string, error) {
 	rs, err := s.reader.QueryContext(ctx, "EXPLAIN QUERY PLAN "+q, args...)
 	if err != nil {
-		return nil, wrap(err)
+		return nil, wrapCtx(ctx, err)
 	}
 	defer func() { _ = rs.Close() }()
 	var out []string
@@ -268,11 +268,11 @@ func (s *Store) ExplainQueryPlan(ctx context.Context, q string, args ...any) ([]
 		var id, parent, notused int
 		var detail string
 		if err := rs.Scan(&id, &parent, &notused, &detail); err != nil {
-			return nil, wrap(err)
+			return nil, wrapCtx(ctx, err)
 		}
 		out = append(out, detail)
 	}
-	return out, wrap(rs.Err())
+	return out, wrapCtx(ctx, rs.Err())
 }
 
 // Close closes both handles, first folding the WAL back into the main
@@ -325,8 +325,12 @@ type sqliteCoder interface{ Code() int }
 // SQLITE_BUSY and SQLITE_LOCKED (and their extended-result-code variants,
 // e.g. SQLITE_BUSY_SNAPSHOT, SQLITE_LOCKED_SHAREDCACHE: masking with & 0xff
 // recovers the primary code) mean another connection held a conflicting lock;
-// context.DeadlineExceeded and io.EOF/io.ErrUnexpectedEOF mean the caller gave
-// up or the connection dropped mid-read. SQLITE_IOERR-class subcodes are not
+// SQLITE_INTERRUPT means modernc.org/sqlite cut a running statement short
+// because its context was done (see wrapCtx, which attributes this to the
+// caller's context directly whenever that context is available; this
+// classification is the fallback for a path where it isn't). context.
+// DeadlineExceeded and io.EOF/io.ErrUnexpectedEOF mean the caller gave up or
+// the connection dropped mid-read. SQLITE_IOERR-class subcodes are not
 // classified as retryable here: unlike BUSY/LOCKED they usually indicate a
 // disk-level fault (full disk, permission, hardware) that a caller retrying
 // immediately will not resolve.
@@ -334,7 +338,7 @@ func isTransient(err error) bool {
 	var c sqliteCoder
 	if errors.As(err, &c) {
 		switch c.Code() & 0xff {
-		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_INTERRUPT:
 			return true
 		}
 		return false // a well-formed, non-transient SQLite error: e.g. SQLITE_CONSTRAINT
@@ -358,6 +362,22 @@ func wrap(err error) error {
 		return fmt.Errorf("%w: %w", store.ErrUnavailable, err)
 	}
 	return err
+}
+
+// wrapCtx attributes a failure to ctx when ctx is done: modernc surfaces a
+// mid-statement cancellation as SQLITE_INTERRUPT, and database/sql's rollback
+// watcher can make Commit return sql.ErrTxDone; both are cancellations. A nil
+// err (a successful call racing a context that goes done right after, e.g.
+// rs.Err() or a read-only tx.Commit() that both landed cleanly) is never
+// turned into a non-nil error: success stays success.
+func wrapCtx(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if cerr := ctx.Err(); cerr != nil && !errors.Is(err, cerr) {
+		err = fmt.Errorf("%w (%w)", cerr, err)
+	}
+	return wrap(err)
 }
 
 // write runs fn inside one transaction on the single writer *sql.DB
@@ -385,15 +405,15 @@ func wrap(err error) error {
 func (s *Store) write(ctx context.Context, fn func(querier) error) error {
 	tx, err := s.writer.BeginTx(ctx, nil)
 	if err != nil {
-		return wrap(err)
+		return wrapCtx(ctx, err)
 	}
 	if err := fn(tx); err != nil {
 		_ = tx.Rollback()
-		return wrap(err)
+		return wrapCtx(ctx, err)
 	}
 	if err := tx.Commit(); err != nil {
 		_ = tx.Rollback()
-		return wrap(err)
+		return wrapCtx(ctx, err)
 	}
 	return nil
 }

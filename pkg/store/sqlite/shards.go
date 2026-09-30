@@ -109,7 +109,7 @@ func (s *Store) GetShard(ctx context.Context, pool string, txid chainhash.Hash) 
 		return nil, store.ErrNotFound
 	}
 	if err != nil {
-		return nil, wrap(err)
+		return nil, wrapCtx(ctx, err)
 	}
 	return &sh, nil
 }
@@ -398,16 +398,16 @@ func (s *Store) ListShards(ctx context.Context, pool string, f store.ShardFilter
 	}
 	rs, err := s.reader.QueryContext(ctx, sb.String(), args...)
 	if err != nil {
-		return nil, wrap(err)
+		return nil, wrapCtx(ctx, err)
 	}
 	defer func() { _ = rs.Close() }()
 	var out []store.Shard
 	for rs.Next() {
 		sh, err := scanShard(rs, false)
 		if err != nil {
-			return nil, wrap(err)
+			return nil, wrapCtx(ctx, err)
 		}
 		out = append(out, sh)
 	}
-	return out, wrap(rs.Err())
+	return out, wrapCtx(ctx, rs.Err())
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -37,6 +38,10 @@ func TestIsTransient_Locked(t *testing.T) {
 	assert.True(t, isTransient(fakeCoder{sqlite3.SQLITE_LOCKED}))
 	assert.True(t, isTransient(fakeCoder{sqlite3.SQLITE_LOCKED_SHAREDCACHE}), "extended code masks to the base LOCKED code")
 	assert.True(t, isTransient(fakeCoder{sqlite3.SQLITE_LOCKED_VTAB}))
+}
+
+func TestIsTransient_Interrupt(t *testing.T) {
+	assert.True(t, isTransient(fakeCoder{sqlite3.SQLITE_INTERRUPT}))
 }
 
 func TestIsTransient_NonTransientCode(t *testing.T) {
@@ -133,4 +138,79 @@ func TestIsTransient_RealBusy(t *testing.T) {
 	require.Error(t, err, "the second connection must fail to acquire the RESERVED lock immediately")
 	assert.True(t, isTransient(err), "a real SQLITE_BUSY from the driver must be classified transient: %v", err)
 	assert.ErrorIs(t, wrap(err), store.ErrUnavailable)
+}
+
+// TestWrapCtx_DoneContextInterrupted covers the first observed shape from the
+// bug this fix addresses: modernc.org/sqlite interrupts a running statement
+// mid-cancellation and surfaces SQLITE_INTERRUPT, not a context error
+// directly. Against a cancelled ctx, wrapCtx must still attribute the failure
+// to context.Canceled while keeping the original error reachable via
+// errors.Is/errors.Unwrap.
+func TestWrapCtx_DoneContextInterrupted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	originalErr := fakeCoder{sqlite3.SQLITE_INTERRUPT}
+	err := wrapCtx(ctx, originalErr)
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.ErrorIs(t, err, error(originalErr))
+}
+
+// TestWrapCtx_ExceededDeadlineTxDone covers the second observed shape: the
+// database/sql context watcher wins the race and rolls the transaction back
+// before our own Commit call reaches the server, so Commit returns
+// sql.ErrTxDone -- an error with no sqliteCoder to classify at all. Against a
+// context whose deadline has already passed, wrapCtx must attribute this to
+// context.DeadlineExceeded while keeping sql.ErrTxDone reachable.
+func TestWrapCtx_ExceededDeadlineTxDone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+	<-ctx.Done()
+
+	err := wrapCtx(ctx, sql.ErrTxDone)
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.ErrorIs(t, err, sql.ErrTxDone)
+}
+
+// TestWrapCtx_LiveContextTxDoneNotAttributed proves wrapCtx does not blame the
+// context when the context is not actually done: sql.ErrTxDone can also occur
+// from an ordinary double-Commit/Commit-after-Rollback programming mistake
+// unrelated to cancellation, and a live ctx must not be misreported as
+// cancelled or deadline-exceeded in that case.
+func TestWrapCtx_LiveContextTxDoneNotAttributed(t *testing.T) {
+	ctx := context.Background()
+	err := wrapCtx(ctx, sql.ErrTxDone)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, context.DeadlineExceeded)
+	assert.ErrorIs(t, err, sql.ErrTxDone)
+}
+
+// TestWrapCtx_LiveContextAlreadyWrapsCanceled proves wrapCtx does not
+// double-wrap an error that already carries context.Canceled in its chain
+// (e.g. an error returned by a lower layer that already did its own
+// attribution): the resulting message must mention "context canceled" only
+// once.
+func TestWrapCtx_LiveContextAlreadyWrapsCanceled(t *testing.T) {
+	ctx := context.Background()
+	original := fmt.Errorf("op failed: %w", context.Canceled)
+	err := wrapCtx(ctx, original)
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, strings.Count(err.Error(), "context canceled"), "must not double-wrap an error that already carries context.Canceled: %v", err)
+}
+
+// TestWrapCtx_LiveContextInterruptIsUnavailable covers the fallback path: with
+// no context error to attribute the failure to (ctx is live), a
+// SQLITE_INTERRUPT must still be reported as store.ErrUnavailable via
+// isTransient/wrap, since interrupting a statement without a corresponding
+// context cancellation is exactly the kind of "unknown outcome" a caller may
+// safely retry.
+func TestWrapCtx_LiveContextInterruptIsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	err := wrapCtx(ctx, fakeCoder{sqlite3.SQLITE_INTERRUPT})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, store.ErrUnavailable)
 }
