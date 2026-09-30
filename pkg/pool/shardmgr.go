@@ -114,7 +114,7 @@ func NewShardManager(st store.Store, pc Config, cfg InstanceConfig, alloc *Alloc
 // Holder returns this instance's lease holder id.
 func (m *ShardManager) Holder() string { return m.holder }
 
-// Hungry signals the run loop to try adopting (non-blocking).
+// Hungry signals Run's feed goroutine to try adopting (non-blocking).
 func (m *ShardManager) Hungry() {
 	select {
 	case m.hungry <- struct{}{}:
@@ -193,7 +193,7 @@ func (m *ShardManager) FeedOnce(ctx context.Context) error {
 // EnsureRows is the bounded synchronous path Reserve uses when the FIFO is
 // empty. It serializes with FeedOnce (and other concurrent EnsureRows calls)
 // on adoptSem, bounded by AdoptTimeout: a concurrent in-progress adoption
-// (typically the background Run loop's own hunger-driven pull) is waited for
+// (typically Run's feed goroutine's own hunger-driven pull) is waited for
 // instead of causing a spurious exhaustion, and concurrent callers cannot
 // together push the owned shard count past MaxShards. Returns true if rows
 // are available once it returns.
@@ -254,14 +254,17 @@ func (m *ShardManager) EnsureRows(ctx context.Context) bool {
 //     shard is neither refilled nor released; rotation moves on to the next
 //     candidate, and a later call sees it empty once those flushes land;
 //   - the store lists zero available rows: the shard has nothing to give
-//     now. It is dropped at once with reason "empty"
-//     (lease released, excluded from re-adoption for emptyExclusion), without
-//     waiting for RescanOnce's emptyRescansMax consecutive ticks, which exist
-//     only to avoid churn when the instance is not starved.
+//     now. It is dropped at once, without waiting for RescanOnce's
+//     emptyRescansMax consecutive ticks, which exist only to avoid churn when
+//     the instance is not starved: retired (reason "retired", no exclusion
+//     entry) when every row is terminal, as RescanOnce does (see
+//     retireDrained), otherwise with reason "empty" (lease released,
+//     excluded from re-adoption for emptyExclusion).
 //
-// With async (the request path) the lease release itself runs in the
-// background (see dropAsync); the shard is forgotten and excluded at once
-// either way.
+// With async (the request path) the retire check and the lease release run
+// in the background (see dropRotatedAsync), so AdoptTimeout is never charged
+// for the check's GetRows; the shard is forgotten and kept out of
+// AcquireShard at once either way.
 //
 // Rows released back to the store after their shard was rotated out (by a
 // client through this instance, see NoteReleased, or through another one)
@@ -314,6 +317,7 @@ func (m *ShardManager) rotateDrained(ctx context.Context, async bool) (released 
 			m.mu.Unlock()
 			return released, true
 		}
+		snap := store.Shard{TxID: txid, Status: st.head.Status, Version: st.head.Version, Size: st.size}
 		m.mu.Unlock()
 		if listed > 0 { // only rows already in flight through us: not empty in the store
 			continue
@@ -321,8 +325,12 @@ func (m *ShardManager) rotateDrained(ctx context.Context, async bool) (released 
 		m.log.Debug("rotating out drained shard", "txid", txid.String())
 		var dropped bool
 		if async {
-			dropped = m.dropAsync(ctx, txid, "empty")
+			dropped = m.dropRotatedAsync(ctx, snap)
 		} else {
+			if m.retireDrained(ctx, txid) {
+				released++
+				continue
+			}
 			dropped = m.drop(ctx, txid, true, "empty")
 		}
 		if dropped {
@@ -359,6 +367,21 @@ func (m *ShardManager) excludeList(now time.Time) []chainhash.Hash {
 		}
 	}
 	return ex
+}
+
+// unmarkRecentlyEmpty removes txid from the exclusion list (a shard retired
+// after it was excluded). Callers must hold m.mu.
+func (m *ShardManager) unmarkRecentlyEmpty(txid chainhash.Hash) {
+	if _, ok := m.recentlyEmpty[txid]; !ok {
+		return
+	}
+	delete(m.recentlyEmpty, txid)
+	for i, id := range m.recentOrder {
+		if id == txid {
+			m.recentOrder = append(m.recentOrder[:i], m.recentOrder[i+1:]...)
+			break
+		}
+	}
 }
 
 // markRecentlyEmpty records txid as drained just now, evicting the oldest
@@ -593,36 +616,59 @@ func (m *ShardManager) drop(ctx context.Context, txid chainhash.Hash, release bo
 	return true
 }
 
-// dropAsync is drop with release=true whose ReleaseShard call runs in a
-// background goroutine (bounded at 1 s like releaseLease; Run waits for it
-// before returning). Until that release completes the shard is kept out of
-// AcquireShard via the releasing set, so a late release can never clear a
-// lease this instance has meanwhile re-acquired. The background release is
-// registered (bg.Add, releasing insert) inside forget's critical section and
-// only while the manager is not closed: ReleaseAll sets closed under the same
-// mutex before Run calls bg.Wait, so no Add can race that Wait. Once closed,
-// the release runs synchronously here instead.
-func (m *ShardManager) dropAsync(ctx context.Context, txid chainhash.Hash, reason string) bool {
-	ok, background := m.forget(txid, true, true, reason)
+// dropRotatedAsync drops a drained shard rotated out on the request path
+// (sh is its owned state, snapshotted by rotateDrained) and finishes the drop
+// in a background goroutine (Run waits for it before returning): the retire
+// check (retireIfSpentOut, bounded at 1 s) and then the lease release
+// (bounded at 1 s like releaseLease). The drop is counted there, as
+// "retired" if the shard was retired, else "empty". Until that goroutine
+// finishes the shard is kept out of AcquireShard via the releasing set, so a
+// late release can never clear a lease this instance has meanwhile
+// re-acquired; it is also put on the exclusion list at once, and taken off
+// again if retired, since AcquireShard never returns a retired shard. The
+// background work is registered (bg.Add, releasing insert) inside forget's
+// critical section and only while the manager is not closed: ReleaseAll sets
+// closed under the same mutex before Run calls bg.Wait, so no Add can race
+// that Wait. Once closed, it runs synchronously here instead.
+func (m *ShardManager) dropRotatedAsync(ctx context.Context, sh store.Shard) bool {
+	ok, background := m.forget(sh.TxID, true, true, "")
 	if !ok {
 		return false
 	}
 	if !background {
-		m.releaseLease(ctx, txid)
+		m.finishRotatedDrop(ctx, sh)
 		return true
 	}
 	go func() {
 		defer m.bg.Done()
-		m.releaseLease(context.WithoutCancel(ctx), txid)
+		m.finishRotatedDrop(context.WithoutCancel(ctx), sh)
 		m.mu.Lock()
-		delete(m.releasing, txid)
+		delete(m.releasing, sh.TxID)
 		m.mu.Unlock()
 	}()
 	return true
 }
 
+// finishRotatedDrop is dropRotatedAsync's deferred half: retire sh if it is
+// spent out (and lift its exclusion entry), count the drop, release the lease.
+func (m *ShardManager) finishRotatedDrop(ctx context.Context, sh store.Shard) {
+	rctx, cancel := context.WithTimeout(ctx, time.Second)
+	retired := m.retireIfSpentOut(rctx, &sh)
+	cancel()
+	reason := "empty"
+	if retired {
+		reason = "retired"
+		m.mu.Lock()
+		m.unmarkRecentlyEmpty(sh.TxID)
+		m.mu.Unlock()
+	}
+	m.countDrop(reason)
+	m.releaseLease(ctx, sh.TxID)
+}
+
 // forget is drop's local half: check-and-delete txid from owned under mu
-// (ok false if it was already gone), count the drop, record the exclusion
+// (ok false if it was already gone), count the drop (unless reason is "",
+// which leaves counting to the caller), record the exclusion
 // when release is true, and remove the shard from the allocator. With
 // backgroundRelease it also, in the same critical section and only if the
 // manager is not closed, registers a background lease release (bg.Add and
@@ -643,13 +689,20 @@ func (m *ShardManager) forget(txid chainhash.Hash, release, backgroundRelease bo
 		background = true
 	}
 	m.mu.Unlock()
+	if reason != "" {
+		m.countDrop(reason)
+	}
+	m.alloc.RemoveShard(txid)
+	return true, background
+}
+
+// countDrop increments shard_drops_total for reason.
+func (m *ShardManager) countDrop(reason string) {
 	if c, ok := m.dropCounters[reason]; ok {
 		c.Inc()
 	} else { // defensive: an unlisted reason still gets counted, just not cached
 		shardDrops.WithLabelValues(m.pc.Name, reason).Inc()
 	}
-	m.alloc.RemoveShard(txid)
-	return true, background
 }
 
 func (m *ShardManager) ownedIDs() []chainhash.Hash {
@@ -772,7 +825,10 @@ func (m *ShardManager) RescanOnce(ctx context.Context) error {
 // "retired" and releases its lease, with no exclusion entry since
 // AcquireShard never returns a retired shard. It reports whether it did; a
 // shard that is not spent out (a row still reserved or quarantined, or any
-// store error) is left owned for the caller to drop as empty.
+// store error) is left owned for the caller to drop as empty. The mined check
+// uses the head cached at the last renew or adoption (up to LeaseTTL/3 old),
+// which is harmless: status only moves forward, and retired -> invalid stays
+// allowed, so a shard the watcher invalidates later can still be invalidated.
 func (m *ShardManager) retireDrained(ctx context.Context, txid chainhash.Hash) bool {
 	m.mu.Lock()
 	st := m.owned[txid]
@@ -963,6 +1019,9 @@ func (m *ShardManager) Run(ctx context.Context) error {
 		case <-m.flagged:
 			if err := m.rescanFlagged(ctx); err != nil && ctx.Err() == nil {
 				m.log.Warn("rescan flagged", "err", err)
+			}
+			if m.isHungry() { // a not_owner drop may have freed a slot
+				m.Hungry()
 			}
 		case <-renew.C:
 			if err := m.RenewOnce(ctx); err != nil && ctx.Err() == nil {

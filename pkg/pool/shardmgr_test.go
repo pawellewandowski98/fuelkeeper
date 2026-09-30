@@ -568,6 +568,20 @@ func drainAll(t *testing.T, st store.Store, clk *storetest.Clock, poolName strin
 	return tok, popped
 }
 
+// waitRotatedDrops waits until the background half of each request-path
+// rotation drop of shards (retire check, drop count, lease release) is done.
+func waitRotatedDrops(t *testing.T, m *pool.ShardManager, shards []store.Shard) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		for _, sh := range shards {
+			if m.ReleasePending(sh.TxID) {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, time.Millisecond, "background rotation drops finish")
+}
+
 func dropsEmpty(poolName string) float64 {
 	return testutil.ToFloat64(pool.ShardDrops.WithLabelValues(poolName, "empty"))
 }
@@ -600,6 +614,7 @@ func TestEnsureRowsRotatesDrainedShardsWithoutRescanTick(t *testing.T) {
 
 	// No clock advance, no RescanOnce: the request path alone must rotate.
 	require.True(t, m.EnsureRows(ctx), "drained shards must be rotated out, not answered with exhaustion")
+	waitRotatedDrops(t, m, shards[:2]) // the request path counts each drop once its retire check has run
 	assert.InDelta(t, dropsBefore+2, dropsEmpty(poolName), 0, "both drained shards dropped as empty")
 	assert.InDelta(t, adoptsBefore+2, adoptionsOK(poolName), 0, "both freed slots refilled while below LowWaterRows")
 	assert.False(t, alloc.Has(shards[0].TxID))
@@ -734,6 +749,7 @@ func TestRotationBoundedPerCall(t *testing.T) {
 	dropsBefore, adoptsBefore := dropsEmpty(poolName), adoptionsOK(poolName)
 
 	require.True(t, m.EnsureRows(ctx))
+	waitRotatedDrops(t, m, shards[:2])
 	assert.InDelta(t, dropsBefore+2, dropsEmpty(poolName), 0, "at most two drained shards released per call")
 	assert.InDelta(t, adoptsBefore+2, adoptionsOK(poolName), 0, "at most two fresh shards adopted per call")
 	assert.Len(t, alloc.Shards(), 6)
@@ -1451,4 +1467,194 @@ func TestRescanRetiresSpentOutShardWhenDroppingIt(t *testing.T) {
 
 	assert.InDelta(t, retiredBefore+1, dropsRetired(poolName), 0)
 	assert.InDelta(t, emptyBefore+1, dropsEmpty(poolName), 0)
+}
+
+// slowGetRowsStore delays every GetRows call (the retire check's read).
+type slowGetRowsStore struct {
+	store.Store
+	delay time.Duration
+}
+
+func (w *slowGetRowsStore) GetRows(ctx context.Context, pool string, ops []store.Outpoint) ([]store.Row, error) {
+	select {
+	case <-time.After(w.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return w.Store.GetRows(ctx, pool, ops)
+}
+
+// rotationFixture owns shards 0 and 1 of four (MaxShards=2) and leaves both
+// drained in the store: shard 0 spent out (every row terminal), shard 1 with
+// one row still reserved, so rotation must retire 0 and drop 1 as empty.
+func rotationFixture(t *testing.T, st store.Store, clk *storetest.Clock, poolName string, m *pool.ShardManager, alloc *pool.Allocator, shards []store.Shard) {
+	t.Helper()
+	ctx := context.Background()
+	require.NoError(t, m.FeedOnce(ctx))
+	require.True(t, alloc.Has(shards[0].TxID) && alloc.Has(shards[1].TxID))
+	tok, popped := drainAll(t, st, clk, poolName, alloc)
+	var spend []store.Outpoint
+	kept := false
+	for _, r := range popped {
+		if r.TxID == shards[1].TxID && !kept {
+			kept = true // shard 1 keeps one reserved row
+			continue
+		}
+		spend = append(spend, r.Outpoint)
+	}
+	n, err := st.Spend(ctx, poolName, tok, spend, storetest.NewTxID(), true)
+	require.NoError(t, err)
+	require.Equal(t, len(spend), n)
+}
+
+// assertRotatedOut checks rotation's outcome for rotationFixture's shards:
+// shard 0 retired with no exclusion entry, shard 1 still mined and excluded,
+// both released, the freed slots refilled by shards 2 and 3.
+func assertRotatedOut(t *testing.T, st store.Store, m *pool.ShardManager, alloc *pool.Allocator, poolName string, shards []store.Shard, emptyBefore, retiredBefore float64) {
+	t.Helper()
+	ctx := context.Background()
+	got, err := st.GetShard(ctx, poolName, shards[0].TxID)
+	require.NoError(t, err)
+	assert.Equal(t, store.ShardRetired, got.Status, "spent-out shard retired by rotation")
+	assert.Empty(t, got.Owner)
+	assert.False(t, m.RecentlyEmpty(shards[0].TxID), "a retired shard needs no exclusion entry")
+	got, err = st.GetShard(ctx, poolName, shards[1].TxID)
+	require.NoError(t, err)
+	assert.Equal(t, store.ShardMined, got.Status, "a shard with a reserved row is not retired")
+	assert.Empty(t, got.Owner)
+	assert.True(t, m.RecentlyEmpty(shards[1].TxID))
+	assert.InDelta(t, retiredBefore+1, dropsRetired(poolName), 0)
+	assert.InDelta(t, emptyBefore+1, dropsEmpty(poolName), 0)
+	assert.True(t, alloc.Has(shards[2].TxID) && alloc.Has(shards[3].TxID), "freed slots refilled")
+}
+
+// TestFeedOnceRotationRetiresSpentOutShard pins that the background rotation
+// (FeedOnce at MaxShards) retires a spent-out shard instead of excluding it,
+// so it never comes back as a dead adoption after emptyExclusion.
+func TestFeedOnceRotationRetiresSpentOutShard(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "rotate-retire-feed"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, _ := mintN(t, st, clk, poolName, 4, 3)
+	cfg := testInstanceConfig() // MaxShards=2
+	cfg.LowWaterRows = 100
+	m, alloc := newMgr(t, st, clk, cfg, pc)
+	rotationFixture(t, st, clk, poolName, m, alloc, shards)
+	emptyBefore, retiredBefore := dropsEmpty(poolName), dropsRetired(poolName)
+
+	require.NoError(t, m.FeedOnce(ctx))
+	assertRotatedOut(t, st, m, alloc, poolName, shards, emptyBefore, retiredBefore)
+}
+
+// TestEnsureRowsRotationRetiresInBackground pins the request-path variant:
+// EnsureRows rotation retires a spent-out shard too, but does the retire
+// check in the background with the lease release, so a slow GetRows (here
+// 400 ms, twice AdoptTimeout) is never charged to the Reserve.
+func TestEnsureRowsRotationRetiresInBackground(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "rotate-retire-ensure"
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	st := &slowGetRowsStore{Store: base}
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, _ := mintN(t, base, clk, poolName, 4, 3)
+	cfg := testInstanceConfig() // MaxShards=2, AdoptTimeout 200 ms
+	cfg.LowWaterRows = 100
+	m, alloc := newMgr(t, st, clk, cfg, pc)
+	rotationFixture(t, base, clk, poolName, m, alloc, shards)
+	emptyBefore, retiredBefore := dropsEmpty(poolName), dropsRetired(poolName)
+	st.delay = 400 * time.Millisecond
+
+	start := time.Now()
+	require.True(t, m.EnsureRows(ctx), "rotation refills the freed slots")
+	assert.Less(t, time.Since(start), cfg.AdoptTimeout, "the retire check's GetRows is not charged to the request")
+	assert.True(t, m.ReleasePending(shards[0].TxID), "retire check still running in the background")
+	waitRotatedDrops(t, m, shards[:2])
+	assertRotatedOut(t, base, m, alloc, poolName, shards, emptyBefore, retiredBefore)
+}
+
+// TestRescanDoesNotRetireShardWithUnexpectedVouts is the rescan-path variant
+// of TestAdoptOnceDoesNotRetireShardWithUnexpectedVouts: a shard consumed
+// while owned whose rows sit at vouts 1..Size cannot be proven spent out
+// (vout 0 is missing), so RescanOnce drops it as empty, never retires it.
+func TestRescanDoesNotRetireShardWithUnexpectedVouts(t *testing.T) {
+	ctx := context.Background()
+	const poolName = "rescan-retire-gap"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	sh, rows := storetest.BuildShard(poolName, 3, store.ShardMined)
+	for i := range rows {
+		rows[i].Vout = uint32(i + 1) //nolint:gosec // tiny test count
+	}
+	require.NoError(t, st.PutShard(ctx, sh, rows))
+	m, alloc := newMgr(t, st, clk, testInstanceConfig(), pc)
+	adopted, err := m.AdoptOnce(ctx)
+	require.NoError(t, err)
+	require.True(t, adopted)
+	require.Equal(t, 3, alloc.Available())
+	tok, popped := drainAll(t, st, clk, poolName, alloc)
+	n, err := st.Spend(ctx, poolName, tok, storetest.Ops(popped), storetest.NewTxID(), true)
+	require.NoError(t, err)
+	require.Equal(t, 3, n)
+	emptyBefore, retiredBefore := dropsEmpty(poolName), dropsRetired(poolName)
+
+	for range 2 { // emptyRescansMax consecutive empty rescans
+		require.NoError(t, m.RescanOnce(ctx))
+	}
+	assert.False(t, alloc.Has(sh.TxID))
+	assertDroppedAsEmpty(t, st, m, poolName, sh, emptyBefore, retiredBefore)
+}
+
+// slowNotOwnerRenewStore makes RenewShard of one shard wait briefly and then
+// fail with ErrNotOwner, so the hunger signal NoteCASMiss sends is consumed
+// by the feed goroutine (finding nothing to do at MaxShards) before
+// rescanFlagged drops the shard.
+type slowNotOwnerRenewStore struct {
+	store.Store
+	txid  chainhash.Hash
+	armed atomic.Bool
+}
+
+func (w *slowNotOwnerRenewStore) RenewShard(ctx context.Context, pool string, txid chainhash.Hash, holder string, until time.Time) (store.ShardHead, error) {
+	if txid == w.txid && w.armed.Load() {
+		time.Sleep(50 * time.Millisecond)
+		return store.ShardHead{}, store.ErrNotOwner
+	}
+	return w.Store.RenewShard(ctx, pool, txid, holder, until)
+}
+
+// TestFlaggedNotOwnerDropReadoptsWithoutTick pins that a not_owner drop on the
+// flagged-rescan path re-signals hunger, as the renew and rescan ticks do:
+// the freed slot is refilled without waiting for a Reserve or a tick (both
+// tickers are 1 h here).
+func TestFlaggedNotOwnerDropReadoptsWithoutTick(t *testing.T) {
+	const poolName = "flagged-readopt"
+	clk := storetest.NewClock(storetest.Start)
+	base := memory.New(memory.WithClock(clk.Now))
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	shards, _ := mintN(t, base, clk, poolName, 2, 5)
+	st := &slowNotOwnerRenewStore{Store: base, txid: shards[0].TxID}
+	cfg := testInstanceConfig()
+	cfg.MaxShards = 1
+	cfg.LowWaterRows = 100 // hungry whenever a slot is free; at MaxShards only if the FIFO is empty
+	cfg.LeaseTTL = time.Hour
+	cfg.RescanInterval = time.Hour
+	m, alloc := newMgr(t, st, clk, cfg, pc)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx) }()
+	defer func() {
+		cancel()
+		require.NoError(t, <-done)
+	}()
+	require.Eventually(t, func() bool { return alloc.ShardAvailable(shards[0].TxID) == 5 }, 2*time.Second, 5*time.Millisecond)
+
+	st.armed.Store(true)
+	m.NoteCASMiss(shards[0].TxID)
+	require.Eventually(t, func() bool { return !alloc.Has(shards[0].TxID) }, 2*time.Second, 5*time.Millisecond, "flagged rescan drops the lost shard")
+	assert.Eventually(t, func() bool { return alloc.ShardAvailable(shards[1].TxID) == 5 }, time.Second, 5*time.Millisecond,
+		"the freed slot is refilled without a Reserve or a tick")
 }
