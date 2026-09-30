@@ -40,7 +40,7 @@ func MinedBEEF(unminedBEEF []byte, txid chainhash.Hash, merklePath []byte) ([]by
 	if err != nil {
 		return nil, fmt.Errorf("fuel: parse merkle path: %w", err)
 	}
-	if !merklePathContains(mp, txid) {
+	if !forceTxidLeaf(mp, txid) {
 		return nil, fmt.Errorf("%w: %s", ErrTxNotInMerklePath, txid)
 	}
 	out := transaction.NewBeefV2()
@@ -55,21 +55,40 @@ func MinedBEEF(unminedBEEF []byte, txid chainhash.Hash, merklePath []byte) ([]by
 	return beefBytes, nil
 }
 
-// merklePathContains reports whether mp's leaf level names txid.
+// forceTxidLeaf finds the leaf-level entry in mp naming txid and forces its
+// Txid flag on, reporting whether such a leaf was found. Duplicate leaves
+// (which carry no Hash) and nil-Hash entries are skipped rather than matched.
 //
-// (*transaction.MerklePath).ComputeRoot cannot be used for this check: for a
-// single-leaf path (block height and level of the tree containing only one
-// tx, the common case for a just-mined split) it takes a shortcut and
-// returns whatever txid it was given as the root, without ever comparing it
-// to the leaf's hash. So a BUMP for a different transaction entirely would
-// still "compute" a root and produce no error. Only an explicit scan of the
-// leaf level catches that.
-func merklePathContains(mp *transaction.MerklePath, txid chainhash.Hash) bool {
+// Two independent behaviors of go-sdk's transaction package (v1.4.1,
+// transaction/beef.go and transaction/merklepath.go) make both the scan and
+// the mutation necessary:
+//
+//  1. (*MerklePath).ComputeRoot cannot be used to check membership: for a
+//     single-leaf path (a just-mined block containing only this one tx, the
+//     common case for a split) it takes a shortcut and returns whatever txid
+//     it is given as the root, without ever comparing it to the leaf's hash.
+//     A BUMP naming a different transaction entirely would still "compute" a
+//     root and produce no error. Only an explicit scan of the leaf level
+//     catches that, which is what the loop below does.
+//  2. (*Beef).verifyValid - which (*Beef).Verify relies on to decide which
+//     roots to check against a chain tracker - only folds a BUMP's root into
+//     that set for level-0 leaves whose Txid flag is set. A leaf that names
+//     the right hash but happens to arrive with the flag unset is silently
+//     skipped: Verify then has no root to check for that BUMP's height and
+//     reports success without ever consulting the tracker. Forcing the flag
+//     once we've independently confirmed by hash that this is the right leaf
+//     guarantees Verify always performs the SPV check.
+func forceTxidLeaf(mp *transaction.MerklePath, txid chainhash.Hash) bool {
 	if len(mp.Path) == 0 {
 		return false
 	}
 	for _, leaf := range mp.Path[0] {
-		if leaf.Hash != nil && leaf.Hash.Equal(txid) {
+		if leaf.Hash == nil || (leaf.Duplicate != nil && *leaf.Duplicate) {
+			continue
+		}
+		if leaf.Hash.Equal(txid) {
+			isTxid := true
+			leaf.Txid = &isTxid
 			return true
 		}
 	}
