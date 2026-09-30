@@ -63,9 +63,21 @@ func ParseOutpoint(s string) (transaction.Outpoint, error) {
 	return transaction.Outpoint{Txid: *h, Index: uint32(v)}, nil
 }
 
+// minDescriptionLen and maxDescriptionLen bound CreateActionInputs's
+// description: the go-wallet-toolbox rejects a CreateAction input description
+// shorter than minDescriptionLen, and BRC-100 caps it at maxDescriptionLen.
+const (
+	minDescriptionLen = 5
+	maxDescriptionLen = 2000
+)
+
 // CreateActionInputs converts a reservation into go-sdk wallet.CreateActionInput
 // values, each carrying the full unlocking script (no signing: FuelKeeper
-// hands out fully-unlockable outputs) and description.
+// hands out fully-unlockable outputs) and description. It rejects a
+// description outside [minDescriptionLen, maxDescriptionLen] bytes (the
+// go-wallet-toolbox does the same) and a reservation with a duplicate
+// outpoint, before either could reach the wallet as a confusing downstream
+// error.
 //
 // When res.Constraints is set (presigned P2PKH mode: tx version 1, lockTime
 // 0, sequence 0xffffffff — the values the presigned SIGHASH_NONE|ANYONECANPAY
@@ -73,10 +85,19 @@ func ParseOutpoint(s string) (transaction.Outpoint, error) {
 // res.Constraints.Sequence, since a P2PKH signature's ANYONECANPAY input
 // still fixes its own sequence number. Puzzle mode carries no such
 // constraint, so SequenceNumber is left nil and the wallet's own default
-// applies.
+// applies. See also ApplyConstraints, which sets the matching tx-level
+// version/lockTime on a wallet.CreateActionArgs.
 func CreateActionInputs(res *wire.ReserveResponse, description string) ([]wallet.CreateActionInput, error) {
+	if l := len(description); l < minDescriptionLen || l > maxDescriptionLen {
+		return nil, fmt.Errorf("client: description must be %d..%d bytes, got %d", minDescriptionLen, maxDescriptionLen, l)
+	}
+	seen := make(map[string]bool, len(res.Outputs))
 	inputs := make([]wallet.CreateActionInput, 0, len(res.Outputs))
 	for _, o := range res.Outputs {
+		if seen[o.Outpoint] {
+			return nil, fmt.Errorf("client: duplicate outpoint %s", o.Outpoint)
+		}
+		seen[o.Outpoint] = true
 		op, err := ParseOutpoint(o.Outpoint)
 		if err != nil {
 			return nil, fmt.Errorf("client: output %s: %w", o.Outpoint, err)
@@ -101,11 +122,34 @@ func CreateActionInputs(res *wire.ReserveResponse, description string) ([]wallet
 	return inputs, nil
 }
 
+// ApplyConstraints sets args.Version and args.LockTime from res.Constraints
+// (presigned P2PKH mode: tx version 1, lockTime 0 — the values the presigned
+// SIGHASH_NONE|ANYONECANPAY signature commits to). It is a no-op when
+// res.Constraints is nil (puzzle mode carries no such constraint, so the
+// wallet's own defaults apply). See also CreateActionInputs, which pins the
+// matching per-input SequenceNumber.
+func ApplyConstraints(args *wallet.CreateActionArgs, res *wire.ReserveResponse) {
+	if res.Constraints == nil {
+		return
+	}
+	version := res.Constraints.TxVersion
+	lockTime := res.Constraints.LockTime
+	args.Version = &version
+	args.LockTime = &lockTime
+}
+
 // Surplus returns denomination minus the fee for a transaction of
 // estimatedTxBytes at satPerKB, floored at 0. It is meant for a wallet that
 // must not create a change output: spend fuel outputs worth denomination
 // each and let Surplus become the miner fee (or dust the wallet discards),
 // rather than sizing a change output for it.
+//
+// A rough estimatedTxBytes for a transaction spending n fuel inputs is
+// 10 + n*PuzzleInputSize (or n*P2PKHInputSize in presigned mode): 10 fixed
+// bytes (version, input/output counts, lockTime) plus each fuel input's size.
+// Add the wallet's own inputs and outputs on top: 148 bytes per additional
+// P2PKH input and 9+len(lockingScript) bytes per output (the standard
+// go-sdk/toolbox size accounting).
 func Surplus(denomination uint64, estimatedTxBytes int, satPerKB uint64) uint64 {
 	fee := fuel.FeeSats(estimatedTxBytes, satPerKB)
 	if fee >= denomination {

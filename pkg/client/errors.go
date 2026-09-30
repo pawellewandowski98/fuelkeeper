@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/api/wire"
 )
@@ -15,8 +16,13 @@ import (
 // returned by any Client method. Each maps to one or more wire.Error codes
 // via (*APIError).Is; see mapErr in pkg/api for the server-side mapping this
 // mirrors.
+//
+// client_closed_request (499) has no dedicated sentinel: it means the server
+// observed the caller's own request context end mid-request, which the
+// caller already knows from the ctx.Err() its own call returned.
 var (
-	// ErrBadRequest means the request was malformed (400).
+	// ErrBadRequest means the request was malformed (400), or named a method
+	// the route does not support (405, method_not_allowed).
 	ErrBadRequest = errors.New("client: bad request")
 	// ErrUnauthorized means the API key was missing or invalid (401).
 	ErrUnauthorized = errors.New("client: unauthorized")
@@ -28,7 +34,11 @@ var (
 	ErrExhausted = errors.New("client: exhausted")
 	// ErrBackpressure means the server is shedding load (503).
 	ErrBackpressure = errors.New("client: backpressure")
-	// ErrUnavailable means the server (or the transport to it) is unavailable.
+	// ErrUnavailable means the server (or the transport to it) is unavailable:
+	// this covers pkg/api's "unavailable"/"internal" codes, any 5xx response
+	// whose body could not be parsed as a wire.Error ("http_5xx"), and a
+	// transport-level failure (dial, timeout, dropped connection) that was
+	// not caused by the caller's own context ending.
 	ErrUnavailable = errors.New("client: unavailable")
 )
 
@@ -57,7 +67,7 @@ func (e *APIError) Error() string {
 func (e *APIError) Is(target error) bool {
 	switch target {
 	case ErrBadRequest:
-		return e.Code == "bad_request"
+		return e.Code == "bad_request" || e.Code == "method_not_allowed"
 	case ErrUnauthorized:
 		return e.Code == "unauthorized"
 	case ErrNotFound:
@@ -69,23 +79,38 @@ func (e *APIError) Is(target error) bool {
 	case ErrBackpressure:
 		return e.Code == "backpressure"
 	case ErrUnavailable:
-		return e.Code == "unavailable" || e.Code == "internal"
+		// "http_5xx" is newAPIError's fallback code for a 5xx response whose
+		// body could not be parsed as a wire.Error (e.g. an HTML error page
+		// from a proxy in front of FuelKeeper): that is unavailability too.
+		return e.Code == "unavailable" || e.Code == "internal" ||
+			(e.Status >= http.StatusInternalServerError && strings.HasPrefix(e.Code, "http_"))
 	default:
 		return false
 	}
 }
 
 // IsRetryable reports whether a client is likely to succeed by retrying err
-// after a short delay: an *APIError carrying a positive RetryAfter or a
-// 503/409 status, or a transport failure wrapped as ErrUnavailable. Caller
-// context cancellation/deadline is never retryable.
+// after a short delay.
+//
+// For an *APIError: a positive RetryAfter, a 503/409/429 status, or any 5xx
+// whose body could not be parsed as a wire.Error (Code "http_5xx" -- see
+// (*APIError).Is).
+//
+// Otherwise: whether err wraps ErrUnavailable. This intentionally does not
+// special-case context.Canceled/context.DeadlineExceeded: wrapTransportErr
+// never wraps ErrUnavailable around the caller's own context ending (it
+// returns ctx.Err() directly instead), so errors.Is(err, ErrUnavailable) is
+// already false for that case -- including when err also happens to wrap
+// context.DeadlineExceeded because it was the *client's own* per-request
+// timeout (http.Client.Timeout), rather than the caller's ctx, that expired.
 func IsRetryable(err error) bool {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		return apiErr.RetryAfter > 0 || apiErr.Status == http.StatusServiceUnavailable || apiErr.Status == http.StatusConflict
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
+		return apiErr.RetryAfter > 0 ||
+			apiErr.Status == http.StatusServiceUnavailable ||
+			apiErr.Status == http.StatusConflict ||
+			apiErr.Status == http.StatusTooManyRequests ||
+			(apiErr.Status >= http.StatusInternalServerError && strings.HasPrefix(apiErr.Code, "http_"))
 	}
 	return errors.Is(err, ErrUnavailable)
 }
@@ -108,6 +133,9 @@ func newAPIError(status int, body []byte, header http.Header) *APIError {
 		if ra, err := strconv.Atoi(header.Get("Retry-After")); err == nil {
 			we.RetryAfter = ra
 		}
+	}
+	if we.RetryAfter < 0 {
+		we.RetryAfter = 0
 	}
 	return &APIError{Status: status, Code: we.Code, Message: we.Message, RetryAfter: we.RetryAfter}
 }
