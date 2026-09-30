@@ -601,4 +601,17 @@ func TestLogOracleMode(t *testing.T) {
 	assert.Equal(t, false, attrs["jobs_enabled"])
 	assert.NotContains(t, rec.Message, "unknown_requeue_age")
 	assert.Contains(t, rec.Message, "jobs.enabled is false")
+
+	// unknown_requeue_age 0: the reaper runs, but the requeue itself is
+	// disabled, so the message must not promise one -- it must say expired
+	// reservations are held instead.
+	h.records = nil
+	cfg.Oracle.Kind = "arcade"
+	cfg.Jobs.Enabled = true
+	cfg.Jobs.Reaper.UnknownRequeueAge = 0
+	logOracleMode(log, cfg)
+	rec = h.last(t)
+	assert.Contains(t, rec.Message, "unknown_requeue_age is 0")
+	assert.Contains(t, rec.Message, "held")
+	assert.NotContains(t, rec.Message, "requeued after")
 }

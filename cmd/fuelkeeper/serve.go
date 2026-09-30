@@ -213,7 +213,11 @@ func warnInsecureListener(log *slog.Logger, cfg *config.Config) {
 // held under expiry_policy: hold) -- "unhinted" meaning an expired
 // reservation or a release_policy: verify release, never a spend: Spend
 // always carries a txid, so there is no such thing as an unhinted spend.
-// See ofactory.Config.AnswersOutpoints, pkg/jobs.Reaper's doc comment, and
+// unknown_requeue_age itself can be 0, which disables the requeue outright
+// (pkg/jobs.ReaperConfig.UnknownRequeueAge's doc: "0, which disables the
+// requeue") regardless of any pool's expiry_policy; the message says so
+// instead of promising a requeue that will never happen either. See
+// ofactory.Config.AnswersOutpoints, pkg/jobs.Reaper's doc comment, and
 // docs/OPERATIONS.md "Oracle kinds and policies".
 func logOracleMode(log *slog.Logger, cfg *config.Config) {
 	answers := cfg.Oracle.AnswersOutpoints()
@@ -232,6 +236,8 @@ func logOracleMode(log *slog.Logger, cfg *config.Config) {
 	switch {
 	case !cfg.Jobs.Enabled:
 		msg += "; jobs.enabled is false, so no reaper runs and quarantined rows are never resolved or requeued"
+	case (none || !answers) && cfg.Jobs.Reaper.UnknownRequeueAge <= 0:
+		msg += "; expired reservations are held (jobs.reaper.unknown_requeue_age is 0)"
 	case none || !answers:
 		msg += "; expired or verify-released reservations are requeued after jobs.reaper.unknown_requeue_age (or held, for a pool with expiry_policy: hold)"
 	}
