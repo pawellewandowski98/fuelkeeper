@@ -68,4 +68,7 @@ type Treasury interface {
 	// Send broadcasts a previously built split. It is idempotent; a terminal
 	// network rejection returns ErrRejected.
 	Send(ctx context.Context, txid chainhash.Hash) error
+	// MinedBEEF converts a shard's stored unmined BEEF plus the BUMP reported by
+	// the oracle into the compact mined BEEF (split tx + BUMP).
+	MinedBEEF(ctx context.Context, txid chainhash.Hash, unminedBEEF, merklePath []byte) ([]byte, error)
 }

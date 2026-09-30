@@ -19,12 +19,13 @@ import (
 // splits, for tests, benchmarks and the "nullnet" mode. It is safe for
 // concurrent use.
 type Treasury struct {
-	mu        sync.Mutex
-	built     map[chainhash.Hash]*treasury.BuiltShard
-	sent      map[chainhash.Hash]int // send count per txid
-	failBuild error
-	failSend  error
-	nBuilt    int
+	mu            sync.Mutex
+	built         map[chainhash.Hash]*treasury.BuiltShard
+	sent          map[chainhash.Hash]int // send count per txid
+	failBuild     error
+	failSend      error
+	failMinedBEEF error
+	nBuilt        int
 }
 
 var _ treasury.Treasury = (*Treasury)(nil)
@@ -53,6 +54,13 @@ func (t *Treasury) FailSend(err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.failSend = err
+}
+
+// FailMinedBEEF makes MinedBEEF return err (nil clears it).
+func (t *Treasury) FailMinedBEEF(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.failMinedBEEF = err
 }
 
 // Sent reports whether txid was sent at least once.
@@ -164,4 +172,15 @@ func (t *Treasury) Send(_ context.Context, txid chainhash.Hash) error {
 	}
 	t.sent[txid]++
 	return nil
+}
+
+// MinedBEEF returns a synthetic mined BEEF: a marker, the txid and the BUMP bytes.
+func (t *Treasury) MinedBEEF(_ context.Context, txid chainhash.Hash, _, merklePath []byte) ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.failMinedBEEF != nil {
+		return nil, t.failMinedBEEF
+	}
+	out := append([]byte("mock-mined-beef-"), txid[:]...)
+	return append(out, merklePath...), nil
 }
