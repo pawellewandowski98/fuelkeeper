@@ -465,12 +465,13 @@ func TestValidateOracleAndTreasuryFactories(t *testing.T) {
 
 func TestValidateReconcileGraceExceedsBuildTimeout(t *testing.T) {
 	c := toolboxConfig(t)
-	c.Treasury.Toolbox.ReconcileGrace = c.Jobs.Minter.BuildTimeout
+	c.Treasury.Toolbox.ReconcileGrace = c.Jobs.Minter.BuildTimeout + jobs.ReconcileBudget
 	err := c.Validate()
 	require.ErrorContains(t, err, "treasury.toolbox.reconcile_grace")
 	require.ErrorContains(t, err, "jobs.minter.build_timeout")
+	require.ErrorContains(t, err, "reconcile budget")
 
-	c.Treasury.Toolbox.ReconcileGrace = c.Jobs.Minter.BuildTimeout + time.Second
+	c.Treasury.Toolbox.ReconcileGrace = c.Jobs.Minter.BuildTimeout + jobs.ReconcileBudget + time.Second
 	require.NoError(t, c.Validate())
 
 	c.Jobs.Minter.BuildTimeout = 0

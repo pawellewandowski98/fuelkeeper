@@ -433,8 +433,10 @@ type ReconcileReport struct {
 //
 // The grace covers a minter in another instance (overlapping runs are
 // allowed during a lease hand-over) that built a split and has not yet
-// recorded it. Task 5 should run Reconcile as the first step inside the
-// minter's lease, or at startup, and always with the grace. Only a listing
+// recorded it. Reconcile blocks for the whole grace, so it is kept for
+// one-shot use such as the teratestnet smoke; the minter instead runs the
+// same two listings as ReconcileStart and ReconcileFinish in separate rounds
+// (reconcile_phases.go), never waiting inside a round. Only a listing
 // failure (or ctx ending during the grace) returns an error.
 func (c *Core) Reconcile(ctx context.Context, known func(context.Context, chainhash.Hash) (bool, error)) (ReconcileReport, error) {
 	rep := ReconcileReport{Errors: map[chainhash.Hash]error{}}

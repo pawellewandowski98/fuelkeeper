@@ -340,12 +340,14 @@ func (c *Config) Validate() error {
 	if err := c.Oracle.Validate(); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	if c.Treasury.Kind == tfactory.KindToolbox && c.Treasury.Toolbox.ReconcileGrace <= c.Jobs.Minter.BuildTimeout {
+	if c.Treasury.Kind == tfactory.KindToolbox && c.Treasury.Toolbox.ReconcileGrace <= c.Jobs.Minter.BuildTimeout+jobs.ReconcileBudget {
 		// Reconcile's grace only protects a split whose Build and PutShard
-		// finish within it; the minter bounds that window by build_timeout.
-		return fmt.Errorf("config: treasury.toolbox.reconcile_grace (%s) must exceed jobs.minter.build_timeout (%s), "+
+		// finish within it; the minter bounds that window by build_timeout,
+		// and a first listing (bounded by the reconcile budget) may run while
+		// such a Build is in flight.
+		return fmt.Errorf("config: treasury.toolbox.reconcile_grace (%s) must exceed jobs.minter.build_timeout (%s) + %s reconcile budget, "+
 			"or a slow Build+PutShard could be aborted by Reconcile as unrecorded",
-			c.Treasury.Toolbox.ReconcileGrace, c.Jobs.Minter.BuildTimeout)
+			c.Treasury.Toolbox.ReconcileGrace, c.Jobs.Minter.BuildTimeout, jobs.ReconcileBudget)
 	}
 	if c.Treasury.Kind == tfactory.KindToolbox && c.Jobs.Enabled {
 		// A minter round runs one Build+PutShard per split and at most one

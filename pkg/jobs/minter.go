@@ -177,7 +177,7 @@ func (m *Minter) startRound(ctx context.Context) {
 			m.finishReconcile(ctx, rec)
 		}
 		if m.reconcilePending && m.snapshot == nil {
-			m.startReconcile(ctx, rec, now)
+			m.startReconcile(ctx, rec)
 		}
 	}
 	if ce, ok := m.tr.(treasury.ChunkEnsurer); ok {
@@ -189,7 +189,7 @@ func (m *Minter) startRound(ctx context.Context) {
 
 // startReconcile takes the first listing and sends the splits the store
 // already records; the rest wait for finishReconcile.
-func (m *Minter) startReconcile(ctx context.Context, rec treasury.Reconciler, now time.Time) {
+func (m *Minter) startReconcile(ctx context.Context, rec treasury.Reconciler) {
 	rctx, cancel := context.WithTimeout(ctx, ReconcileBudget)
 	defer cancel()
 	txids, rep, err := rec.ReconcileStart(rctx, m.knownSplit)
@@ -201,7 +201,10 @@ func (m *Minter) startReconcile(ctx context.Context, rec treasury.Reconciler, no
 	}
 	m.reconcilePending = false
 	if len(txids) > 0 {
-		m.snapshot = &reconcileSnapshot{txids: txids, due: now.Add(rec.ReconcileGrace())}
+		// The grace runs from the end of the first listing, not from the
+		// round's start: a finish earlier in this round may have taken up to
+		// ReconcileBudget, and the two listings must be a full grace apart.
+		m.snapshot = &reconcileSnapshot{txids: txids, due: m.clock.Now().Add(rec.ReconcileGrace())}
 	}
 	m.log.Info("treasury reconcile snapshot", "unsent", len(txids), "resent", len(rep.Resent), "errors", len(rep.Errors))
 	m.log.Debug("treasury reconcile snapshot txids", "unsent", hashStrings(txids), "resent", hashStrings(rep.Resent))

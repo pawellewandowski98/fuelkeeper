@@ -144,7 +144,8 @@ splits in two phases, never waiting inside a round:
 1. **Snapshot** (`ReconcileStart`): list the wallet's `fuel-split` actions in
    status no-send. Each one FuelKeeper's store records (in any configured
    pool) is sent at once; the whole listing is kept as the snapshot, with a
-   due time `reconcile_grace` (default 2 min) later.
+   due time `reconcile_grace` (default 2 min) after the listing returned
+   (not after the round started, which may have begun with a slow finish).
 2. **Finish** (`ReconcileFinish`), in the first minter round that starts at
    or after the due time: list again and look each split up afresh:
    - **resent**: recorded; handed to Send (the wallet claims and posts it).
@@ -166,7 +167,9 @@ When the first listing is empty there is nothing to finish.
 
 The grace only protects a split whose Build and PutShard finish within it,
 so the minter bounds that window with `jobs.minter.build_timeout` (default
-60 s), and the config requires `reconcile_grace > build_timeout`. Each phase
+60 s), and the config requires `reconcile_grace > build_timeout + 10 s`
+(a first listing, bounded by the reconcile budget, may overlap such a
+Build). Each phase
 is bounded by a 10 s budget (`jobs.ReconcileBudget`), and a round runs at
 most one finish and one snapshot, so with the toolbox treasury the config
 requires `jobs.lease_ttl > build_timeout + 20 s` (90 s > 80 s by default).

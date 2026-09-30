@@ -85,7 +85,7 @@ jobs:
     interval: 30s                    # How often to mint new shards; default 30s
     max_per_round: 20                # Max new shards per minting round; default 20
     max_pending_shards: 50           # Max unmined shards before minting pauses; default 50
-    build_timeout: 60s               # Bound on one split's Build + PutShard; default 60s; must be < treasury.toolbox.reconcile_grace
+    build_timeout: 60s               # Bound on one split's Build + PutShard; default 60s; treasury.toolbox.reconcile_grace must exceed it + 10s
 
 # Chain oracle (verifies spend and unspent states)
 oracle:
@@ -125,7 +125,7 @@ treasury:
       interval: 10s                  # Keeper cadence (the minter drives it each round); default 10s
       reserve_basket: reserve        # Wallet basket for reserve chunks; default reserve
       chunk_basket: chunks           # Wallet basket for leaf-sized chunks; default chunks
-    reconcile_grace: 2m              # Gap between Reconcile's two listings; must exceed jobs.minter.build_timeout
+    reconcile_grace: 2m              # Minimum gap between Reconcile's two listings; must exceed jobs.minter.build_timeout + 10s
 
 # HTTP API listener
 api:
@@ -157,7 +157,7 @@ On startup, FuelKeeper validates the configuration:
 - Pools with `spend_policy: verify` or `release_policy: verify` require an oracle (`oracle.kind` != "none")
 - `oracle.kind: arcade` and `composite` need `oracle.arcade_url` (or a toolbox treasury, whose arcade they then use); `teranode` needs `oracle.teranode_url`
 - `treasury.kind: toolbox` needs a valid `root_key_hex` (plus `arcade_url` and `chaintracks_url` on `test`/`tstn`; `main` and `ttn` default to the toolbox's public endpoints), and every pool must share one leaf cost class (same `split_size` × `denomination`, same leaf size): one treasury keeps one chunk denomination (see [TREASURY.md](TREASURY.md))
-- `treasury.toolbox.reconcile_grace` must exceed `jobs.minter.build_timeout`, or Reconcile could abort a split whose Build and PutShard were merely slow
+- `treasury.toolbox.reconcile_grace` must exceed `jobs.minter.build_timeout` + 10 s (the reconcile budget), or Reconcile could abort a split whose Build and PutShard were merely slow
 - With the toolbox treasury and jobs enabled, `jobs.lease_ttl` must exceed `jobs.minter.build_timeout` + 20 s (two 10 s reconcile phases), the longest minter round the lease has to outlast
 
 **Config keys changed with the toolbox treasury.** The oracle URLs moved from
@@ -216,7 +216,7 @@ Runs every `watcher.interval`. Responsibilities:
 
 Runs every `minter.interval`. Responsibilities:
 
-- Reconcile the toolbox treasury without blocking: take a snapshot of built-but-unsent splits on the first round of each lease (and after a failed PutShard or a timed-out Build), and finish it in the first round at least `reconcile_grace` later; unrecorded splits seen in both listings are aborted, recorded ones are sent (see [TREASURY.md](TREASURY.md#reconciliation))
+- Reconcile the toolbox treasury without blocking: take a snapshot of built-but-unsent splits on the first round of each lease (and after a failed PutShard or a timed-out Build), and finish it in the first round at least `reconcile_grace` after the snapshot's listing; unrecorded splits seen in both listings are aborted, recorded ones are sent (see [TREASURY.md](TREASURY.md#reconciliation))
 - At the start of every round, top up the treasury's leaf-sized funding chunks (toolbox treasury)
 - Build, sign and send new split transactions ("shards") to keep each pool's available rows near target; one split's Build + PutShard is bounded by `build_timeout`
 - Stop minting when unmined shards exceed `max_pending_shards`
@@ -284,8 +284,9 @@ that runs while the binary initialises, before FuelKeeper reads its config:
   then in the working directory and its parents, and prints
   `WARN: No config file 'settings.conf'` and
   `WARN: No local config file 'settings_local.conf'` when none is found.
-  FuelKeeper never reads those settings; an unreadable `settings.conf` on
-  that path makes the process exit at start-up.
+  FuelKeeper never reads those settings, but any file found on that path is
+  loaded into the settings package, so keep them out of the binary's and the
+  working directory's ancestry.
 
 In deployments, set `SETTINGS_ENV_FILE=/dev/null` (or any path that does not
 exist) in the service environment, e.g. `Environment=SETTINGS_ENV_FILE=/dev/null`

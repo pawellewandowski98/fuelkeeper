@@ -352,12 +352,17 @@ type reconcilingTreasury struct {
 	ensures      int
 	ensureErr    error
 	buildErr     error
-	buildDL      time.Duration // remaining time on Build's ctx deadline
+	buildDL      time.Duration             // remaining time on Build's ctx deadline
+	onStart      func(ctx context.Context) // called at ReconcileStart, if set
+	onFinish     func(ctx context.Context) // called at ReconcileFinish, if set
 }
 
 func (r *reconcilingTreasury) ReconcileGrace() time.Duration { return r.grace }
 
-func (r *reconcilingTreasury) ReconcileStart(_ context.Context, known func(context.Context, chainhash.Hash) (bool, error)) ([]chainhash.Hash, treasury.ReconcileReport, error) {
+func (r *reconcilingTreasury) ReconcileStart(ctx context.Context, known func(context.Context, chainhash.Hash) (bool, error)) ([]chainhash.Hash, treasury.ReconcileReport, error) {
+	if r.onStart != nil {
+		r.onStart(ctx)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.starts++
@@ -368,7 +373,10 @@ func (r *reconcilingTreasury) ReconcileStart(_ context.Context, known func(conte
 	return r.snapshot, treasury.ReconcileReport{}, nil
 }
 
-func (r *reconcilingTreasury) ReconcileFinish(_ context.Context, snap []chainhash.Hash, _ func(context.Context, chainhash.Hash) (bool, error)) (treasury.ReconcileReport, error) {
+func (r *reconcilingTreasury) ReconcileFinish(ctx context.Context, snap []chainhash.Hash, _ func(context.Context, chainhash.Hash) (bool, error)) (treasury.ReconcileReport, error) {
+	if r.onFinish != nil {
+		r.onFinish(ctx)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.finishes = append(r.finishes, snap)
@@ -697,4 +705,88 @@ func TestTwoRunnersNeverOverlapDuringReconcile(t *testing.T) {
 	bStarts, bFinishes, _ := b.tr.counts()
 	assert.Equal(t, []int{1, 1}, []int{aStarts, bStarts}, "one snapshot per lease: a's, then b's after the hand-over")
 	assert.Equal(t, []int{1, 1}, []int{aFinishes, bFinishes}, "each finished its snapshot a grace later, without blocking a round")
+}
+
+// TestMinterReconcileGraceRunsFromTheFirstListing reproduces a finish that
+// takes 9 s and defers a split: the new snapshot taken in the same round must
+// be due a full grace after its own listing, not after the round started.
+func TestMinterReconcileGraceRunsFromTheFirstListing(t *testing.T) {
+	ctx := context.Background()
+	m, tr, _, clk, _ := reconcileSetup(t)
+	tr.grace = 61 * time.Second
+	tr.snapshot = []chainhash.Hash{{1}}
+	var starts, finishes []time.Time
+	tr.onStart = func(context.Context) { starts = append(starts, clk.Now()) }
+	tr.onFinish = func(context.Context) {
+		finishes = append(finishes, clk.Now())
+		clk.Advance(9 * time.Second) // a slow second listing
+		tr.finishReport = treasury.ReconcileReport{Deferred: []chainhash.Hash{{2}}}
+	}
+
+	require.NoError(t, m.RunOnce(ctx)) // snapshot 1 at t0
+	for clk.Now().Sub(starts[0]) < 61*time.Second {
+		clk.Advance(time.Second)
+		require.NoError(t, m.RunOnce(ctx))
+	}
+	require.Len(t, finishes, 1)
+	require.Len(t, starts, 2, "the deferred finish takes a new snapshot in the same round")
+	assert.Equal(t, 9*time.Second, starts[1].Sub(finishes[0]))
+
+	for len(finishes) < 2 {
+		clk.Advance(time.Second)
+		require.NoError(t, m.RunOnce(ctx))
+	}
+	assert.GreaterOrEqual(t, finishes[1].Sub(starts[1]), 61*time.Second,
+		"the two listings of a reconcile are at least a grace apart")
+}
+
+// TestMinterDeferredOrFailedFinishTakesNewSnapshot steps by exactly one
+// interval (no lease gap), so only the finish's outcome can ask for a new
+// snapshot.
+func TestMinterDeferredOrFailedFinishTakesNewSnapshot(t *testing.T) {
+	for name, rep := range map[string]treasury.ReconcileReport{
+		"deferred": {Deferred: []chainhash.Hash{{2}}},
+		"errors":   {Errors: map[chainhash.Hash]error{{2}: errors.New("x")}},
+		"clean":    {Aborted: []chainhash.Hash{{1}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			m, tr, _, clk, cfg := reconcileSetup(t)
+			tr.grace = cfg.Interval
+			tr.snapshot = []chainhash.Hash{{1}}
+			tr.finishReport = rep
+			require.NoError(t, m.RunOnce(ctx))
+			clk.Advance(cfg.Interval)
+			require.NoError(t, m.RunOnce(ctx))
+			starts, finishes, _ := tr.counts()
+			require.Equal(t, 1, finishes)
+			if name == "clean" {
+				assert.Equal(t, 1, starts, "a clean finish needs no new snapshot")
+			} else {
+				assert.Equal(t, 2, starts, "the next snapshot is taken right after the finish")
+			}
+		})
+	}
+}
+
+func TestMinterBoundsReconcilePhasesByBudget(t *testing.T) {
+	ctx := context.Background()
+	m, tr, _, clk, _ := reconcileSetup(t)
+	tr.grace = time.Second
+	tr.snapshot = []chainhash.Hash{{1}}
+	var dls []time.Duration
+	record := func(c context.Context) {
+		dl, ok := c.Deadline()
+		require.True(t, ok, "each phase runs under a deadline")
+		dls = append(dls, time.Until(dl))
+	}
+	tr.onStart, tr.onFinish = record, record
+	require.NoError(t, m.RunOnce(ctx))
+	clk.Advance(time.Minute)
+	require.NoError(t, m.RunOnce(ctx))
+	require.Len(t, dls, 3, "start; then finish and, the minute-long gap being a new lease, a new start")
+	for _, d := range dls {
+		assert.Positive(t, d)
+		assert.LessOrEqual(t, d, jobs.ReconcileBudget)
+	}
 }
