@@ -134,21 +134,25 @@ func exitCode(err error) int {
 // result is one run's outcome, in the shape written to --out and read back
 // by "fuelbench render".
 type result struct {
-	Label          string           `json:"label"`
-	Backend        string           `json:"backend,omitempty"`
-	Instances      int              `json:"instances"`
-	Workers        int              `json:"workers"`
-	Count          int              `json:"count"`
-	Mode           string           `json:"mode"`
-	Seconds        float64          `json:"seconds"`
-	Reserves       int64            `json:"reserves"`
-	Outputs        int64            `json:"outputs"`
-	ReservesPerSec float64          `json:"reserves_per_sec"`
-	OutputsPerSec  float64          `json:"outputs_per_sec"`
-	P50Micros      int64            `json:"p50_us"`
-	P95Micros      int64            `json:"p95_us"`
-	P99Micros      int64            `json:"p99_us"`
-	MaxMicros      int64            `json:"max_us"`
+	Label          string  `json:"label"`
+	Backend        string  `json:"backend,omitempty"`
+	Instances      int     `json:"instances"`
+	Workers        int     `json:"workers"`
+	Count          int     `json:"count"`
+	Mode           string  `json:"mode"`
+	Seconds        float64 `json:"seconds"`
+	Reserves       int64   `json:"reserves"`
+	Outputs        int64   `json:"outputs"`
+	ReservesPerSec float64 `json:"reserves_per_sec"`
+	OutputsPerSec  float64 `json:"outputs_per_sec"`
+	P50Micros      int64   `json:"p50_us"`
+	P95Micros      int64   `json:"p95_us"`
+	P99Micros      int64   `json:"p99_us"`
+	MaxMicros      int64   `json:"max_us"`
+	// SpendP50Micros and SpendP99Micros time the spend call alone (mode
+	// spend only; the p*_us fields above are the reserve round trip).
+	SpendP50Micros int64            `json:"spend_p50_us,omitempty"`
+	SpendP99Micros int64            `json:"spend_p99_us,omitempty"`
 	Errors         map[string]int64 `json:"errors,omitempty"`
 	GoVersion      string           `json:"go_version"`
 	Timestamp      time.Time        `json:"timestamp"`
@@ -292,6 +296,7 @@ func run(ctx context.Context, o options) (result, error) {
 	}
 
 	hist := newHistogram()
+	spendHist := newHistogram()
 	errs := newErrTracker()
 	var reserves, outputs atomic.Int64
 	var idx atomic.Int64
@@ -305,7 +310,7 @@ func run(ctx context.Context, o options) (result, error) {
 	for i := 0; i < o.workers; i++ {
 		go func() {
 			defer wg.Done()
-			runWorker(runCtx, clients, &idx, o, limiter, hist, errs, &reserves, &outputs)
+			runWorker(runCtx, clients, &idx, o, limiter, hist, spendHist, errs, &reserves, &outputs)
 		}()
 	}
 	wg.Wait()
@@ -327,6 +332,8 @@ func run(ctx context.Context, o options) (result, error) {
 		P95Micros:      hist.quantile(95),
 		P99Micros:      hist.quantile(99),
 		MaxMicros:      hist.max(),
+		SpendP50Micros: spendHist.quantile(50),
+		SpendP99Micros: spendHist.quantile(99),
 		Errors:         errs.snapshot(),
 		GoVersion:      runtime.Version(),
 		Timestamp:      time.Now().UTC(),
@@ -344,7 +351,7 @@ func runWorker(
 	idx *atomic.Int64,
 	o options,
 	limiter *rate.Limiter,
-	hist *histogram,
+	hist, spendHist *histogram,
 	errs *errTracker,
 	reserves, outputs *atomic.Int64,
 ) {
@@ -378,8 +385,13 @@ func runWorker(
 
 		switch o.mode {
 		case "spend":
-			if _, serr := c.Spend(ctx, o.pool, res.Token, outpointsOf(res.Outputs), fakeTxID()); serr != nil && ctx.Err() == nil {
-				recordErr(errs, serr)
+			spendStart := time.Now()
+			if _, serr := c.Spend(ctx, o.pool, res.Token, outpointsOf(res.Outputs), fakeTxID()); serr != nil {
+				if ctx.Err() == nil {
+					recordErr(errs, serr)
+				}
+			} else {
+				spendHist.record(time.Since(spendStart).Microseconds())
 			}
 		case "release":
 			if _, rerr := c.Release(ctx, o.pool, res.Token, outpointsOf(res.Outputs)); rerr != nil && ctx.Err() == nil {

@@ -78,6 +78,8 @@ func TestRunAgainstMemoryStore(t *testing.T) {
 	assert.Equal(t, res.Reserves*5, res.Outputs, "every reserve got count outputs")
 	assert.Positive(t, res.P50Micros)
 	assert.GreaterOrEqual(t, res.P99Micros, res.P50Micros)
+	assert.Positive(t, res.SpendP50Micros, "spend mode times the spend call separately")
+	assert.GreaterOrEqual(t, res.SpendP99Micros, res.SpendP50Micros)
 	assert.Empty(t, res.Errors, "no errors against a well-stocked pool: %v", res.Errors)
 	assert.InDelta(t, float64(res.Reserves)/res.Seconds, res.ReservesPerSec, 1e-6)
 	assert.Equal(t, 1, res.Instances)
