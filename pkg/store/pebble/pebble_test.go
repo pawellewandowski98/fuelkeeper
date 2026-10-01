@@ -205,3 +205,5 @@ func diskUsage(t *testing.T, dir string) (int64, error) {
 // former TestCountersMatchScans with a much stronger check, comparing pebble
 // against pkg/store/memory op-by-op instead of only checking pebble's own
 // counters against its own scans.
+
+var _ store.SpendBatcher = (*pebblestore.Store)(nil)

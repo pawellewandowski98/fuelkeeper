@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	pdb "github.com/cockroachdb/pebble"
+
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
@@ -196,11 +198,34 @@ func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpo
 	b := s.db.NewBatch()
 	defer func() { _ = b.Close() }()
 	deltas := map[string]int64{}
+	n, err := s.mutateReservedInto(b, deltas, nil, pool, token, ops, now, mutate)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.applyCounters(b, deltas); err != nil {
+		return 0, err
+	}
+	if err := g.commit(b); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// mutateReservedInto is mutateReserved's body: it stages every change in b
+// and deltas (s.mu must be held) and returns how many rows it moved. When
+// staged is non-nil it maps outpoints already rewritten earlier in the same,
+// not yet applied, batch to their staged rows -- b is not readable through
+// s.db until it is applied -- and is updated with every row this call
+// rewrites, so a later call staging into the same batch sees them.
+func (s *Store) mutateReservedInto(b *pdb.Batch, deltas map[string]int64, staged map[store.Outpoint]*store.Row, pool string, token store.Token, ops []store.Outpoint, now time.Time, mutate func(next *store.Row, now time.Time)) (int, error) {
 	n := 0
 	for _, op := range store.SortOutpoints(ops) {
-		r, err := s.loadRow(op)
-		if err != nil {
-			return 0, err
+		r, ok := staged[op]
+		if !ok {
+			var err error
+			if r, err = s.loadRow(op); err != nil {
+				return 0, err
+			}
 		}
 		if r == nil || r.Pool != pool || r.State != store.StateReserved || r.ReservedBy != token {
 			continue
@@ -212,13 +237,10 @@ func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpo
 		if err := s.setRow(b, &prev, &next, deltas); err != nil {
 			return 0, wrapErr(err)
 		}
+		if staged != nil {
+			staged[op] = &next
+		}
 		n++
-	}
-	if err := s.applyCounters(b, deltas); err != nil {
-		return 0, err
-	}
-	if err := g.commit(b); err != nil {
-		return 0, err
 	}
 	return n, nil
 }
@@ -248,7 +270,12 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 	if err := store.ValidateSpend(txid, terminal); err != nil {
 		return 0, err
 	}
-	return s.mutateReserved(pool, token, ops, func(next *store.Row, now time.Time) {
+	return s.mutateReserved(pool, token, ops, spendMutation(txid, terminal))
+}
+
+// spendMutation is Spend's row mutation, shared with SpendBatch.
+func spendMutation(txid chainhash.Hash, terminal bool) func(next *store.Row, now time.Time) {
+	return func(next *store.Row, now time.Time) {
 		if terminal {
 			h := txid
 			next.State = store.StateSpent
@@ -261,7 +288,50 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 			h := txid
 			next.SpentHint = &h
 		}
-	})
+	}
+}
+
+// SpendBatch implements store.SpendBatcher: every request is staged, in
+// slice order, into one Pebble batch under one hold of s.mu and committed
+// once through the guard (one WAL append, one fsync shared with any other
+// concurrent commit). A request reads the rows earlier requests in the same
+// batch already rewrote from the staged overlay, so it sees exactly what
+// sequential Spend calls would have left behind.
+func (s *Store) SpendBatch(ctx context.Context, pool string, reqs []store.SpendRequest) (_ []int, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := store.ValidatePool(pool); err != nil {
+		return nil, err
+	}
+	if err := store.ValidateSpendBatch(reqs, maxBatch); err != nil {
+		return nil, err
+	}
+	g := s.lock()
+	defer g.unlock(&err)
+	if s.closed.Load() {
+		return nil, errClosed
+	}
+	now := s.now().Truncate(time.Microsecond)
+	b := s.db.NewBatch()
+	defer func() { _ = b.Close() }()
+	deltas := map[string]int64{}
+	staged := map[store.Outpoint]*store.Row{}
+	counts := make([]int, len(reqs))
+	for i, r := range reqs {
+		n, err := s.mutateReservedInto(b, deltas, staged, pool, r.Token, r.Ops, now, spendMutation(r.TxID, r.Terminal))
+		if err != nil {
+			return nil, err
+		}
+		counts[i] = n
+	}
+	if err := s.applyCounters(b, deltas); err != nil {
+		return nil, err
+	}
+	if err := g.commit(b); err != nil {
+		return nil, err
+	}
+	return counts, nil
 }
 
 // Quarantine implements store.Store. before is a comparison bound, not
