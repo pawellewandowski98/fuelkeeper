@@ -99,9 +99,10 @@ func newTwin(t *testing.T, newStore Factory, shards, size int) *twin {
 	return tw
 }
 
-func (tw *twin) advance(d time.Duration) {
-	tw.batchClk.Advance(d)
-	tw.seqClk.Advance(d)
+// tick advances both clocks by one second.
+func (tw *twin) tick() {
+	tw.batchClk.Advance(time.Second)
+	tw.seqClk.Advance(time.Second)
 }
 
 // reserve reserves ops in pool under tok in both stores and requires the
@@ -222,7 +223,7 @@ func testSpendBatchDifferential(t *testing.T, newStore Factory) {
 		for _, tok := range toks {
 			tw.reserve(t, "main", byTok[tok], tok)
 		}
-		tw.advance(time.Second)
+		tw.tick()
 
 		reqs := make([]store.SpendRequest, 1+rng.IntN(8))
 		for i := range reqs {
@@ -247,7 +248,7 @@ func testSpendBatchDifferential(t *testing.T, newStore Factory) {
 			}
 		}
 		tw.apply(t, reqs)
-		tw.advance(time.Second)
+		tw.tick()
 
 		if round%5 == 4 {
 			// Return some quarantined rows to available so they can be
@@ -287,7 +288,7 @@ func testSpendBatchReplay(t *testing.T, newStore Factory) {
 	for i, op := range tw.mainOps {
 		tw.reserve(t, "main", []store.Outpoint{op}, toks[i%len(toks)])
 	}
-	tw.advance(time.Second)
+	tw.tick()
 	reqs := make([]store.SpendRequest, 6)
 	for i := range reqs {
 		reqs[i] = randomRequest(rng, toks, tw.mainOps, txids, 5)
@@ -301,7 +302,7 @@ func testSpendBatchReplay(t *testing.T, newStore Factory) {
 
 	// A retry (e.g. after an in-doubt commit) changes nothing and, like a
 	// sequential Spend replay, counts 0 for every row the first one moved.
-	tw.advance(time.Second)
+	tw.tick()
 	again := tw.apply(t, reqs)
 	assert.Equal(t, make([]int, len(reqs)), again, "a replayed batch moves nothing")
 }
@@ -363,13 +364,13 @@ func testSpendBatchConcurrent(t *testing.T, newStore Factory) {
 	b := s.(store.SpendBatcher)
 	seed := spendBatchSeed(t)
 
-	const nTok = 4
+	const nTok, perTok = 4, 24
 	toks := make([]store.Token, nTok)
-	var all []store.Outpoint
+	all := make([]store.Outpoint, 0, nTok*perTok)
 	holder := map[store.Outpoint]store.Token{}
 	for i := range toks {
 		toks[i] = store.NewToken()
-		_, rows := MintShard(t, s, "main", 24, store.ShardMined)
+		_, rows := MintShard(t, s, "main", perTok, store.ShardMined)
 		MustReserve(t, s, "main", rows, toks[i], clk.Now().Add(time.Hour))
 		for _, r := range rows {
 			all = append(all, r.Outpoint)

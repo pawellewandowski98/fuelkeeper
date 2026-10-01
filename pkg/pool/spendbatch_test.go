@@ -87,7 +87,7 @@ func startSpendCoalescer(t *testing.T, st store.SpendBatcher, cfg pool.SpendCoal
 
 // reservedFixture mints a shard of n rows and reserves them two at a time
 // under fresh tokens, returning one spend request per token.
-func reservedFixture(t *testing.T, n int) (*storetest.Clock, *memory.Store, []store.SpendRequest) {
+func reservedFixture(t *testing.T, n int) (*memory.Store, []store.SpendRequest) {
 	t.Helper()
 	clk := storetest.NewClock(storetest.Start)
 	st := memory.New(memory.WithClock(clk.Now))
@@ -98,7 +98,7 @@ func reservedFixture(t *testing.T, n int) (*storetest.Clock, *memory.Store, []st
 		storetest.MustReserve(t, st, "main", rows[i:i+2], tok, clk.Now().Add(time.Minute))
 		reqs = append(reqs, store.SpendRequest{Token: tok, Ops: storetest.Ops(rows[i : i+2]), TxID: storetest.NewTxID(), Terminal: true})
 	}
-	return clk, st, reqs
+	return st, reqs
 }
 
 // waitPending waits until the coalescer holds n queued requests.
@@ -108,7 +108,7 @@ func waitPending(t *testing.T, c *pool.SpendCoalescer, n int) {
 }
 
 func TestSpendCoalescerBatchesConcurrentRequests(t *testing.T) {
-	_, st, reqs := reservedFixture(t, 100)
+	st, reqs := reservedFixture(t, 100)
 	cb := newCountingBatcher(st)
 	cb.hold = make(chan struct{})
 	c := startSpendCoalescer(t, cb, pool.SpendCoalescerConfig{Slots: 1, MaxBatch: 1000})
@@ -144,7 +144,7 @@ func TestSpendCoalescerBatchesConcurrentRequests(t *testing.T) {
 }
 
 func TestSpendCoalescerRoutesPerRequestResults(t *testing.T) {
-	_, st, reqs := reservedFixture(t, 8)
+	st, reqs := reservedFixture(t, 8)
 	cb := newCountingBatcher(st)
 	cb.hold = make(chan struct{})
 	c := startSpendCoalescer(t, cb, pool.SpendCoalescerConfig{Slots: 1})
@@ -179,7 +179,7 @@ func TestSpendCoalescerRoutesPerRequestResults(t *testing.T) {
 }
 
 func TestSpendCoalescerFailingFlushFailsOnlyItsRequests(t *testing.T) {
-	_, st, reqs := reservedFixture(t, 10)
+	st, reqs := reservedFixture(t, 10)
 	cb := newCountingBatcher(st)
 	cb.hold = make(chan struct{})
 	boom := errors.New("boom")
@@ -211,7 +211,7 @@ func TestSpendCoalescerFailingFlushFailsOnlyItsRequests(t *testing.T) {
 }
 
 func TestSpendCoalescerRetriesUnavailable(t *testing.T) {
-	_, st, reqs := reservedFixture(t, 4)
+	st, reqs := reservedFixture(t, 4)
 	cb := newCountingBatcher(st)
 	cb.fail = func(call int, _ []store.SpendRequest) error {
 		if call == 1 {
@@ -227,7 +227,7 @@ func TestSpendCoalescerRetriesUnavailable(t *testing.T) {
 }
 
 func TestSpendCoalescerGivesUpAfterRetries(t *testing.T) {
-	_, st, reqs := reservedFixture(t, 4)
+	st, reqs := reservedFixture(t, 4)
 	cb := newCountingBatcher(st)
 	cb.fail = func(int, []store.SpendRequest) error { return fmt.Errorf("%w: down", store.ErrUnavailable) }
 	c := startSpendCoalescer(t, cb, pool.SpendCoalescerConfig{Slots: 1, Retries: 2, RetryBackoff: time.Millisecond})
@@ -237,7 +237,7 @@ func TestSpendCoalescerGivesUpAfterRetries(t *testing.T) {
 }
 
 func TestSpendCoalescerWithdrawsCancelledRequests(t *testing.T) {
-	_, st, reqs := reservedFixture(t, 6)
+	st, reqs := reservedFixture(t, 6)
 	cb := newCountingBatcher(st)
 	cb.hold = make(chan struct{})
 	c := startSpendCoalescer(t, cb, pool.SpendCoalescerConfig{Slots: 1})
@@ -271,7 +271,7 @@ func TestSpendCoalescerWithdrawsCancelledRequests(t *testing.T) {
 }
 
 func TestSpendCoalescerCancelledInFlightGetsFlushResult(t *testing.T) {
-	_, st, reqs := reservedFixture(t, 2)
+	st, reqs := reservedFixture(t, 2)
 	cb := newCountingBatcher(st)
 	cb.hold = make(chan struct{})
 	c := startSpendCoalescer(t, cb, pool.SpendCoalescerConfig{Slots: 1})
@@ -291,7 +291,7 @@ func TestSpendCoalescerCancelledInFlightGetsFlushResult(t *testing.T) {
 }
 
 func TestSpendCoalescerBackpressure(t *testing.T) {
-	_, st, reqs := reservedFixture(t, 20)
+	st, reqs := reservedFixture(t, 20)
 	cb := newCountingBatcher(st)
 	cb.hold = make(chan struct{})
 	c := startSpendCoalescer(t, cb, pool.SpendCoalescerConfig{Slots: 1, MaxBatch: 4, MaxInflightOps: 6})
@@ -312,7 +312,7 @@ func TestSpendCoalescerBackpressure(t *testing.T) {
 }
 
 func TestSpendCoalescerRejectsInvalidRequests(t *testing.T) {
-	_, st, reqs := reservedFixture(t, 4)
+	st, reqs := reservedFixture(t, 4)
 	cb := newCountingBatcher(st)
 	c := startSpendCoalescer(t, cb, pool.SpendCoalescerConfig{Slots: 1})
 	dup := reqs[0]
@@ -330,7 +330,7 @@ func TestSpendCoalescerRejectsInvalidRequests(t *testing.T) {
 }
 
 func TestSpendCoalescerStoppedIsUnavailable(t *testing.T) {
-	_, st, reqs := reservedFixture(t, 4)
+	st, reqs := reservedFixture(t, 4)
 	cb := newCountingBatcher(st)
 	c := pool.NewSpendCoalescer(cb, "main", pool.SpendCoalescerConfig{Slots: 1})
 	ctx, cancel := context.WithCancel(context.Background())
