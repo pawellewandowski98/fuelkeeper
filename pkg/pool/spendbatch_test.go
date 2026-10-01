@@ -32,7 +32,10 @@ type countingBatcher struct {
 	entered chan struct{}
 	hold    chan struct{}
 	fail    func(call int, reqs []store.SpendRequest) error
-	spends  int // direct Spend calls
+	// failAfter, when set, runs after the call was applied: a non-nil error
+	// is returned in place of the real result (a commit whose reply was lost).
+	failAfter func(call int) error
+	spends    int // direct Spend calls
 }
 
 func (c *countingBatcher) Spend(ctx context.Context, pool string, token store.Token, ops []store.Outpoint, txid chainhash.Hash, terminal bool) (int, error) {
@@ -67,7 +70,13 @@ func (c *countingBatcher) SpendBatch(ctx context.Context, pool string, reqs []st
 			return nil, err
 		}
 	}
-	return c.Store.SpendBatch(ctx, pool, reqs)
+	counts, err := c.Store.SpendBatch(ctx, pool, reqs)
+	if err == nil && c.failAfter != nil {
+		if ferr := c.failAfter(call); ferr != nil {
+			return nil, ferr
+		}
+	}
+	return counts, err
 }
 
 func (c *countingBatcher) Calls() [][]store.SpendRequest {
@@ -154,9 +163,14 @@ func TestSpendCoalescerRoutesPerRequestResults(t *testing.T) {
 	wrong.Token = store.NewToken() // holds nothing
 	partial := reqs[2]
 	partial.Ops = append(append([]store.Outpoint(nil), partial.Ops...), reqs[3].Ops[0]) // one op held by another token
-	dupOfFirst := reqs[0]                                                               // the same rows again: the earlier request wins
-	batch := []store.SpendRequest{reqs[0], wrong, partial, dupOfFirst}
-	want := []int{2, 0, 2, 0}
+	first := reqs[0]
+	first.Ops = reqs[0].Ops[:1]
+	// The last request names first's row again (the earlier request wins it)
+	// plus one row nobody else spends, so it counts exactly 1: a dropped or
+	// misrouted last result shows up as a mismatch.
+	overlap := reqs[0]
+	batch := []store.SpendRequest{first, wrong, partial, overlap}
+	want := []int{1, 0, 2, 1}
 
 	// Park a throwaway flush so the four requests below all queue into one batch.
 	go func() { _, _ = c.Submit(context.Background(), reqs[3]) }()
@@ -460,4 +474,45 @@ func TestPoolSpendBatchingDisabled(t *testing.T) {
 	assert.Empty(t, cb.Calls())
 	assert.Equal(t, 1, cb.Spends())
 	assert.InDelta(t, before+1, testutil.ToFloat64(pool.SpendFallback.WithLabelValues(poolName, "disabled")), 0)
+}
+
+func TestSpendCoalescerDoesNotRetryInvalidArgument(t *testing.T) {
+	st, reqs := reservedFixture(t, 4)
+	cb := newCountingBatcher(st)
+	cb.fail = func(int, []store.SpendRequest) error { return fmt.Errorf("%w: x", store.ErrInvalidArgument) }
+	c := startSpendCoalescer(t, cb, pool.SpendCoalescerConfig{Slots: 1, Retries: 3, RetryBackoff: time.Millisecond})
+	_, err := c.Submit(context.Background(), reqs[0])
+	require.ErrorIs(t, err, store.ErrInvalidArgument)
+	assert.Len(t, cb.Calls(), 1, "an invalid-argument failure is final: never retried")
+}
+
+func TestSpendCoalescerRetryAfterInDoubtCommitReportsZero(t *testing.T) {
+	const poolName = "spend-in-doubt"
+	clk := storetest.NewClock(storetest.Start)
+	st := memory.New(memory.WithClock(clk.Now))
+	_, rows := storetest.MintShard(t, st, poolName, 2, store.ShardMined)
+	tok := store.NewToken()
+	storetest.MustReserve(t, st, poolName, rows, tok, clk.Now().Add(time.Minute))
+	cb := newCountingBatcher(st)
+	cb.failAfter = func(call int) error {
+		if call == 1 {
+			return fmt.Errorf("%w: reply lost", store.ErrUnavailable)
+		}
+		return nil
+	}
+	c := pool.NewSpendCoalescer(cb, poolName, pool.SpendCoalescerConfig{Slots: 1, RetryBackoff: time.Millisecond})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = c.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	before := testutil.ToFloat64(pool.SpendFlushRetries.WithLabelValues(poolName))
+
+	n, err := c.Submit(context.Background(), store.SpendRequest{Token: tok, Ops: storetest.Ops(rows), TxID: storetest.NewTxID(), Terminal: true})
+	require.NoError(t, err, "the retry succeeds")
+	assert.Equal(t, 0, n, "the retry finds the rows the lost attempt already moved: Spend replay semantics")
+	assert.Len(t, cb.Calls(), 2)
+	assert.InDelta(t, before+1, testutil.ToFloat64(pool.SpendFlushRetries.WithLabelValues(poolName)), 0)
+	for _, r := range storetest.RowsByOutpoint(t, st, poolName, storetest.Ops(rows)) {
+		assert.Equal(t, store.StateSpent, r.State)
+	}
 }

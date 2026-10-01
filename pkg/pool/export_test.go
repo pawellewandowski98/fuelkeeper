@@ -17,6 +17,7 @@ var (
 	SpendBatchSize        = spendBatchSize
 	SpendFlushSeconds     = spendFlushSeconds
 	SpendFallback         = spendFallback
+	SpendFlushRetries     = spendFlushRetries
 )
 
 // Tombstones reports how many forgotten-row tombstones the allocator holds.
