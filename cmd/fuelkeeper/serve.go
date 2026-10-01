@@ -154,17 +154,9 @@ func openTreasury(ctx context.Context, cfg *config.Config, mockOracle *oracle.Mo
 	var opts []tfactory.Option
 	if mockOracle != nil {
 		delay := cfg.Treasury.Mock.ConfirmAfter
-		var nextHeight atomic.Uint32
+		mine := nullnetMiner(mockOracle)
 		opts = append(opts, tfactory.WithMockOnSend(func(txid chainhash.Hash) {
-			confirmer.schedule(delay, func() {
-				height := nextHeight.Add(1)
-				mockOracle.SetTx(txid, oracle.TxStatus{
-					Known:       true,
-					Mined:       true,
-					BlockHeight: height,
-					MerklePath:  mock.SingleTxMerklePath(txid, height),
-				})
-			})
+			confirmer.schedule(delay, func() { mine(txid) })
 		}))
 	}
 	o, err := tfactory.Open(ctx, cfg.Treasury, cfg.Pools, log, opts...)
@@ -172,6 +164,23 @@ func openTreasury(ctx context.Context, cfg *config.Config, mockOracle *oracle.Mo
 		return nil, fmt.Errorf("treasury: %w", err)
 	}
 	return &openedTreasury{Opened: o, confirmer: confirmer}, nil
+}
+
+// nullnetMiner returns the nullnet "mine" step: each call reports txid mined
+// in its own single-transaction block at the next synthetic height (1, 2, ...),
+// with a real BRC-74 merkle path whose root is the txid. Safe for concurrent
+// calls.
+func nullnetMiner(mockOracle *oracle.Mock) func(txid chainhash.Hash) {
+	var nextHeight atomic.Uint32
+	return func(txid chainhash.Hash) {
+		height := nextHeight.Add(1)
+		mockOracle.SetTx(txid, oracle.TxStatus{
+			Known:       true,
+			Mined:       true,
+			BlockHeight: height,
+			MerklePath:  mock.SingleTxMerklePath(txid, height),
+		})
+	}
 }
 
 // logNullnetHint logs a one-line development nudge when a mock treasury is

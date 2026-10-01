@@ -24,8 +24,10 @@ import (
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/client"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/config"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/oracle"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/store/storetest"
 )
 
 // TestServeSmokeNullnet runs the full "nullnet" pipeline end to end: a memory
@@ -165,26 +167,25 @@ log:
 // directly checks the height counter logic used by the nullnet mock oracle
 // hook in openTreasury, ensuring two consecutive confirmations get h and h+1.
 func TestNullnetHeightCounterIncreases(t *testing.T) {
-	// Simulate the height counter mechanism used in openTreasury.
+	orc := oracle.NewMock()
+	mine := nullnetMiner(orc)
+	a, b := storetest.NewTxID(), storetest.NewTxID()
+	mine(a)
+	mine(b)
 	var heights []uint32
-	var mu sync.Mutex
-	var nextHeight atomic.Uint32
-
-	// Simulate two consecutive confirmations via the mock oracle callback.
-	// Each "confirmation" increments the height counter, exactly as the
-	// openTreasury hook does via nextHeight.Add(1).
-	for i := 0; i < 2; i++ {
-		height := nextHeight.Add(1)
-		mu.Lock()
-		heights = append(heights, height)
-		mu.Unlock()
+	for _, txid := range []chainhash.Hash{a, b} {
+		st, err := orc.Tx(context.Background(), txid)
+		require.NoError(t, err)
+		require.True(t, st.Known && st.Mined)
+		mp, err := transaction.NewMerklePathFromBinary(st.MerklePath)
+		require.NoError(t, err)
+		assert.Equal(t, st.BlockHeight, mp.BlockHeight, "BUMP height matches the reported height")
+		root, err := mp.ComputeRoot(&txid)
+		require.NoError(t, err)
+		assert.Equal(t, txid, *root, "single-tx block: root is the txid")
+		heights = append(heights, st.BlockHeight)
 	}
-
-	// Two consecutive confirmations must have strictly increasing heights.
-	require.Len(t, heights, 2)
-	assert.Equal(t, uint32(1), heights[0], "first confirmation height")
-	assert.Equal(t, uint32(2), heights[1], "second confirmation height")
-	assert.Less(t, heights[0], heights[1], "heights must be strictly increasing")
+	assert.Equal(t, []uint32{1, 2}, heights, "consecutive confirmations get strictly increasing heights")
 }
 
 // TestServeRejectsBadConfig checks two ways runServe fails fast: a config
