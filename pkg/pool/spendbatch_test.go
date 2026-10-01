@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -29,6 +31,20 @@ type countingBatcher struct {
 	entered chan struct{}
 	hold    chan struct{}
 	fail    func(call int, reqs []store.SpendRequest) error
+	spends  int // direct Spend calls
+}
+
+func (c *countingBatcher) Spend(ctx context.Context, pool string, token store.Token, ops []store.Outpoint, txid chainhash.Hash, terminal bool) (int, error) {
+	c.mu.Lock()
+	c.spends++
+	c.mu.Unlock()
+	return c.Store.Spend(ctx, pool, token, ops, txid, terminal)
+}
+
+func (c *countingBatcher) Spends() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.spends
 }
 
 func newCountingBatcher(st *memory.Store) *countingBatcher {
@@ -322,4 +338,124 @@ func TestSpendCoalescerStoppedIsUnavailable(t *testing.T) {
 	require.NoError(t, c.Run(ctx))
 	_, err := c.Submit(context.Background(), reqs[0])
 	require.ErrorIs(t, err, pool.ErrUnavailable)
+}
+
+// noBatchStore hides a store's SpendBatch, like a backend without one.
+type noBatchStore struct{ store.Store }
+
+// startPool runs a pool named poolName over st, with 4 mined 2-row shards'
+// worth of rows minted in the memory store under it.
+func startPool(t *testing.T, st store.Store, mem *memory.Store, clk *storetest.Clock, poolName string, mutate func(*pool.Config)) *pool.Pool {
+	t.Helper()
+	storetest.MintShard(t, mem, poolName, 8, store.ShardMined)
+	pc := pool.DefaultPoolConfig(poolName, 50)
+	pc.MinTTL = time.Second
+	if mutate != nil {
+		mutate(&pc)
+	}
+	require.NoError(t, pc.Validate())
+	p := pool.NewPool(st, pc, testInstanceConfig(), pool.ClockFunc(clk.Now), slog.New(slog.DiscardHandler))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = p.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	return p
+}
+
+func TestPoolSpendGoesThroughSpendBatch(t *testing.T) {
+	const poolName = "spend-batch-pool"
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	mem := memory.New(memory.WithClock(clk.Now))
+	cb := newCountingBatcher(mem)
+	p := startPool(t, cb, mem, clk, poolName, func(c *pool.Config) { c.SpendPolicy = pool.SpendTrust })
+
+	sizeBefore, sizeSumBefore := histObserved(t, pool.SpendBatchSize, poolName)
+	flushBefore, _ := histObserved(t, pool.SpendFlushSeconds, poolName)
+	opBefore, _ := histObserved(t, pool.StoreOpLatency, poolName, "spend_batch")
+
+	res, err := p.Reserve(ctx, pool.ReserveRequest{Count: 2})
+	require.NoError(t, err)
+	n, err := p.Spend(ctx, res.Token, outpointsOf(res.Outputs), storetest.NewTxID())
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	require.Len(t, cb.Calls(), 1)
+	assert.Equal(t, 0, cb.Spends(), "no direct Spend when the store batches")
+	got := storetest.RowsByOutpoint(t, mem, poolName, outpointsOf(res.Outputs))
+	for _, o := range res.Outputs {
+		assert.Equal(t, store.StateSpent, got[o.Outpoint].State)
+	}
+
+	size, sizeSum := histObserved(t, pool.SpendBatchSize, poolName)
+	assert.Equal(t, sizeBefore+1, size)
+	assert.InDelta(t, sizeSumBefore+1, sizeSum, 0, "one request in the flush")
+	flush, _ := histObserved(t, pool.SpendFlushSeconds, poolName)
+	assert.Equal(t, flushBefore+1, flush)
+	op, _ := histObserved(t, pool.StoreOpLatency, poolName, "spend_batch")
+	assert.Equal(t, opBefore+1, op, "store_op_latency_seconds{op=spend_batch} is observed per flush attempt")
+
+	// A request Spend itself would reject is a bad request and never reaches the store.
+	dup := []store.Outpoint{res.Outputs[0].Outpoint, res.Outputs[0].Outpoint}
+	_, err = p.Spend(ctx, res.Token, dup, storetest.NewTxID())
+	require.ErrorIs(t, err, pool.ErrBadRequest)
+	assert.Len(t, cb.Calls(), 1)
+}
+
+func TestPoolVerifyReleaseGoesThroughSpendBatch(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	mem := memory.New(memory.WithClock(clk.Now))
+	cb := newCountingBatcher(mem)
+	p := startPool(t, cb, mem, clk, "spend-batch-release", func(c *pool.Config) { c.ReleasePolicy = pool.ReleaseVerify })
+
+	res, err := p.Reserve(ctx, pool.ReserveRequest{Count: 2})
+	require.NoError(t, err)
+	n, err := p.Release(ctx, res.Token, outpointsOf(res.Outputs))
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	calls := cb.Calls()
+	require.Len(t, calls, 1)
+	require.Len(t, calls[0], 1)
+	assert.Equal(t, chainhash.Hash{}, calls[0][0].TxID, "verify release is a non-terminal spend with no hint")
+	assert.False(t, calls[0][0].Terminal)
+	got := storetest.RowsByOutpoint(t, mem, "spend-batch-release", outpointsOf(res.Outputs))
+	for _, o := range res.Outputs {
+		assert.Equal(t, store.StateQuarantined, got[o.Outpoint].State)
+		assert.Nil(t, got[o.Outpoint].SpentHint)
+	}
+}
+
+func TestPoolSpendFallsBackWithoutSpendBatcher(t *testing.T) {
+	const poolName = "spend-batch-unsupported"
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	mem := memory.New(memory.WithClock(clk.Now))
+	p := startPool(t, noBatchStore{mem}, mem, clk, poolName, nil)
+	before := testutil.ToFloat64(pool.SpendFallback.WithLabelValues(poolName, "unsupported"))
+
+	res, err := p.Reserve(ctx, pool.ReserveRequest{Count: 2})
+	require.NoError(t, err)
+	n, err := p.Spend(ctx, res.Token, outpointsOf(res.Outputs), storetest.NewTxID())
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	assert.InDelta(t, before+1, testutil.ToFloat64(pool.SpendFallback.WithLabelValues(poolName, "unsupported")), 0)
+}
+
+func TestPoolSpendBatchingDisabled(t *testing.T) {
+	const poolName = "spend-batch-disabled"
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	mem := memory.New(memory.WithClock(clk.Now))
+	cb := newCountingBatcher(mem)
+	p := startPool(t, cb, mem, clk, poolName, func(c *pool.Config) { c.SpendBatching.Enabled = false })
+	before := testutil.ToFloat64(pool.SpendFallback.WithLabelValues(poolName, "disabled"))
+
+	res, err := p.Reserve(ctx, pool.ReserveRequest{Count: 2})
+	require.NoError(t, err)
+	n, err := p.Spend(ctx, res.Token, outpointsOf(res.Outputs), storetest.NewTxID())
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	assert.Empty(t, cb.Calls())
+	assert.Equal(t, 1, cb.Spends())
+	assert.InDelta(t, before+1, testutil.ToFloat64(pool.SpendFallback.WithLabelValues(poolName, "disabled")), 0)
 }

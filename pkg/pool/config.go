@@ -111,6 +111,25 @@ type Config struct {
 	// ExpectedTPS is the pool's expected spend rate; optional (0 disables the
 	// check) and, when set, enables the mint-capacity check in pkg/config.
 	ExpectedTPS float64 `yaml:"expected_tps"`
+	// SpendBatching groups concurrent spend reports (and release_policy=verify
+	// releases) into one durable store write per flush; see SpendCoalescer.
+	SpendBatching SpendBatchingConfig `yaml:"spend_batching"`
+}
+
+// SpendBatchingConfig tunes a pool's spend group commit. It only takes effect
+// on a store that implements store.SpendBatcher (memory, sqlite, pebble,
+// postgres); any other store gets one Spend call per request regardless.
+type SpendBatchingConfig struct {
+	// Enabled turns spend batching on (the default).
+	Enabled bool `yaml:"enabled"`
+	// MaxBatch caps the outpoints one flush carries, summed over its
+	// requests; 0 means the store's max batch. It is raised to the pool's
+	// max_count (one request always fits) and capped at the store's max batch.
+	MaxBatch int `yaml:"max_batch"`
+	// Window optionally holds a flush open this long, once a slot is free, to
+	// gather more requests; 0 (the default) flushes at once -- requests that
+	// arrive while a flush is in flight still join the next one.
+	Window time.Duration `yaml:"window"`
 }
 
 // DefaultPoolConfig returns the spec defaults for a puzzle pool. Its
@@ -134,6 +153,7 @@ func DefaultPoolConfig(name string, denomination uint64) Config {
 		ReleasePolicy:   ReleaseTrust,
 		SpendPolicy:     SpendVerify,
 		ExpiryPolicy:    ExpiryRequeue,
+		SpendBatching:   SpendBatchingConfig{Enabled: true},
 	}
 }
 
@@ -192,6 +212,9 @@ func (c *Config) Validate() error {
 	}
 	if c.ExpectedTPS < 0 {
 		return fmt.Errorf("pool %s: expected_tps must be >= 0", c.Name)
+	}
+	if c.SpendBatching.MaxBatch < 0 || c.SpendBatching.Window < 0 {
+		return fmt.Errorf("pool %s: spend_batching max_batch and window must be >= 0", c.Name)
 	}
 	return nil
 }

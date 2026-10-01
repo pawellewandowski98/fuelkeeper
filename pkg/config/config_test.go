@@ -855,3 +855,25 @@ func TestTeranodeOnlyOracleRejectedWhenJobsRun(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, pool.SpendVerify, c.Pools[0].SpendPolicy)
 }
+
+func TestSpendBatchingParsesAndDefaults(t *testing.T) {
+	c, err := config.Parse(oracleYAML("  kind: none", ""))
+	require.NoError(t, err)
+	assert.Equal(t, pool.SpendBatchingConfig{Enabled: true}, c.Pools[0].SpendBatching, "omitted spend_batching is enabled with store-sized batches and no window")
+
+	c, err = config.Parse(oracleYAML("  kind: none", "    spend_batching: {max_batch: 64, window: 2ms}"))
+	require.NoError(t, err)
+	assert.Equal(t, pool.SpendBatchingConfig{Enabled: true, MaxBatch: 64, Window: 2 * time.Millisecond}, c.Pools[0].SpendBatching,
+		"a partial spend_batching block keeps enabled's default")
+
+	c, err = config.Parse(oracleYAML("  kind: none", "    spend_batching: {enabled: false}"))
+	require.NoError(t, err)
+	assert.False(t, c.Pools[0].SpendBatching.Enabled)
+
+	_, err = config.Parse(oracleYAML("  kind: none", "    spend_batching: {max_batch: -1}"))
+	require.ErrorContains(t, err, "spend_batching")
+	_, err = config.Parse(oracleYAML("  kind: none", "    spend_batching: {window: -1s}"))
+	require.ErrorContains(t, err, "spend_batching")
+	_, err = config.Parse(oracleYAML("  kind: none", "    spend_batching: {max_btach: 1}"))
+	require.Error(t, err, "unknown spend_batching keys are rejected")
+}

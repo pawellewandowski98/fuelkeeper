@@ -14,6 +14,9 @@ var (
 	ShardDrops            = shardDrops
 	LeaseRenewFailures    = leaseRenewFailures
 	StoreOpLatency        = storeOpLatency
+	SpendBatchSize        = spendBatchSize
+	SpendFlushSeconds     = spendFlushSeconds
+	SpendFallback         = spendFallback
 )
 
 // Tombstones reports how many forgotten-row tombstones the allocator holds.

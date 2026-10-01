@@ -140,6 +140,14 @@ type crashableStore struct {
 	crashed atomic.Bool
 }
 
+// SpendBatch forwards to the shared store's SpendBatch, so the invariant runs
+// exercise the pool's spend coalescer (the shared store is always memory,
+// which implements it), not the unbatched fallback that embedding alone
+// would select.
+func (c *crashableStore) SpendBatch(ctx context.Context, pool string, reqs []store.SpendRequest) ([]int, error) {
+	return c.Store.(store.SpendBatcher).SpendBatch(ctx, pool, reqs)
+}
+
 func (c *crashableStore) ReleaseShard(ctx context.Context, pool string, txid chainhash.Hash, holder string) error {
 	if c.crashed.Load() {
 		return nil

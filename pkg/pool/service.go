@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store"
 )
@@ -56,8 +57,13 @@ type Pool struct {
 	alloc *Allocator
 	mgr   *ShardManager
 	coal  *Coalescer
-	clock Clock
-	log   *slog.Logger
+	// spendc batches Spend (and verify-mode Release) store writes; nil when
+	// the store has no SpendBatch or spend_batching is disabled, in which
+	// case every request is its own Spend call (spendFallback counts them).
+	spendc        *SpendCoalescer
+	spendFallback prometheus.Counter
+	clock         Clock
+	log           *slog.Logger
 }
 
 // NewPool wires allocator, shard manager and coalescer for pc. The coalescer
@@ -82,6 +88,30 @@ func NewPool(st store.Store, pc Config, ic InstanceConfig, clock Clock, log *slo
 	maxBatch = max(maxBatch, pc.MaxCount)
 	maxBatch = min(maxBatch, caps.MaxBatch)
 	alloc := NewAllocator()
+	var spendc *SpendCoalescer
+	fallback := ""
+	switch b, ok := st.(store.SpendBatcher); {
+	case !ok:
+		fallback = "unsupported"
+	case !pc.SpendBatching.Enabled:
+		fallback = "disabled"
+	default:
+		sb := pc.SpendBatching.MaxBatch
+		if sb <= 0 {
+			sb = caps.MaxBatch
+		}
+		sb = min(max(sb, pc.MaxCount), caps.MaxBatch)
+		spendc = NewSpendCoalescer(b, pc.Name, SpendCoalescerConfig{
+			Slots:        max(1, caps.MaxConcurrentFlushes),
+			MaxBatch:     sb,
+			Window:       pc.SpendBatching.Window,
+			FlushTimeout: ic.FlushTimeout,
+		})
+	}
+	var fallbackCounter prometheus.Counter
+	if fallback != "" {
+		fallbackCounter = spendFallback.WithLabelValues(pc.Name, fallback)
+	}
 	return &Pool{
 		cfg:   pc,
 		icfg:  ic,
@@ -94,8 +124,10 @@ func NewPool(st store.Store, pc Config, ic InstanceConfig, clock Clock, log *slo
 			Window:       ic.FlushWindow,
 			FlushTimeout: ic.FlushTimeout,
 		}),
-		clock: clock,
-		log:   log.With("component", "pool", "pool", pc.Name),
+		spendc:        spendc,
+		spendFallback: fallbackCounter,
+		clock:         clock,
+		log:           log.With("component", "pool", "pool", pc.Name),
 	}
 }
 
@@ -117,7 +149,8 @@ func (p *Pool) Ready(_ context.Context) bool {
 	return p.alloc.Available() > 0 || len(p.alloc.Shards()) > 0
 }
 
-// Run runs the coalescer and shard manager until ctx is done.
+// Run runs the coalescer, the spend coalescer (when there is one) and the
+// shard manager until ctx is done.
 func (p *Pool) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -135,6 +168,10 @@ func (p *Pool) Run(ctx context.Context) error {
 	wg.Add(2)
 	go run(p.coal.Run)
 	go run(p.mgr.Run)
+	if p.spendc != nil {
+		wg.Add(1)
+		go run(p.spendc.Run)
+	}
 	wg.Wait()
 	return first
 }
@@ -320,7 +357,9 @@ func (p *Pool) releaseBestEffort(token store.Token, applied []store.ReserveOp) {
 
 // storeRelease and storeSpend wrap the store's Release/Spend calls with
 // fuelkeeper_store_op_latency_seconds; every pool call site that reaches the
-// store's Release or Spend goes through one of these.
+// store's Release or Spend goes through one of these. (A batched spend is a
+// SpendBatch call instead, observed per flush attempt as
+// op="spend_batch" by SpendCoalescer.)
 func (p *Pool) storeRelease(ctx context.Context, token store.Token, ops []store.Outpoint) (int, error) {
 	start := time.Now()
 	n, err := p.st.Release(ctx, p.cfg.Name, token, ops)
@@ -333,6 +372,17 @@ func (p *Pool) storeSpend(ctx context.Context, token store.Token, ops []store.Ou
 	n, err := p.st.Spend(ctx, p.cfg.Name, token, ops, txid, terminal)
 	storeOpLatency.WithLabelValues(p.cfg.Name, "spend").Observe(time.Since(start).Seconds())
 	return n, err
+}
+
+// spendRows moves rows reserved(token) on to quarantined/spent: through the
+// spend coalescer when the pool has one, so concurrent callers share one
+// durable store write, otherwise as its own Spend call exactly as before.
+func (p *Pool) spendRows(ctx context.Context, token store.Token, ops []store.Outpoint, txid chainhash.Hash, terminal bool) (int, error) {
+	if p.spendc != nil {
+		return p.spendc.Submit(ctx, store.SpendRequest{Token: token, Ops: ops, TxID: txid, Terminal: terminal})
+	}
+	p.spendFallback.Inc()
+	return p.storeSpend(ctx, token, ops, txid, terminal)
 }
 
 // noteReleased re-adds released rows of owned shards to the allocator.
@@ -371,7 +421,7 @@ func (p *Pool) Release(ctx context.Context, token store.Token, ops []store.Outpo
 	var n int
 	var err error
 	if p.cfg.ReleasePolicy == ReleaseVerify {
-		n, err = p.storeSpend(ctx, token, ops, chainhash.Hash{}, false) // a zero txid records no hint: SpentHint stays nil
+		n, err = p.spendRows(ctx, token, ops, chainhash.Hash{}, false) // a zero txid records no hint: SpentHint stays nil
 	} else {
 		n, err = p.storeRelease(ctx, token, ops)
 	}
@@ -393,7 +443,7 @@ func (p *Pool) Spend(ctx context.Context, token store.Token, ops []store.Outpoin
 		spendTotal.WithLabelValues(p.cfg.Name, "bad_request").Inc()
 		return 0, fmt.Errorf("%w: token, txid and 1..%d outpoints required", ErrBadRequest, p.cfg.MaxCount)
 	}
-	n, err := p.storeSpend(ctx, token, ops, txid, p.cfg.SpendPolicy == SpendTrust)
+	n, err := p.spendRows(ctx, token, ops, txid, p.cfg.SpendPolicy == SpendTrust)
 	if err != nil {
 		spendTotal.WithLabelValues(p.cfg.Name, "error").Inc()
 		return 0, mapStoreErr(err)
