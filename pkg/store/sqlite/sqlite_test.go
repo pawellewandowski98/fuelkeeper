@@ -79,3 +79,5 @@ func TestCheckpoint(t *testing.T) {
 	// A maintenance job may call it repeatedly; it must stay safe to call again.
 	require.NoError(t, s.Checkpoint(ctx))
 }
+
+var _ store.SpendBatcher = (*sqlite.Store)(nil)

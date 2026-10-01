@@ -277,9 +277,15 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 	if err := store.ValidateSpend(txid, terminal); err != nil {
 		return 0, err
 	}
-	now := s.now().UnixMicro()
+	sqlText, extra := spendStatement(txid, terminal, s.now().UnixMicro())
+	return s.updateReserved(ctx, pool, token, ops, sqlText, extra...)
+}
+
+// spendStatement returns the statement and leading arguments Spend sends for
+// one txid/terminal combination (see updateReserved).
+func spendStatement(txid chainhash.Hash, terminal bool, now int64) (string, []any) {
 	if terminal {
-		return s.updateReserved(ctx, pool, token, ops, spendTerminalRowSQL, txid[:], now)
+		return spendTerminalRowSQL, []any{txid[:], now}
 	}
 	// A zero txid is only a client-supplied hint, not an oracle-proven fact (see
 	// ValidateSpend): bind NULL rather than 32 zero bytes so SpentHint scans back
@@ -288,7 +294,60 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 	if txid != (chainhash.Hash{}) {
 		hint = txid[:]
 	}
-	return s.updateReserved(ctx, pool, token, ops, spendHintRowSQL, now, hint, now)
+	return spendHintRowSQL, []any{now, hint, now}
+}
+
+// SpendBatch implements store.SpendBatcher. The whole batch is one write on
+// the group-commit writer -- one SAVEPOINT inside the writer's shared
+// transaction, committed with whatever else was queued -- and runs every
+// request in slice order with the same per-row statements Spend uses, so
+// each request sees exactly what its predecessors in the batch left behind.
+// No per-request savepoint is needed: the only way a request can fail is a
+// statement error, which rolls the whole batch back (a batch is all or
+// nothing, like any other write).
+func (s *Store) SpendBatch(ctx context.Context, pool string, reqs []store.SpendRequest) ([]int, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return nil, err
+	}
+	if err := store.ValidateSpendBatch(reqs, maxBatch); err != nil {
+		return nil, err
+	}
+	now := s.now().UnixMicro()
+	counts := make([]int, len(reqs))
+	err := s.write(ctx, func(ctx context.Context, c querier) error {
+		stmts := map[string]*sql.Stmt{}
+		defer func() {
+			for _, st := range stmts {
+				_ = st.Close()
+			}
+		}()
+		for i, r := range reqs {
+			sqlText, extra := spendStatement(r.TxID, r.Terminal, now)
+			stmt, ok := stmts[sqlText]
+			if !ok {
+				var err error
+				if stmt, err = c.PrepareContext(ctx, sqlText); err != nil {
+					return err
+				}
+				stmts[sqlText] = stmt
+			}
+			counts[i] = 0
+			for _, op := range store.SortOutpoints(r.Ops) {
+				args := append(append([]any{}, extra...), pool, op.TxID[:], op.Vout, r.Token[:])
+				res, err := stmt.ExecContext(ctx, args...)
+				if err != nil {
+					return err
+				}
+				k, _ := res.RowsAffected()
+				counts[i] += int(k)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return counts, nil
 }
 
 // Quarantine implements store.Store.
