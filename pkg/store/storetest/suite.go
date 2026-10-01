@@ -74,6 +74,7 @@ func RunSuite(t *testing.T, newStore Factory) {
 			tc.fn(t, s, clk)
 		})
 	}
+	runSpendBatchSuite(t, newStore)
 }
 
 func testClose(t *testing.T, s store.Store, _ *Clock) {
