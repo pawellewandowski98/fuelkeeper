@@ -72,3 +72,22 @@ var (
 		Buckets: latencyBuckets,
 	}, []string{"pool", "op"})
 )
+
+// Spend batching (spendbatch.go).
+var (
+	spendBatchSize = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "fuelkeeper_spend_batch_size", Help: "Spend requests grouped into one SpendBatch flush (one durable store write).",
+		Buckets: batchSizeBuckets,
+	}, []string{"pool"})
+	spendFlushSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "fuelkeeper_spend_flush_seconds",
+		Help:    "Spend flush time from the first SpendBatch attempt to the final outcome, including retry backoff.",
+		Buckets: latencyBuckets,
+	}, []string{"pool"})
+	spendFlushRetries = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fuelkeeper_spend_flush_retries_total", Help: "SpendBatch attempts retried after ErrUnavailable or a per-attempt timeout.",
+	}, []string{"pool"})
+	spendFallback = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fuelkeeper_spend_fallback_total", Help: "Spend store writes made one per request, unbatched, by reason (unsupported: the store has no SpendBatch; disabled: spend_batching.enabled is false).",
+	}, []string{"pool", "reason"})
+)
