@@ -252,7 +252,10 @@ table).
   MongoDB in particular has no replica to make `{w: majority, j: true}`
   meaningfully redundant here, and none of these servers' storage is
   separated from the benchmark client's own disk I/O.
-- **`/spend` is not coalesced across callers.** Reserve requests from many
+- **`/spend` was not coalesced across callers when these numbers were
+  taken** (it now is on memory, sqlite, pebble and postgres -- see
+  `docs/OPERATIONS.md`'s "Known Limits"; the paragraph below describes the
+  build these runs measured). Reserve requests from many
   concurrent callers are batched by the per-pool coalescer into one store
   write per flush; `spend`/`release` are not -- `Pool.storeSpend`
   (`pkg/pool/service.go`) makes one store write per *request* (covering

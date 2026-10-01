@@ -27,7 +27,7 @@ instance:
   reserve_timeout: 2s          # Max time a single reserve request can take; default 2s
   flush_window: 0s             # Extra time the coalescer waits to batch concurrent Reserve calls into one store write; default 0 (flush as soon as a slot is free)
   max_batch: 0                 # Max ops per coalescer flush; 0 means at least 256 (and at least pools[].max_count if that is larger), capped at the store's own max batch size
-  flush_timeout: 5s            # Per-attempt timeout for the store call each flush (and each retried attempt) makes; default 5s
+  flush_timeout: 5s            # Per-attempt timeout for the store call each flush (and each retried attempt) makes, reserve and spend flushes alike; default 5s
   adopt_timeout: 200ms         # Max time a reserve request waits for shard adoption; default 200ms
 
 # Store backend (memory, sqlite, postgres, pebble, mongodb, aerospike)
@@ -82,6 +82,13 @@ pools:
                                      #   no spend hint and no oracle verdict: requeue it after jobs.reaper.unknown_requeue_age,
                                      #   or hold it quarantined for an operator
     expected_tps: 0                  # Expected transactions per second (for capacity validation); no check if 0
+    spend_batching:                  # Group commit for /spend (and /release under release_policy: verify)
+      enabled: true                  # Default true; takes effect only on memory, sqlite, pebble and postgres stores
+                                     #   (mongodb and aerospike always make one store write per request)
+      max_batch: 0                   # Max outpoints per spend flush, summed over its requests; 0 = the store's max batch
+                                     #   (1000); raised to max_count, capped at the store's max batch
+      window: 0s                     # Extra time a flush waits for more requests once a slot is free; default 0 (flush at
+                                     #   once -- requests arriving while a flush is in flight still join the next one)
 
 # Background jobs (enabled by default)
 jobs:
@@ -589,24 +596,24 @@ rescan cycle once the overlap resolves.
   ones, adoption can still cycle indefinitely. The planned fix is a
   store-side `AcquireShard` that skips row-less shards server-side instead
   of relying on a bounded client-side exclusion list.
-- **`/spend` is not coalesced.** Reserve requests from many concurrent
-  callers are batched by the per-pool coalescer into one store write per
-  flush (group-commit); `spend` and `release` are not -- `Pool.storeSpend`
-  (`pkg/pool/service.go`) makes one store write per *request*, covering
-  every outpoint that request names, but each caller's request is always
-  its own store call, never merged with another caller's. So the
-  spend:reserve write-transaction ratio is roughly the coalescer's batch
-  size divided by `count` (outputs per reserve): a store write is cheaper
-  per output on the reserve side whenever concurrent demand fills a batch
-  bigger than `count`, and the two sides are roughly even otherwise. A
-  write-bound store (see "Durability and Consistency" above) still pays
-  for this per request, though sqlite and pebble's group-commit (concurrent
-  writers sharing one `fsync` per flush) applies at the store layer to
-  spend/release writes the same as to reserve writes, so the per-request
-  cost is not one `fsync` per writer there either. Watch
-  `fuelkeeper_coalescer_batch_size` against `count` to see which side is
-  paying more per output in a given deployment, rather than assuming a
-  fixed multiplier.
+- **Spend batching covers only some stores and only one write path.**
+  `/spend` reports (and `/release` under `release_policy: verify`, which is
+  a non-terminal spend with no hint) are group-committed by a per-pool spend
+  coalescer (`pkg/pool/spendbatch.go`): every request that arrives while a
+  flush is in flight joins the next one, and the whole flush is one
+  `SpendBatch` store write -- one transaction and one `fsync` -- so a
+  write-bound store pays per flush rather than per request. Watch
+  `fuelkeeper_spend_batch_size` for how many requests share a write. What
+  remains unbatched: (1) the **mongodb** and **aerospike** backends have no
+  atomic multi-request write, so they fall back to one `Spend` call per
+  request (`fuelkeeper_spend_fallback_total{reason="unsupported"}`), as does
+  any pool with `spend_batching.enabled: false` (`reason="disabled"`);
+  (2) `/release` under `release_policy: trust` is still one store write per
+  call (sqlite and pebble's own group commit still lets concurrent ones
+  share an `fsync`). A spend flush that fails in doubt is retried; the retry
+  is safe (a row already moved is no longer reserved, so it cannot move
+  twice) but reports `accepted: 0` for rows the lost attempt had in fact
+  moved -- the same answer a client's own retry gets.
 - **Abandoned reservations are released inside the reserve flush.** When
   many clients abandon in-flight reserves at once (client timeouts, a load
   generator stopping), the coalescer releases each abandoned request's rows
@@ -702,7 +709,11 @@ Monitor these Prometheus metrics to stay on top of pool health:
 | `fuelkeeper_shard_adoptions_total` | counter | pool, result (ok\|none\|error) | error rate ↑? | AdoptOnce attempts by result |
 | `fuelkeeper_shard_drops_total` | counter | pool, reason (not_owner\|retired\|empty\|stale\|closed) | not_owner/stale rate ↑? | Owned shards dropped, by reason |
 | `fuelkeeper_lease_renew_failures_total` | counter | pool | > 0 sustained? | RenewShard calls that failed transiently (excludes lease-loss) |
-| `fuelkeeper_store_op_latency_seconds` | histogram | pool, op (reserve\|release\|spend\|acquire_shard\|renew_shard\|release_shard\|list_available) | p99 high? | Store call latency observed at the pool's call sites |
+| `fuelkeeper_store_op_latency_seconds` | histogram | pool, op (reserve\|release\|spend\|spend_batch\|acquire_shard\|renew_shard\|release_shard\|list_available) | p99 high? | Store call latency observed at the pool's call sites; `spend_batch` is one batched spend flush attempt, `spend` an unbatched one |
+| `fuelkeeper_spend_batch_size` | histogram | pool | track | Spend requests grouped into one spend flush (one durable store write) |
+| `fuelkeeper_spend_flush_seconds` | histogram | pool | p99 high? | Spend flush time from the first `SpendBatch` attempt to the final outcome, including retry backoff |
+| `fuelkeeper_spend_flush_retries_total` | counter | pool | > 0 sustained? | Spend flush attempts retried after an unavailable store or a per-attempt timeout |
+| `fuelkeeper_spend_fallback_total` | counter | pool, reason (unsupported\|disabled) | track | Spend store writes made one per request: the store has no batched spend (mongodb, aerospike), or `spend_batching.enabled` is false |
 | `fuelkeeper_quarantine_oldest_age_seconds` | gauge | pool | > 5 minutes? | Oldest stuck quarantined row |
 | `fuelkeeper_watcher_unmined_shards` | gauge | pool | > limit × 0.8? | Current unmined shard count |
 | `fuelkeeper_watcher_oldest_unmined_age_seconds` | gauge | pool | > 2 hours? | Age of oldest unmined shard |

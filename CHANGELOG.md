@@ -4,6 +4,21 @@ All notable changes to FuelKeeper are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Spend batching: a per-pool spend coalescer folds concurrent `/spend`
+  reports (and `/release` under `release_policy: verify`) into one durable
+  store write per flush through the new optional `store.SpendBatcher`
+  (`SpendBatch`), implemented natively by the memory, sqlite, pebble and
+  postgres backends; mongodb and aerospike fall back to one `Spend` per
+  request. Configured per pool under `spend_batching` (`enabled`, default
+  true; `max_batch`; `window`), observed through
+  `fuelkeeper_spend_batch_size`, `fuelkeeper_spend_flush_seconds`,
+  `fuelkeeper_spend_flush_retries_total`, `fuelkeeper_spend_fallback_total`
+  and `fuelkeeper_store_op_latency_seconds{op="spend_batch"}`.
+
 ## [0.1.0] - 2026-09-30
 
 Initial release: a standalone Go service that splits a funding payment into

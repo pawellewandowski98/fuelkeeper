@@ -292,6 +292,19 @@ size come from `Store.Capabilities()` (`MaxConcurrentFlushes`, `MaxBatch`).
 Backpressure trips at `max_inflight_ops` (default `4 * Slots * MaxBatch`):
 above it, `Submit` returns `ErrBackpressure` (503) immediately.
 
+**Spend coalescer** (`pkg/pool/spendbatch.go`, per pool): the same group
+commit for `Spend` and verify-mode `Release` (a non-terminal spend with no
+hint). Requests that arrive while a flush is in flight join the next one,
+and each flush is one `SpendBatch` call (`store.SpendBatcher`, implemented by
+memory, sqlite, pebble and postgres): one durable write that returns, per
+request, exactly what sequential `Spend` calls would have. Each request is
+validated as `Spend` validates it before it is queued, so one bad request
+can never fail a batch for the others. A caller whose context ends before a
+flush takes its request is withdrawn; once taken it gets the flush's
+result. On a store without `SpendBatch` (mongodb, aerospike), or with
+`pools[].spend_batching.enabled: false`, every request is its own `Spend`
+call.
+
 **Reserve request flow** (`Pool.Reserve`, `pkg/pool/service.go`):
 
 1. Validate `count` (1..`max_count`), `min_count` (1..`count`, default
