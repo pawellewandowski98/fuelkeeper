@@ -28,6 +28,8 @@ instance:
   flush_window: 0s             # Extra time the coalescer waits to batch concurrent Reserve calls into one store write; default 0 (flush as soon as a slot is free)
   max_batch: 0                 # Max ops per coalescer flush; 0 means at least 256 (and at least pools[].max_count if that is larger), capped at the store's own max batch size
   flush_timeout: 5s            # Per-attempt timeout for the store call each flush (and each retried attempt) makes, reserve and spend flushes alike; default 5s
+                               #   A /spend (or verify-mode /release) taken into a flush waits for that flush even if the client
+                               #   gives up: worst case 3 attempts x flush_timeout + backoff (~15s with the defaults)
   adopt_timeout: 200ms         # Max time a reserve request waits for shard adoption; default 200ms
 
 # Store backend (memory, sqlite, postgres, pebble, mongodb, aerospike)
@@ -713,6 +715,8 @@ Monitor these Prometheus metrics to stay on top of pool health:
 | `fuelkeeper_spend_batch_size` | histogram | pool | track | Spend requests grouped into one spend flush (one durable store write) |
 | `fuelkeeper_spend_flush_seconds` | histogram | pool | p99 high? | Spend flush time from the first `SpendBatch` attempt to the final outcome, including retry backoff |
 | `fuelkeeper_spend_flush_retries_total` | counter | pool | > 0 sustained? | Spend flush attempts retried after an unavailable store or a per-attempt timeout |
+| `fuelkeeper_spend_inflight_ops` | gauge | pool | near the limit (4 × slots × max_batch outpoints)? | Outpoints in spend requests queued plus those in a spend flush |
+| `fuelkeeper_spend_backpressure_total` | counter | pool | > 0 sustained? | Spend requests rejected with `503 backpressure` because the spend batcher's in-flight limit was reached |
 | `fuelkeeper_spend_fallback_total` | counter | pool, reason (unsupported\|disabled) | track | Spend store writes made one per request: the store has no batched spend (mongodb, aerospike), or `spend_batching.enabled` is false |
 | `fuelkeeper_quarantine_oldest_age_seconds` | gauge | pool | > 5 minutes? | Oldest stuck quarantined row |
 | `fuelkeeper_watcher_unmined_shards` | gauge | pool | > limit × 0.8? | Current unmined shard count |

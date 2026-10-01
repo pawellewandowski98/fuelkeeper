@@ -38,7 +38,7 @@ A single reserve request draws from the instance's in-memory rows plus at most o
 ### Idempotency
 
 - **Release** is idempotent: outputs not reserved under the given token are silently skipped; the response reports how many changed.
-- **Spend** is idempotent: a second call with a different txid for the same token is ignored; only the `accepted` field in the response is meaningful.
+- **Spend** is idempotent: a second call with a different txid for the same token is ignored; only the `accepted` field in the response is meaningful. `accepted` counts the rows *this* call moved, so it can be lower than the rows actually spent -- 0 on a replay, and also on a first call whose server-side write was retried after an in-doubt commit (the lost attempt moved the rows; the retry finds them already spent). A lower `accepted` is never an error and needs no action.
 
 ## Fee Sizing
 

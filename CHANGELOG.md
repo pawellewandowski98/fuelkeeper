@@ -16,7 +16,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   request. Configured per pool under `spend_batching` (`enabled`, default
   true; `max_batch`; `window`), observed through
   `fuelkeeper_spend_batch_size`, `fuelkeeper_spend_flush_seconds`,
-  `fuelkeeper_spend_flush_retries_total`, `fuelkeeper_spend_fallback_total`
+  `fuelkeeper_spend_flush_retries_total`, `fuelkeeper_spend_inflight_ops`,
+  `fuelkeeper_spend_backpressure_total`, `fuelkeeper_spend_fallback_total`
   and `fuelkeeper_store_op_latency_seconds{op="spend_batch"}`.
 
 ## [0.1.0] - 2026-09-30

@@ -51,6 +51,11 @@ backoff (see below). A TypeScript or other HTTP client should treat the same
 set of codes the same way: wait `retry_after` seconds (jittered) and retry
 the same reserve call with a fresh token.
 
+`/spend` (and `/release` on a pool with `release_policy: verify`) can return
+`503 backpressure` too, when the server's spend batcher already has too many
+outpoints queued: retry the same call, with the same token and outpoints,
+after `Retry-After` -- it is idempotent (see "On Errors" below).
+
 ## When Your Broadcast Fails
 
 A consumer, not FuelKeeper, is the one who learns what actually happened to
@@ -489,7 +494,7 @@ code -- never log it, and only pass it to the wallet call that consumes it.
 |---|---|---|
 | `409 insufficient` | Fewer than `min_count` reserved; nothing held | Retry with `Retry-After` |
 | `503 exhausted` | No fuel available right now | Retry with `Retry-After` |
-| `503 backpressure` | Server shedding load | Retry with `Retry-After` |
+| `503 backpressure` | Server shedding load (reserve's coalescer, or the spend batcher on `/spend` and verify-mode `/release`) | Retry with `Retry-After`; for spend/release, the same token and outpoints |
 | `503 unavailable` | Store/server temporarily down | Retry with backoff |
 | `401 unauthorized` | Missing/invalid API key | Fix the key |
 | `404 not_found` / `unknown_pool` | Pool or resource missing | Fix the pool name/path |
