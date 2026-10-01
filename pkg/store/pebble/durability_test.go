@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ type gateFS struct {
 	gate    chan struct{} // non-nil: WAL syncs block until it is closed
 	failErr error         // non-nil: WAL syncs fail with it
 	entered chan struct{} // gets a value (non-blocking) when a sync blocks on gate
+	syncs   atomic.Int64  // WAL syncs attempted
 }
 
 func newGateFS(fs vfs.FS) *gateFS { return &gateFS{FS: fs, entered: make(chan struct{}, 1)} }
@@ -52,6 +54,7 @@ func (g *gateFS) fail(err error) {
 }
 
 func (g *gateFS) beforeSync() error {
+	g.syncs.Add(1)
 	g.mu.Lock()
 	gate, ferr := g.gate, g.failErr
 	g.mu.Unlock()
@@ -303,4 +306,29 @@ func TestDurable_SyncFailureIsSurfaced(t *testing.T) {
 	_, err = s.GetRows(ctx, "main", storetest.Ops(rows))
 	require.ErrorIs(t, err, store.ErrUnavailable, "a read after a failed sync must not return state that never became durable")
 	require.ErrorIs(t, err, errDisk)
+}
+
+// TestSpendBatchIsOneWALSync pins SpendBatch's point on pebble: a
+// multi-request batch, with nothing else writing, is one WAL sync (one
+// fsync), not one per request.
+func TestSpendBatchIsOneWALSync(t *testing.T) {
+	ctx := context.Background()
+	clk := storetest.NewClock(storetest.Start)
+	gfs := newGateFS(newStrictMem(t))
+	s, err := pebblestore.Open(ctx, pebblestore.Config{Path: durPath}, pebblestore.WithFS(gfs), pebblestore.WithClock(clk.Now))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	_, rows := storetest.MintShard(t, s, "main", 6, store.ShardMined)
+	reqs := make([]store.SpendRequest, 3)
+	for i := range reqs {
+		tok := store.NewToken()
+		storetest.MustReserve(t, s, "main", rows[2*i:2*i+2], tok, clk.Now().Add(time.Minute))
+		reqs[i] = store.SpendRequest{Token: tok, Ops: storetest.Ops(rows[2*i : 2*i+2]), TxID: storetest.NewTxID(), Terminal: i%2 == 0}
+	}
+
+	before := gfs.syncs.Load()
+	counts, err := s.SpendBatch(ctx, "main", reqs)
+	require.NoError(t, err)
+	require.Equal(t, []int{2, 2, 2}, counts)
+	require.Equal(t, before+1, gfs.syncs.Load(), "one WAL sync for the whole batch")
 }
