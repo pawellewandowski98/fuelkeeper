@@ -12,6 +12,13 @@
 // lifecycle is driven entirely by explicit state transitions (Reserve,
 // Release, Spend, Quarantine, Resolve, RetireShard), never by MongoDB
 // expiring a document out from under a live reservation.
+//
+// The store does not implement store.SpendBatcher: with no shared
+// transaction a batch of Spend calls could not be the single all-or-nothing
+// write SpendBatch's retry contract requires, and it would still cost one
+// conditional update per document, so there is little for a native batch to
+// amortise yet. The pool's spend batcher
+// therefore falls back to one Spend call per request against this backend.
 package mongodb
 
 import (

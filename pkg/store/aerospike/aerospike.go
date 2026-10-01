@@ -99,6 +99,14 @@
 //     string): created only when Config.KeyPrefix is set (production
 //     records carry no tn bin at all), and used only by Truncate to delete
 //     exactly one tenant's records from each set.
+//
+// # Spend batching
+//
+// The store does not implement store.SpendBatcher: without multi-record
+// transactions a batch of Spend calls cannot be applied as one atomic,
+// all-or-nothing write, which is what SpendBatch's retry contract requires.
+// The pool's spend batcher therefore falls back to one Spend call per request
+// against this backend.
 package aerospike
 
 import (
