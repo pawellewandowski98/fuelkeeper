@@ -172,7 +172,7 @@ func TestNullnetHeightCounterIncreases(t *testing.T) {
 	a, b := storetest.NewTxID(), storetest.NewTxID()
 	mine(a)
 	mine(b)
-	var heights []uint32
+	heights := make([]uint32, 0, 2)
 	for _, txid := range []chainhash.Hash{a, b} {
 		st, err := orc.Tx(context.Background(), txid)
 		require.NoError(t, err)
