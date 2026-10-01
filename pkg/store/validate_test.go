@@ -200,3 +200,42 @@ func TestValidateReserveOpsRejectsPreEpochExpiry(t *testing.T) {
 	ok := []store.ReserveOp{{Outpoint: store.Outpoint{TxID: hashN(1), Vout: 0}, Token: tok, ExpiresAt: time.Now().Add(time.Minute)}}
 	require.NoError(t, store.ValidateReserveOps(ok, 10))
 }
+
+func TestValidateSpendRequest(t *testing.T) {
+	tok := store.NewToken()
+	op := func(v uint32) store.Outpoint { return store.Outpoint{TxID: hashN(1), Vout: v} }
+	ok := store.SpendRequest{Token: tok, Ops: []store.Outpoint{op(0), op(1)}, TxID: hashN(9), Terminal: true}
+	require.NoError(t, store.ValidateSpendRequest(ok, 10))
+
+	hint := ok
+	hint.Terminal, hint.TxID = false, chainhash.Hash{}
+	require.NoError(t, store.ValidateSpendRequest(hint, 10), "non-terminal accepts a zero txid")
+
+	for name, bad := range map[string]store.SpendRequest{
+		"zero token":              {Ops: ok.Ops, TxID: ok.TxID},
+		"empty ops":               {Token: tok, TxID: ok.TxID},
+		"duplicate outpoint":      {Token: tok, Ops: []store.Outpoint{op(0), op(0)}, TxID: ok.TxID},
+		"too many ops":            {Token: tok, Ops: []store.Outpoint{op(0), op(1), op(2)}, TxID: ok.TxID},
+		"terminal with zero txid": {Token: tok, Ops: ok.Ops, Terminal: true},
+	} {
+		require.ErrorIs(t, store.ValidateSpendRequest(bad, 2), store.ErrInvalidArgument, name)
+	}
+}
+
+func TestValidateSpendBatch(t *testing.T) {
+	tok := store.NewToken()
+	req := func(vs ...uint32) store.SpendRequest {
+		r := store.SpendRequest{Token: tok, TxID: hashN(9)}
+		for _, v := range vs {
+			r.Ops = append(r.Ops, store.Outpoint{TxID: hashN(1), Vout: v})
+		}
+		return r
+	}
+	require.NoError(t, store.ValidateSpendBatch([]store.SpendRequest{req(0, 1), req(1, 2)}, 4),
+		"the same outpoint in two requests is allowed; the later one simply finds it already spent")
+	require.ErrorIs(t, store.ValidateSpendBatch(nil, 4), store.ErrInvalidArgument, "empty batch")
+	require.ErrorIs(t, store.ValidateSpendBatch([]store.SpendRequest{req(0, 1), req(2, 3), req(4)}, 4),
+		store.ErrInvalidArgument, "total outpoints over maxBatch")
+	require.ErrorIs(t, store.ValidateSpendBatch([]store.SpendRequest{req(0), {Token: tok}}, 4),
+		store.ErrInvalidArgument, "one invalid request rejects the batch")
+}

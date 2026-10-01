@@ -227,3 +227,45 @@ type Leaser interface {
 	// (Named ReleaseLease because Store.Release is the row operation.)
 	ReleaseLease(ctx context.Context, name, holder string) error
 }
+
+// SpendRequest is one Spend call's arguments, as carried by SpendBatch.
+type SpendRequest struct {
+	Token    Token
+	Ops      []Outpoint
+	TxID     chainhash.Hash
+	Terminal bool
+}
+
+// SpendBatcher is an optional Store extension: a backend that implements it
+// can apply many Spend calls in one durable write (one transaction, one
+// fsync), which is what lets the pool group-commit spend reports from many
+// concurrent callers (pkg/pool's spend batcher). A backend that does not
+// implement it simply gets one Spend call per request.
+//
+// SpendBatch applies reqs in one durable write and returns, per request,
+// exactly what Spend(ctx, pool, r.Token, r.Ops, r.TxID, r.Terminal) would
+// have returned had the requests been applied one after another in slice
+// order: the same outpoint named by two requests is moved by the first one
+// whose token holds it, and every later request counts 0 for it. Every
+// request in a batch is stamped with the same now. The rows a batch moves end
+// up exactly as sequential Spend calls would leave them (state, provenance,
+// SpentHint/SpentBy), apart from that shared UpdatedAt/QuarantinedAt.
+//
+// Validation is batch-level: ValidateSpendBatch (pool, 1..Caps.MaxBatch
+// requests whose outpoints total at most Caps.MaxBatch, and every request
+// valid exactly as Spend validates its own arguments). One invalid request
+// fails the whole batch with ErrInvalidArgument and applies nothing, so a
+// caller must pre-validate each request with ValidateSpendRequest (the pool
+// does) and never submit one that Spend itself would reject.
+//
+// An error means none of the batch is known to be applied: it may have
+// committed in full or not at all (never partially -- it is one atomic
+// write), so the whole batch may be retried. A retry is state-safe, because
+// Spend is a compare-and-set on reserved(token): a row the first attempt
+// already moved is no longer reserved, so the retry can neither move it again
+// nor overwrite its SpentHint/SpentBy. It is not count-preserving, though: a
+// retry after an in-doubt commit reports 0 for every row the lost attempt
+// moved, exactly as a sequential Spend replay would.
+type SpendBatcher interface {
+	SpendBatch(ctx context.Context, pool string, reqs []SpendRequest) ([]int, error)
+}

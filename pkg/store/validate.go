@@ -282,3 +282,38 @@ func ValidateResolve(to State, spentBy *chainhash.Hash) error {
 		return invalidf("resolve target must be available or spent, got %s", to)
 	}
 }
+
+// ValidateSpendRequest checks one SpendRequest exactly as Spend checks its
+// own arguments: a non-zero token, 1..maxBatch distinct outpoints
+// (ValidateOutpoints), and a txid/terminal combination ValidateSpend accepts.
+func ValidateSpendRequest(r SpendRequest, maxBatch int) error {
+	if err := ValidateOutpoints(r.Ops, maxBatch); err != nil {
+		return err
+	}
+	if r.Token.IsZero() {
+		return invalidf("spend request has a zero token")
+	}
+	return ValidateSpend(r.TxID, r.Terminal)
+}
+
+// ValidateSpendBatch checks a SpendBatch call's requests: 1..maxBatch
+// requests whose outpoints total at most maxBatch, every one valid by
+// ValidateSpendRequest. The same outpoint may appear in more than one request
+// (the later request just finds it no longer reserved); it may not appear
+// twice within one request. One invalid request rejects the whole batch.
+func ValidateSpendBatch(reqs []SpendRequest, maxBatch int) error {
+	if len(reqs) == 0 || len(reqs) > maxBatch {
+		return invalidf("spend batch must have 1..%d requests, got %d", maxBatch, len(reqs))
+	}
+	total := 0
+	for i, r := range reqs {
+		if err := ValidateSpendRequest(r, maxBatch); err != nil {
+			return fmt.Errorf("spend request %d: %w", i, err)
+		}
+		total += len(r.Ops)
+	}
+	if total > maxBatch {
+		return invalidf("spend batch must have at most %d outpoints in total, got %d", maxBatch, total)
+	}
+	return nil
+}
