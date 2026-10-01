@@ -153,3 +153,46 @@ func TestMockMinedBEEFIsRealBEEF(t *testing.T) {
 	_, err = m.MinedBEEF(ctx, built.Shard.TxID, built.Shard.BEEF, mp)
 	assert.ErrorIs(t, err, injected)
 }
+
+// TestSingleTxMerklePathBYTES verifies that SingleTxMerklePath produces
+// parseable BRC-74 (BUMP) bytes that can be decoded by go-sdk and contain
+// the expected merkle path structure for a single-transaction block.
+func TestSingleTxMerklePathBytes(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+	built, err := m.Build(ctx, treasury.MintRequest{Pool: "main", Denomination: 50, Count: 1})
+	require.NoError(t, err)
+
+	const height = 42
+	bumpBytes := mock.SingleTxMerklePath(built.Shard.TxID, height)
+	require.NotEmpty(t, bumpBytes)
+
+	// Parse the BUMP bytes with go-sdk
+	mp, err := transaction.NewMerklePathFromBinary(bumpBytes)
+	require.NoError(t, err, "SingleTxMerklePath must produce parseable BRC-74 BUMP bytes")
+
+	// Assert BlockHeight matches
+	assert.Equal(t, uint32(height), mp.BlockHeight, "BlockHeight must match the requested height")
+
+	// Assert exactly one level with exactly one leaf
+	require.Len(t, mp.Path, 1, "single-tx block must have exactly one level")
+	require.Len(t, mp.Path[0], 1, "single-tx block must have exactly one leaf at level 0")
+
+	leaf := mp.Path[0][0]
+
+	// Assert Offset is 0
+	assert.Equal(t, uint64(0), leaf.Offset, "leaf offset must be 0")
+
+	// Assert Hash equals txid
+	require.NotNil(t, leaf.Hash, "leaf hash must be set")
+	assert.Equal(t, built.Shard.TxID, *leaf.Hash, "leaf hash must be the txid")
+
+	// Assert Txid flag is true
+	require.NotNil(t, leaf.Txid, "Txid flag must be set")
+	assert.True(t, *leaf.Txid, "Txid flag must be true")
+
+	// Assert ComputeRoot(&txid) equals txid
+	root, err := mp.ComputeRoot(&built.Shard.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, built.Shard.TxID, *root, "ComputeRoot must equal the txid for a single-tx block")
+}
