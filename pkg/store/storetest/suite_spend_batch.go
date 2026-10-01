@@ -229,12 +229,21 @@ func testSpendBatchDifferential(t *testing.T, newStore Factory) {
 			reqs[i] = randomRequest(rng, reqToks, tw.ops, txids, 6)
 		}
 		if len(reqs) > 1 && round%3 == 0 {
-			// The same outpoint in two requests of one batch, under the same
-			// token: only the earlier request may count it.
-			dup := reqs[0].Ops[0]
-			reqs[len(reqs)-1].Token = reqs[0].Token
-			if !containsOp(reqs[len(reqs)-1].Ops, dup) {
-				reqs[len(reqs)-1].Ops = append(reqs[len(reqs)-1].Ops, dup)
+			// The same outpoint in two requests of one batch, both under the
+			// token that actually holds it: only the earlier request may
+			// count it.
+			for op, r := range RowsByOutpoint(t, tw.seq, "main", tw.mainOps) {
+				if r.State != store.StateReserved {
+					continue
+				}
+				first, last := &reqs[0], &reqs[len(reqs)-1]
+				first.Token, last.Token = r.ReservedBy, r.ReservedBy
+				for _, q := range []*store.SpendRequest{first, last} {
+					if !containsOp(q.Ops, op) {
+						q.Ops = append(q.Ops, op)
+					}
+				}
+				break
 			}
 		}
 		tw.apply(t, reqs)
