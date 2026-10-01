@@ -471,6 +471,9 @@ func (p *Pool) BEEF(ctx context.Context, txid chainhash.Hash) ([]byte, int64, st
 }
 
 func mapStoreErr(err error) error {
+	if errors.Is(err, ErrBadRequest) || errors.Is(err, ErrUnavailable) {
+		return err // already a pool error (e.g. from the spend coalescer)
+	}
 	if errors.Is(err, store.ErrInvalidArgument) {
 		return fmt.Errorf("%w: %w", ErrBadRequest, err)
 	}

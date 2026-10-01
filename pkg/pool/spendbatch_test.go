@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -398,6 +399,7 @@ func TestPoolSpendGoesThroughSpendBatch(t *testing.T) {
 	dup := []store.Outpoint{res.Outputs[0].Outpoint, res.Outputs[0].Outpoint}
 	_, err = p.Spend(ctx, res.Token, dup, storetest.NewTxID())
 	require.ErrorIs(t, err, pool.ErrBadRequest)
+	assert.Equal(t, 1, strings.Count(err.Error(), pool.ErrBadRequest.Error()), "not wrapped twice: %v", err)
 	assert.Len(t, cb.Calls(), 1)
 }
 
