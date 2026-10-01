@@ -94,7 +94,7 @@ func newTwin(t *testing.T, newStore Factory, shards, size int) *twin {
 	for range shards {
 		put("main", size)
 	}
-	put("other", 4) // outpoints that exist, but in another pool
+	put("other", 4)                                                   // outpoints that exist, but in another pool
 	tw.ops = append(tw.ops, store.Outpoint{TxID: NewTxID(), Vout: 0}) // an outpoint no store has
 	return tw
 }
