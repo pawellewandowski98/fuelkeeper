@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -292,8 +293,16 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 	if err := store.ValidateSpend(txid, terminal); err != nil {
 		return 0, err
 	}
+	sqlText, arg := spendStatement(txid, terminal)
+	return s.updateReserved(ctx, pool, token, ops, sqlText, arg)
+}
+
+// spendStatement returns the per-row statement Spend sends for one
+// txid/terminal combination and its trailing $6 argument (see
+// updateReservedWhereSQL).
+func spendStatement(txid chainhash.Hash, terminal bool) (string, any) {
 	if terminal {
-		return s.updateReserved(ctx, pool, token, ops, spendTerminalRowSQL, txid[:])
+		return spendTerminalRowSQL, txid[:]
 	}
 	// A zero txid is only a client-supplied hint, not an oracle-proven fact (see
 	// ValidateSpend): pass NULL rather than 32 zero bytes so SpentHint scans back
@@ -302,7 +311,79 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 	if txid != (chainhash.Hash{}) {
 		hint = txid[:]
 	}
-	return s.updateReserved(ctx, pool, token, ops, spendHintRowSQL, hint)
+	return spendHintRowSQL, hint
+}
+
+// SpendBatch implements store.SpendBatcher in one transaction with one
+// COMMIT. Like updateReserved, it sends one single-row point UPDATE per
+// (request, outpoint) pair, pipelined as one pgx.Batch -- never a multi-row
+// unnest statement (see the package doc) -- but ordered across the whole
+// batch: every pair is sorted by the global (txid, vout) order
+// (store.LessOutpoint), so this transaction acquires its row locks in the
+// same order as every other batch, SpendBatch or not, and cannot deadlock
+// with them. Pairs naming the same outpoint keep their request order (a
+// stable sort on request index), and each UPDATE re-asserts reserved(token)
+// against what the earlier ones in this transaction left behind, so a row's
+// outcome is exactly what sequential Spend calls in slice order would give.
+// Each UPDATE's row count is attributed back to its own request.
+func (s *Store) SpendBatch(ctx context.Context, pool string, reqs []store.SpendRequest) ([]int, error) {
+	if err := store.ValidatePool(pool); err != nil {
+		return nil, err
+	}
+	if err := store.ValidateSpendBatch(reqs, maxBatch); err != nil {
+		return nil, err
+	}
+	type pair struct {
+		op  store.Outpoint
+		req int
+	}
+	var pairs []pair
+	for i, r := range reqs {
+		for _, op := range r.Ops {
+			pairs = append(pairs, pair{op: op, req: i})
+		}
+	}
+	slices.SortStableFunc(pairs, func(a, b pair) int {
+		switch {
+		case store.LessOutpoint(a.op, b.op):
+			return -1
+		case store.LessOutpoint(b.op, a.op):
+			return 1
+		}
+		return a.req - b.req
+	})
+	now := s.now()
+	type stmt struct {
+		sql string
+		arg any
+	}
+	stmts := make([]stmt, len(reqs))
+	for i, r := range reqs {
+		stmts[i].sql, stmts[i].arg = spendStatement(r.TxID, r.Terminal)
+	}
+	batch := &pgx.Batch{}
+	for _, p := range pairs {
+		r := &reqs[p.req]
+		batch.Queue(stmts[p.req].sql, pool, p.op.TxID[:], int32(p.op.Vout), r.Token[:], now, stmts[p.req].arg) //nolint:gosec // bounded
+	}
+	counts := make([]int, len(reqs))
+	err := s.tx(ctx, func(tx pgx.Tx) error {
+		clear(counts)
+		br := tx.SendBatch(ctx, batch)
+		for _, p := range pairs {
+			tag, err := br.Exec()
+			if err != nil {
+				_ = br.Close()
+				return err
+			}
+			counts[p.req] += int(tag.RowsAffected())
+		}
+		return br.Close()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return counts, nil
 }
 
 // Quarantine implements store.Store.

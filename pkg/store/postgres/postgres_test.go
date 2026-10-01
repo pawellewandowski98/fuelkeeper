@@ -95,3 +95,5 @@ func TestSynchronousCommitOffRejected(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
 }
+
+var _ store.SpendBatcher = (*postgres.Store)(nil)
