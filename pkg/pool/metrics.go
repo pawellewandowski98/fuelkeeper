@@ -87,6 +87,12 @@ var (
 	spendFlushRetries = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fuelkeeper_spend_flush_retries_total", Help: "SpendBatch attempts retried after ErrUnavailable or a per-attempt timeout.",
 	}, []string{"pool"})
+	spendInflightOps = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "fuelkeeper_spend_inflight_ops", Help: "Outpoints in spend requests queued plus those currently in a spend flush.",
+	}, []string{"pool"})
+	spendBackpressure = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fuelkeeper_spend_backpressure_total", Help: "Spend requests rejected because the spend batcher's in-flight outpoint limit was reached.",
+	}, []string{"pool"})
 	spendFallback = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fuelkeeper_spend_fallback_total", Help: "Spend store writes made one per request, unbatched, by reason (unsupported: the store has no SpendBatch; disabled: spend_batching.enabled is false).",
 	}, []string{"pool", "reason"})

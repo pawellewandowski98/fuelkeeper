@@ -18,6 +18,8 @@ var (
 	SpendFlushSeconds     = spendFlushSeconds
 	SpendFallback         = spendFallback
 	SpendFlushRetries     = spendFlushRetries
+	SpendInflightOps      = spendInflightOps
+	SpendBackpressure     = spendBackpressure
 )
 
 // Tombstones reports how many forgotten-row tombstones the allocator holds.

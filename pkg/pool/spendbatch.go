@@ -86,6 +86,8 @@ type SpendCoalescer struct {
 	stopped  atomic.Bool
 	flushes  sync.WaitGroup
 
+	inflightGauge  prometheus.Gauge
+	rejected       prometheus.Counter
 	batchSizeObs   prometheus.Observer
 	flushObs       prometheus.Observer
 	storeOpObs     prometheus.Observer
@@ -101,6 +103,8 @@ func NewSpendCoalescer(st store.SpendBatcher, pool string, cfg SpendCoalescerCon
 		cfg:            cfg,
 		kick:           make(chan struct{}, 1),
 		slots:          make(chan struct{}, cfg.Slots),
+		inflightGauge:  spendInflightOps.WithLabelValues(pool),
+		rejected:       spendBackpressure.WithLabelValues(pool),
 		batchSizeObs:   spendBatchSize.WithLabelValues(pool),
 		flushObs:       spendFlushSeconds.WithLabelValues(pool),
 		storeOpObs:     storeOpLatency.WithLabelValues(pool, "spend_batch"),
@@ -154,16 +158,25 @@ func (c *SpendCoalescer) Submit(ctx context.Context, req store.SpendRequest) (in
 	return r.n, r.err
 }
 
+// addInflight moves the inflight counter and its exported gauge by the same
+// delta (Add, not Set, for the reason Coalescer.addInflight gives).
+func (c *SpendCoalescer) addInflight(n int64) int64 {
+	v := c.inflight.Add(n)
+	c.inflightGauge.Add(float64(n))
+	return v
+}
+
 func (c *SpendCoalescer) enqueue(r *spendReq) error {
 	n := int64(len(r.req.Ops))
-	if c.inflight.Add(n) > int64(c.cfg.MaxInflightOps) {
-		c.inflight.Add(-n)
+	if c.addInflight(n) > int64(c.cfg.MaxInflightOps) {
+		c.addInflight(-n)
+		c.rejected.Inc()
 		return ErrBackpressure
 	}
 	c.mu.Lock()
 	if c.stopped.Load() {
 		c.mu.Unlock()
-		c.inflight.Add(-n)
+		c.addInflight(-n)
 		return ErrUnavailable
 	}
 	c.pending = append(c.pending, r)
@@ -186,7 +199,7 @@ func (c *SpendCoalescer) withdraw(r *spendReq) bool {
 	for i, p := range c.pending {
 		if p == r {
 			c.pending = append(c.pending[:i], c.pending[i+1:]...)
-			c.inflight.Add(-int64(len(r.req.Ops)))
+			c.addInflight(-int64(len(r.req.Ops)))
 			return true
 		}
 	}
@@ -274,7 +287,7 @@ func (c *SpendCoalescer) shutdown() error {
 	}
 	c.mu.Unlock()
 	for _, r := range pending {
-		c.inflight.Add(-int64(len(r.req.Ops)))
+		c.addInflight(-int64(len(r.req.Ops)))
 		r.err = ErrUnavailable
 		close(r.done)
 	}
@@ -302,7 +315,7 @@ func (c *SpendCoalescer) flush(base context.Context, batch []*spendReq) {
 		reqs[i] = r.req
 		total += len(r.req.Ops)
 	}
-	defer c.inflight.Add(-int64(total))
+	defer c.addInflight(-int64(total))
 	c.batchSizeObs.Observe(float64(len(batch)))
 
 	var counts []int

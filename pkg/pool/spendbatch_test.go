@@ -87,7 +87,14 @@ func (c *countingBatcher) Calls() [][]store.SpendRequest {
 
 func startSpendCoalescer(t *testing.T, st store.SpendBatcher, cfg pool.SpendCoalescerConfig) *pool.SpendCoalescer {
 	t.Helper()
-	c := pool.NewSpendCoalescer(st, "main", cfg)
+	return startSpendCoalescerNamed(t, st, "main", cfg)
+}
+
+// startSpendCoalescerNamed is startSpendCoalescer under its own pool label,
+// for tests that read this pool's metrics.
+func startSpendCoalescerNamed(t *testing.T, st store.SpendBatcher, poolName string, cfg pool.SpendCoalescerConfig) *pool.SpendCoalescer {
+	t.Helper()
+	c := pool.NewSpendCoalescer(st, poolName, cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); _ = c.Run(ctx) }()
@@ -309,7 +316,11 @@ func TestSpendCoalescerBackpressure(t *testing.T) {
 	st, reqs := reservedFixture(t, 20)
 	cb := newCountingBatcher(st)
 	cb.hold = make(chan struct{})
-	c := startSpendCoalescer(t, cb, pool.SpendCoalescerConfig{Slots: 1, MaxBatch: 4, MaxInflightOps: 6})
+	const poolName = "spend-backpressure" // rows live in "main": the flushes count 0, which is fine here
+	c := startSpendCoalescerNamed(t, cb, poolName, pool.SpendCoalescerConfig{Slots: 1, MaxBatch: 4, MaxInflightOps: 6})
+	inflight := pool.SpendInflightOps.WithLabelValues(poolName)
+	rejected := pool.SpendBackpressure.WithLabelValues(poolName)
+	rejectedBefore := testutil.ToFloat64(rejected)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -320,10 +331,15 @@ func TestSpendCoalescerBackpressure(t *testing.T) {
 		go func() { defer wg.Done(); _, _ = c.Submit(context.Background(), reqs[i]) }()
 		waitPending(t, c, i)
 	}
+	assert.InDelta(t, 6, testutil.ToFloat64(inflight), 0, "2 ops in flight + 4 queued")
 	_, err := c.Submit(context.Background(), reqs[3])
 	require.ErrorIs(t, err, pool.ErrBackpressure)
+	assert.InDelta(t, rejectedBefore+1, testutil.ToFloat64(rejected), 0)
+	assert.InDelta(t, 6, testutil.ToFloat64(inflight), 0, "a rejected request leaves the gauge unchanged")
 	close(cb.hold)
 	wg.Wait()
+	require.Eventually(t, func() bool { return testutil.ToFloat64(inflight) == 0 }, 5*time.Second, time.Millisecond,
+		"the gauge returns to 0 once every flush settles")
 }
 
 func TestSpendCoalescerRejectsInvalidRequests(t *testing.T) {
