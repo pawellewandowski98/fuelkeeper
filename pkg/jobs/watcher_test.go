@@ -7,10 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bsv-blockchain/fuelkeeper/pkg/fuel"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/jobs"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/oracle"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/pool"
@@ -88,7 +90,7 @@ func TestWatcherMinesRetiresAndResends(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, storedBEEF.BEEF, "the minted shard must have stored BEEF for MinedBEEF to thread through")
 
-	orc.SetTx(mined.Shard.TxID, oracle.TxStatus{Known: true, Mined: true, BlockHeight: 7, MerklePath: []byte{9, 9}})
+	orc.SetTx(mined.Shard.TxID, oracle.TxStatus{Known: true, Mined: true, BlockHeight: 7, MerklePath: mock.SingleTxMerklePath(mined.Shard.TxID, 7)})
 	orc.SetTx(rejected.Shard.TxID, oracle.TxStatus{Known: true, Rejected: true, Status: "REJECTED"})
 	orc.SetTx(pending.Shard.TxID, oracle.TxStatus{Known: true, Status: "SEEN_ON_NETWORK"})
 	// lost: oracle has never seen it
@@ -99,10 +101,19 @@ func TestWatcherMinesRetiresAndResends(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, store.ShardMined, sh.Status)
 	assert.Equal(t, int64(2), sh.Version)
-	wantBEEF := append([]byte("mock-mined-beef-"), mined.Shard.TxID[:]...)
-	wantBEEF = append(wantBEEF, storedBEEF.BEEF...)
-	wantBEEF = append(wantBEEF, 9, 9)
-	assert.Equal(t, wantBEEF, sh.BEEF, "the watcher threads the shard's stored unmined BEEF (from GetShard) into MinedBEEF, not just the txid and merkle path")
+
+	parsed, err := transaction.NewBeefFromBytes(sh.BEEF)
+	require.NoError(t, err, "the watcher must store real, parseable BEEF for a mined shard")
+	minedTx := parsed.FindTransaction(mined.Shard.TxID.String())
+	require.NotNil(t, minedTx)
+	require.NotNil(t, minedTx.MerklePath, "mined BEEF carries the bump")
+	assert.Equal(t, uint32(7), minedTx.MerklePath.BlockHeight)
+	root, err := minedTx.MerklePath.ComputeRoot(&mined.Shard.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, mined.Shard.TxID.String(), root.String())
+	wantRaw, err := fuel.RawTxFromBEEF(storedBEEF.BEEF, mined.Shard.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, wantRaw, minedTx.Bytes(), "the watcher threads the shard's stored unmined BEEF (from GetShard) into MinedBEEF, not just the txid and merkle path")
 
 	sh, err = st.GetShard(ctx, "main", rejected.Shard.TxID)
 	require.NoError(t, err)
@@ -139,7 +150,7 @@ func TestWatcherMinesRetiresAndResends(t *testing.T) {
 
 	// A mined verdict whose BEEF cannot be built leaves the shard unmined for the next tick.
 	tr.FailMinedBEEF(errors.New("bad bump"))
-	orc.SetTx(lost.Shard.TxID, oracle.TxStatus{Known: true, Mined: true, BlockHeight: 8, MerklePath: []byte{1}})
+	orc.SetTx(lost.Shard.TxID, oracle.TxStatus{Known: true, Mined: true, BlockHeight: 8, MerklePath: mock.SingleTxMerklePath(lost.Shard.TxID, 8)})
 	require.NoError(t, w.RunOnce(ctx))
 	sh, err = st.GetShard(ctx, "main", lost.Shard.TxID)
 	require.NoError(t, err)
@@ -249,8 +260,8 @@ func TestWatcherRotationChecksWholeBacklogWithinBound(t *testing.T) {
 	m1 := mintViaTreasury(ctx, t, st, tr, "main", 1)
 	clk.Advance(time.Millisecond)
 	m2 := mintViaTreasury(ctx, t, st, tr, "main", 1)
-	orc.SetTx(m1.Shard.TxID, oracle.TxStatus{Known: true, Mined: true, BlockHeight: 7, MerklePath: []byte{1}})
-	orc.SetTx(m2.Shard.TxID, oracle.TxStatus{Known: true, Mined: true, BlockHeight: 7, MerklePath: []byte{2}})
+	orc.SetTx(m1.Shard.TxID, oracle.TxStatus{Known: true, Mined: true, BlockHeight: 7, MerklePath: mock.SingleTxMerklePath(m1.Shard.TxID, 7)})
+	orc.SetTx(m2.Shard.TxID, oracle.TxStatus{Known: true, Mined: true, BlockHeight: 7, MerklePath: mock.SingleTxMerklePath(m2.Shard.TxID, 7)})
 
 	for range 4 {
 		require.NoError(t, w.RunOnce(ctx))

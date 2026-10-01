@@ -237,19 +237,37 @@ func (t *Treasury) LastSendBEEF(txid chainhash.Hash) []byte {
 	return cloneBytes(t.sendBEEF[txid])
 }
 
-// MinedBEEF returns a synthetic mined BEEF: a marker, the txid, the stored
-// unmined BEEF and the BUMP bytes. Incorporating unminedBEEF lets a caller
-// prove that the shard's actual stored BEEF (from GetShard, since ListShards
-// omits it) was threaded through, not e.g. a nil or truncated value.
+// MinedBEEF converts a shard's stored unmined BEEF and the oracle's BUMP
+// into the real mined BEEF v2 (the raw split tx plus the BUMP), delegating
+// to fuel.MinedBEEF exactly as the toolbox treasury does (see
+// pkg/treasury/toolbox/core.go). A nullnet-served shard's BEEF is therefore
+// just as parseable by a real wallet as a toolbox-served one.
 func (t *Treasury) MinedBEEF(_ context.Context, txid chainhash.Hash, unminedBEEF, merklePath []byte) ([]byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.failMinedBEEF != nil {
 		return nil, t.failMinedBEEF
 	}
-	out := append([]byte("mock-mined-beef-"), txid[:]...)
-	out = append(out, unminedBEEF...)
-	return append(out, merklePath...), nil
+	return fuel.MinedBEEF(unminedBEEF, txid, merklePath)
+}
+
+// SingleTxMerklePath returns the serialised BRC-74 (BUMP) bytes for a
+// single-transaction block at height whose root is txid itself: one leaf at
+// offset 0, naming txid, with the Txid flag set. This is what a "block"
+// containing only one transaction (the common case for a freshly mined
+// split) looks like as a merkle path, and it is real enough that
+// fuel.MinedBEEF and (*transaction.Beef).Verify both accept it -- unlike a
+// fabricated placeholder such as []byte{0}.
+//
+// Used by cmd/fuelkeeper/serve.go's nullnet mock-treasury send hook, and by
+// tests that need a real mined merkle path for Treasury.MinedBEEF, so both
+// share the exact same construction.
+func SingleTxMerklePath(txid chainhash.Hash, height uint32) []byte {
+	isTxid := true
+	mp := transaction.NewMerklePath(height, [][]*transaction.PathElement{{
+		{Offset: 0, Hash: &txid, Txid: &isTxid},
+	}})
+	return mp.Bytes()
 }
 
 // splitTx builds a real (unsigned, unfunded) split transaction: one dummy

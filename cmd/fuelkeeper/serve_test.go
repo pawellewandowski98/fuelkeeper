@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
@@ -16,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -28,8 +31,11 @@ import (
 // TestServeSmokeNullnet runs the full "nullnet" pipeline end to end: a memory
 // store, a mock oracle/treasury with no real chain, jobs enabled. It waits
 // for the minter+watcher+mock-treasury pipeline to mint and mine a shard,
-// exercises reserve/spend/release through pkg/client, checks readyz, and
-// finally confirms graceful shutdown.
+// fetches that mined shard's BEEF exactly as a real wallet would (via
+// InputBEEF) and confirms it is real, parseable BEEF with a merkle path
+// proving the split tx at the reported height and intact fuel-output
+// locking scripts, exercises reserve/spend/release through pkg/client,
+// checks readyz, and finally confirms graceful shutdown.
 func TestServeSmokeNullnet(t *testing.T) {
 	cfg := `
 store:
@@ -86,6 +92,39 @@ log:
 	res, err := c.Reserve(ctx, "main", client.ReserveRequest{Count: 3})
 	require.NoError(t, err)
 	assert.Len(t, res.Outputs, 3)
+
+	// The default serve_policy (mined_only) guarantees every reserved output
+	// above came from a mined shard, i.e. one that has been through
+	// pkg/jobs.Watcher.mine and the nullnet mock treasury's MinedBEEF. Fetch
+	// that shard's BEEF exactly as a real wallet would (InputBEEF, same as
+	// go-sdk's transaction.NewBeefFromBytes expects) and confirm it is real,
+	// parseable BEEF -- not the unparseable "mock-mined-beef-" marker the
+	// nullnet pipeline used to store.
+	beef, err := c.InputBEEF(ctx, "main", res)
+	require.NoError(t, err)
+	parsedBEEF, err := transaction.NewBeefFromBytes(beef)
+	require.NoError(t, err, "a real wallet must be able to parse a nullnet shard's BEEF")
+	require.NotEmpty(t, res.Shards, "reserve names the shard(s) backing the reserved outputs")
+	for _, sh := range res.Shards {
+		txid, err := chainhash.NewHashFromHex(sh.TxID)
+		require.NoError(t, err)
+		tx := parsedBEEF.FindTransaction(sh.TxID)
+		require.NotNil(t, tx, "the split tx for shard %s must be in its own BEEF", sh.TxID)
+		require.NotNil(t, tx.MerklePath, "a mined shard's BEEF must carry a merkle path (BUMP)")
+		root, err := tx.MerklePath.ComputeRoot(txid)
+		require.NoError(t, err)
+		assert.Equal(t, sh.TxID, root.String(), "the BUMP's computed root is the shard's own txid (single-tx block)")
+		assert.GreaterOrEqual(t, tx.MerklePath.BlockHeight, uint32(1), "the reported height is the synthetic height set when the shard was mined")
+	}
+	for _, o := range res.Outputs {
+		tx := parsedBEEF.FindTransaction(o.TxID)
+		require.NotNil(t, tx)
+		require.Greater(t, len(tx.Outputs), int(o.Vout))
+		wantLock, err := hex.DecodeString(o.LockingScript)
+		require.NoError(t, err)
+		assert.Equal(t, wantLock, []byte(*tx.Outputs[o.Vout].LockingScript), "the fuel output's locking script is intact in the mined BEEF")
+	}
+
 	n, err := c.Spend(ctx, "main", res.Token, []string{res.Outputs[0].Outpoint}, strings.Repeat("ab", 32))
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)

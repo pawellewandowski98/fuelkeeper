@@ -2,6 +2,7 @@ package mock_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/bsv-blockchain/go-sdk/transaction"
@@ -110,4 +111,45 @@ func TestMockBEEFIsRealSplit(t *testing.T) {
 	merged := transaction.NewBeefV2()
 	require.NoError(t, merged.MergeBeefBytes(built.Shard.BEEF), "the BEEF merges the way client.InputBEEF merges it")
 	assert.NotNil(t, merged.FindTransaction(built.Shard.TxID.String()))
+}
+
+// TestMockMinedBEEFIsRealBEEF guards the nullnet bug where a mined shard's
+// stored BEEF became an unparseable "mock-mined-beef-" marker: MinedBEEF must
+// delegate to fuel.MinedBEEF and return real, parseable BEEF whose BUMP
+// (built by SingleTxMerklePath, the same helper cmd/fuelkeeper/serve.go's
+// nullnet hook uses) proves the split tx at the reported height, with the
+// rows' locking scripts untouched.
+func TestMockMinedBEEFIsRealBEEF(t *testing.T) {
+	ctx := context.Background()
+	m := mock.New()
+	built, err := m.Build(ctx, treasury.MintRequest{Pool: "main", Denomination: 50, Count: 2})
+	require.NoError(t, err)
+	require.NoError(t, m.Send(ctx, built.Shard.TxID, built.Shard.BEEF))
+
+	const height = 42
+	mp := mock.SingleTxMerklePath(built.Shard.TxID, height)
+	minedBEEF, err := m.MinedBEEF(ctx, built.Shard.TxID, built.Shard.BEEF, mp)
+	require.NoError(t, err)
+
+	parsed, err := transaction.NewBeefFromBytes(minedBEEF)
+	require.NoError(t, err, "a mined shard's BEEF must stay parseable by a real wallet")
+	tx := parsed.FindTransaction(built.Shard.TxID.String())
+	require.NotNil(t, tx)
+	require.NotNil(t, tx.MerklePath, "mined BEEF carries the bump")
+	assert.Equal(t, uint32(height), tx.MerklePath.BlockHeight)
+	root, err := tx.MerklePath.ComputeRoot(&built.Shard.TxID)
+	require.NoError(t, err)
+	assert.Equal(t, built.Shard.TxID.String(), root.String())
+
+	assert.Equal(t, built.RawTx, tx.Bytes())
+	require.Len(t, tx.Outputs, len(built.Rows), "no change output")
+	for i, r := range built.Rows {
+		assert.Equal(t, r.LockingScript, []byte(*tx.Outputs[i].LockingScript), "row %d locking script is intact", i)
+	}
+
+	// FailMinedBEEF still short-circuits before fuel.MinedBEEF runs.
+	injected := errors.New("bad bump")
+	m.FailMinedBEEF(injected)
+	_, err = m.MinedBEEF(ctx, built.Shard.TxID, built.Shard.BEEF, mp)
+	assert.ErrorIs(t, err, injected)
 }

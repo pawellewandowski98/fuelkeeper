@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -25,6 +26,7 @@ import (
 	"github.com/bsv-blockchain/fuelkeeper/pkg/store/factory"
 	"github.com/bsv-blockchain/fuelkeeper/pkg/treasury"
 	tfactory "github.com/bsv-blockchain/fuelkeeper/pkg/treasury/factory"
+	"github.com/bsv-blockchain/fuelkeeper/pkg/treasury/mock"
 )
 
 // shutdownTimeout bounds how long graceful HTTP shutdown waits for
@@ -138,14 +140,30 @@ type openedTreasury struct {
 // "toolbox" it opens the wallet storage and starts the toolbox services; a
 // config error returns before that. The store is never touched, so an
 // invalid kind fails before a sqlite file or postgres pool is created.
+//
+// The reported merkle path is a real BRC-74 BUMP (mock.SingleTxMerklePath):
+// a single-transaction block whose root is the txid itself, at a
+// monotonically increasing synthetic height (height starts at 1 and
+// advances by one per confirmation; nextHeight.Add is safe for the
+// concurrent confirmations multiple in-flight sends can produce). A
+// fabricated merkle path here -- rather than a real one -- used to leave
+// pkg/jobs.Watcher storing unparseable "mined" BEEF for every nullnet shard,
+// since Treasury.MinedBEEF needs a real BUMP to build real BEEF.
 func openTreasury(ctx context.Context, cfg *config.Config, mockOracle *oracle.Mock, log *slog.Logger) (*openedTreasury, error) {
 	confirmer := newSendConfirmer()
 	var opts []tfactory.Option
 	if mockOracle != nil {
 		delay := cfg.Treasury.Mock.ConfirmAfter
+		var nextHeight atomic.Uint32
 		opts = append(opts, tfactory.WithMockOnSend(func(txid chainhash.Hash) {
 			confirmer.schedule(delay, func() {
-				mockOracle.SetTx(txid, oracle.TxStatus{Known: true, Mined: true, BlockHeight: 1, MerklePath: []byte{0}})
+				height := nextHeight.Add(1)
+				mockOracle.SetTx(txid, oracle.TxStatus{
+					Known:       true,
+					Mined:       true,
+					BlockHeight: height,
+					MerklePath:  mock.SingleTxMerklePath(txid, height),
+				})
 			})
 		}))
 	}
