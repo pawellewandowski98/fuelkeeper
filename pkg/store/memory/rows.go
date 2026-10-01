@@ -109,7 +109,11 @@ func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpo
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.clockNow()
+	return s.mutateReservedLocked(pool, token, ops, s.clockNow(), fn), nil
+}
+
+// mutateReservedLocked is mutateReserved's body; s.mu must be held.
+func (s *Store) mutateReservedLocked(pool string, token store.Token, ops []store.Outpoint, now time.Time, fn func(r *store.Row, now time.Time)) int {
 	n := 0
 	for _, op := range ops {
 		r, ok := s.rows[op]
@@ -121,7 +125,7 @@ func (s *Store) mutateReserved(pool string, token store.Token, ops []store.Outpo
 		r.UpdatedAt = now
 		n++
 	}
-	return n, nil
+	return n
 }
 
 func clearReservation(r *store.Row) {
@@ -155,7 +159,12 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 	if err := store.ValidateSpend(txid, terminal); err != nil {
 		return 0, err
 	}
-	return s.mutateReserved(pool, token, ops, func(r *store.Row, now time.Time) {
+	return s.mutateReserved(pool, token, ops, spendFn(txid, terminal))
+}
+
+// spendFn is Spend's row mutation, shared with SpendBatch.
+func spendFn(txid chainhash.Hash, terminal bool) func(r *store.Row, now time.Time) {
+	return func(r *store.Row, now time.Time) {
 		if terminal {
 			h := txid
 			r.State = store.StateSpent
@@ -168,7 +177,7 @@ func (s *Store) Spend(ctx context.Context, pool string, token store.Token, ops [
 			h := txid
 			r.SpentHint = &h
 		}
-	})
+	}
 }
 
 // Quarantine implements store.Store.
@@ -344,4 +353,27 @@ func (s *Store) Stats(ctx context.Context, pool string) (store.Stats, error) {
 		}
 	}
 	return st, nil
+}
+
+// SpendBatch implements store.SpendBatcher: every request is applied in
+// slice order inside one critical section, so the batch is atomic and each
+// request sees exactly what its predecessors left behind.
+func (s *Store) SpendBatch(ctx context.Context, pool string, reqs []store.SpendRequest) ([]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := store.ValidatePool(pool); err != nil {
+		return nil, err
+	}
+	if err := store.ValidateSpendBatch(reqs, s.Capabilities().MaxBatch); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.clockNow()
+	counts := make([]int, len(reqs))
+	for i, r := range reqs {
+		counts[i] = s.mutateReservedLocked(pool, r.Token, r.Ops, now, spendFn(r.TxID, r.Terminal))
+	}
+	return counts, nil
 }

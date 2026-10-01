@@ -14,3 +14,5 @@ func TestConformance(t *testing.T) {
 		return memory.New(memory.WithClock(now))
 	})
 }
+
+var _ store.SpendBatcher = (*memory.Store)(nil)
